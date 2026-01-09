@@ -1,0 +1,44 @@
+{
+  "name": "@solidactions/sdk",
+  "version": "1.0.0",
+  "description": "SolidActions SDK for building durable workflows with step.run, step.sleep, and step.waitForSignal",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "solidactions",
+    "workflow",
+    "automation",
+    "durable-execution",
+    "step-functions",
+    "orchestration"
+  ],
+  "author": "SolidActions",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SolidActions/solidactions-ts-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SolidActions/solidactions-ts-sdk/issues"
+  },
+  "homepage": "https://github.com/SolidActions/solidactions-ts-sdk#readme",
+  "peerDependencies": {}
+}
