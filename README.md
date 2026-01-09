@@ -22,10 +22,10 @@ npm install @solidactions/sdk
 ## Quick Start
 
 ```typescript
-import { SOLID } from '@solidactions/sdk';
+import { SOLIDACTIONS } from '@solidactions/sdk';
 
 // Define a workflow with durable steps
-export const processOrder = SOLID.workflow(
+export const processOrder = SOLIDACTIONS.workflow(
   { id: 'process-order' },
   async (ctx, step) => {
     // step.run() - Execute with durability guarantees
@@ -55,12 +55,12 @@ export const processOrder = SOLID.workflow(
 
 ## API Reference
 
-### SOLID.workflow(options, handler)
+### SOLIDACTIONS.workflow(options, handler)
 
 Define a new workflow.
 
 ```typescript
-const myWorkflow = SOLID.workflow(
+const myWorkflow = SOLIDACTIONS.workflow(
   { id: 'my-workflow', maxAttempts: 4 },
   async (ctx, step) => {
     // ctx.input - Input data passed to the workflow
@@ -222,7 +222,7 @@ const result = await step.awaitWorkflow<ChildOutput>('await', handle, {
 Define an `onFailure` handler to run cleanup or notifications when a workflow fails.
 
 ```typescript
-const processOrder = SOLID.workflow(
+const processOrder = SOLIDACTIONS.workflow(
   {
     id: 'process-order',
     onFailure: async (ctx, errors) => {

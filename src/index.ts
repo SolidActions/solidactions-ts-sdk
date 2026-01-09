@@ -286,7 +286,7 @@ export interface WorkflowOptions {
    *
    * @example
    * ```typescript
-   * SOLID.workflow(
+   * SOLIDACTIONS.workflow(
    *   {
    *     id: 'process-order',
    *     onFailure: async (ctx, errors) => {
@@ -327,9 +327,9 @@ export interface Workflow<TInput = unknown, TOutput = unknown> {
  *
  * @example
  * ```typescript
- * import { SOLID } from '@solidactions/sdk';
+ * import { SOLIDACTIONS } from '@solidactions/sdk';
  *
- * export const processOrder = SOLID.workflow(
+ * export const processOrder = SOLIDACTIONS.workflow(
  *   { id: 'process-order' },
  *   async (ctx, step) => {
  *     const validated = await step.run('validate', async () => {
@@ -769,9 +769,9 @@ export class SolidActionsClient {
  *
  * Use this for defining workflows:
  * ```typescript
- * import { SOLID } from '@solidactions/sdk';
+ * import { SOLIDACTIONS } from '@solidactions/sdk';
  *
- * export const myWorkflow = SOLID.workflow(
+ * export const myWorkflow = SOLIDACTIONS.workflow(
  *   { id: 'my-workflow' },
  *   async (ctx, step) => {
  *     // ...
@@ -779,7 +779,7 @@ export class SolidActionsClient {
  * );
  * ```
  */
-export const SOLID = new SolidActionsClient();
+export const SOLIDACTIONS = new SolidActionsClient();
 
 
-export default SOLID;
+export default SOLIDACTIONS;
