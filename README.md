@@ -1,5 +1,8 @@
 # SolidActions SDK
 
+[![npm version](https://img.shields.io/npm/v/@solidactions/sdk.svg)](https://www.npmjs.com/package/@solidactions/sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Lightweight durable workflows for TypeScript.
 
 ## What is SolidActions?
