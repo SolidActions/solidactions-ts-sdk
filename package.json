@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/solidactions/sdk"
+    "url": "https://github.com/SolidActions/solidactions-ts-sdk"
   },
   "homepage": "https://solidactions.com/",
   "engines": {
