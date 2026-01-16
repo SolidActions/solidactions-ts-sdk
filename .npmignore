@@ -1,0 +1,27 @@
+# ignore all TS files
+*.ts
+
+# except TS declaration files
+!*.d.ts
+
+# individual repo files that shouldn't be published
+.editorconfig
+.eslintrc.cjs
+Gruntfile.js
+jest.config.js
+dbos-config.yaml
+tsconfig.json
+tsconfig.*.json
+version.json
+dbos-test-config.yaml
+
+# repo folders that shouldn't be published
+.vscode/
+.github/
+tests/
+coverage/
+packages/
+dist/packages/
+
+# ignore any packed packages in the repo
+*.tgz

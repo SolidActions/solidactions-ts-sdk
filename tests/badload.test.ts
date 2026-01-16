@@ -1,0 +1,46 @@
+import { spawnSync } from 'child_process';
+
+// Mock API URL for subprocess tests - they don't actually connect
+const TEST_ENV = {
+  ...process.env,
+  SOLIDACTIONS_API_URL: 'http://localhost:9999',
+  SOLIDACTIONS_API_KEY: 'test-key',
+};
+
+describe('bad-code-loads', () => {
+  test('loadCodeTwice', async () => {
+    // Run the TypeScript test script under ts-node
+    const result = spawnSync('npx', ['ts-node', './tests/codereloader.ts'], {
+      encoding: 'utf-8',
+      cwd: process.cwd(),
+      env: TEST_ENV,
+      stdio: ['inherit', 'pipe', 'pipe'], // Capture stdout and stderr
+    });
+
+    // Uncomment to see what happened above...
+    //console.log('STDOUT:', result.stdout);
+    //console.error('STDERR:', result.stderr);
+
+    // Check if the expected error appears in stderr
+    expect(result.stderr).toContain('SolidActionsConflictingRegistrationError');
+    return Promise.resolve();
+  });
+
+  test('loadCodeAfterLaunch', async () => {
+    // Run the TypeScript test script under ts-node
+    const result = spawnSync('npx', ['ts-node', './tests/codelateloader.ts'], {
+      encoding: 'utf-8',
+      cwd: process.cwd(),
+      env: TEST_ENV,
+      stdio: ['inherit', 'pipe', 'pipe'], // Capture stdout and stderr
+    });
+
+    // Uncomment to see what happened above...
+    //console.log('STDOUT:', result.stdout);
+    //console.error('STDERR:', result.stderr);
+
+    // Check if the expected error appears in stderr
+    expect(result.stderr).toContain('SolidActionsConflictingRegistrationError');
+    return Promise.resolve();
+  });
+});

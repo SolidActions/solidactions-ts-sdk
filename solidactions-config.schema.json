@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SolidActions Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "The name of your application"
+    },
+    "language": {
+      "type": "string",
+      "description": "The language used in your application",
+      "enum": ["node", "python"]
+    },
+    "database_url": {
+      "type": "string",
+      "description": "The URL of the application database"
+    },
+    "system_database_url": {
+      "type": "string",
+      "description": "The URL of the system database"
+    },
+    "system_database_schema_name": {
+      "type": "string",
+      "description": "The schema name for SolidActions system tables (default: 'dbos')"
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "app_db_name": {
+          "type": "string",
+          "description": "The name of the application database. DEPRECATED: Use database_url instead",
+          "deprecated": true
+        },
+        "migrate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Specify a list of user DB migration commands to run"
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "logs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "addContextMetadata": {
+              "type": "boolean",
+              "description": "Adds contextual information, such as workflow UUID, to each log entry"
+            },
+            "logLevel": {
+              "type": "string",
+              "description": "A filter on what logs should be printed to the standard output"
+            },
+            "silent": {
+              "type": "boolean",
+              "description": "Silences the logger such that nothing is printed to the standard output"
+            }
+          }
+        },
+        "OTLPExporter": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "logsEndpoint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "description": "The URL of an OTLP collector to which to export logs"
+            },
+            "tracesEndpoint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "description": "The URL of an OTLP collector to which to export traces"
+            }
+          }
+        }
+      }
+    },
+    "runtimeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "admin_port": {
+          "type": "number",
+          "description": "The port number of the admin server (Default: 3001)"
+        },
+        "start": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Commands to start the application"
+        },
+        "setup": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Commands to setup the application execution environment"
+        }
+      }
+    },
+    "env": {
+      "deprecated": true
+    }
+  }
+}

@@ -1,0 +1,1504 @@
+# Build Reliable Applications With SolidActions
+
+## Guidelines
+
+- Respond in a friendly and concise manner
+- Ask clarifying questions when requirements are ambiguous
+- Generate code in TypeScript using the SolidActions library. Make sure to fully type everything.
+- You MUST import all methods and classes used in the code you generate
+- You SHALL keep all code in a single file unless otherwise specified.
+- You MUST await all promises.
+- SolidActions is a workflow automation SDK.
+
+## Workflow Guidelines
+
+Workflows provide durable execution so you can write programs that are resilient to any failure.
+Workflows are comprised of steps, which are ordinary TypeScript functions called with SolidActions.runStep().
+When using SolidActions workflows, you should call any function that performs complex operations or accesses external APIs or services as a step using SolidActions.runStep.
+
+If a workflow is interrupted for any reason (e.g., an executor restarts or crashes), when your program restarts the workflow automatically resumes execution from the last completed step.
+
+- If asked to add SolidActions to existing code, you MUST ask which function to make a workflow. Do NOT recommend any changes until they have told you what function to make a workflow. Do NOT make a function a workflow unless SPECIFICALLY requested.
+- When making a function a workflow, you should make all functions it calls steps. Do NOT change the functions in any way.
+- Do NOT make functions steps unless they are DIRECTLY called by a workflow.
+- If the workflow function performs a non-deterministic action, you MUST move that action to its own function and make that function a step. Examples of non-deterministic actions include accessing an external API or service, accessing files on disk, generating a random number, of getting the current time.
+- Do NOT use Promise.all() due to the risks posed by multiple rejections. Using Promise.allSettled() for parallelism is allowed for single-step promises only. For any complex parallel execution, you should instead use SolidActions.startWorkflow and SolidActions queues to achieve the parallelism.
+- SolidActions workflows and steps should NOT have side effects in memory outside of their own scope. They can access global variables, but they should NOT create or update global variables or variables outside their scope.
+- Do NOT call any SolidActions context method (SolidActions.send, SolidActions.recv, SolidActions.startWorkflow, SolidActions.sleep, SolidActions.setEvent, SolidActions.getEvent) from a step.
+- Do NOT start workflows from inside a step.
+- Do NOT call SolidActions.setEvent and SolidActions.recv from outside a workflow function.
+- Do NOT use SolidActions.getApi, SolidActions.postApi, or other SolidActions HTTP annotations. These are DEPRECATED. Instead, use Express for HTTP serving by default, unless another web framework is specified.
+
+## SolidActions Lifecycle Guidelines
+
+SolidActions should be installed and imported from the `@dbos-inc/dbos-sdk` package.
+Due to its internal workflow registry, The SolidActions library and SolidActions workflows cannot be bundled with JavaScript or TypeScript bundlers (Webpack, Vite, Rollup, esbuild, Parcel, etc.) and must be treated as an external library by these tools. Configuration for bundlers should be suggested if these tools are in use and cannot be avoided.
+
+SolidActions does not support "serverless" frameworks due to its long-running background jobs. SolidActions programs MUST have a starting file (typically 'main.ts' or 'server.ts') that creates all objects and workflow functions during startup.
+
+Any SolidActions program MUST call SolidActions.setConfig and SolidActions.launch in its main function, like so.
+You MUST use this default configuration (changing the name as appropriate) unless otherwise specified.
+
+```javascript
+SolidActions.setConfig({
+  name: 'dbos-node-starter',
+  systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL,
+});
+await SolidActions.launch();
+```
+
+Here is an example main function using Express:
+
+```javascript
+import { SolidActions } from '@dbos-inc/dbos-sdk';
+
+async function main() {
+  SolidActions.setConfig({
+    name: 'dbos-node-starter',
+    systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL,
+  });
+  await SolidActions.launch();
+  const PORT = 3000;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server is running on http://localhost:${PORT}`);
+  });
+}
+
+main().catch(console.log);
+```
+
+## Workflow and Steps Examples
+
+Simple example:
+
+```javascript
+import { SolidActions } from '@dbos-inc/dbos-sdk';
+
+async function stepOne() {
+  SolidActions.logger.info('Step one completed!');
+}
+
+async function stepTwo() {
+  SolidActions.logger.info('Step two completed!');
+}
+
+async function exampleFunction() {
+  await SolidActions.runStep(() => stepOne());
+  await SolidActions.runStep(() => stepTwo());
+}
+const exampleWorkflow = SolidActions.registerWorkflow(exampleFunction);
+
+async function main() {
+  SolidActions.setConfig({
+    name: 'dbos-node-starter',
+    systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL,
+  });
+  await SolidActions.launch();
+  await exampleWorkflow();
+  await SolidActions.shutdown();
+}
+
+main().catch(console.log);
+```
+
+Example with Express:
+
+```javascript
+import { SolidActions } from '@dbos-inc/dbos-sdk';
+import express from 'express';
+
+export const app = express();
+app.use(express.json());
+
+async function stepOne() {
+  SolidActions.logger.info('Step one completed!');
+}
+
+async function stepTwo() {
+  SolidActions.logger.info('Step two completed!');
+}
+
+async function exampleFunction() {
+  await SolidActions.runStep(() => stepOne());
+  await SolidActions.runStep(() => stepTwo());
+}
+const exampleWorkflow = SolidActions.registerWorkflow(exampleFunction);
+
+app.get('/', async (req, res) => {
+  await exampleWorkflow();
+  res.send();
+});
+
+async function main() {
+  SolidActions.setConfig({
+    name: 'dbos-node-starter',
+    systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL,
+  });
+  await SolidActions.launch();
+  const PORT = 3000;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server is running on http://localhost:${PORT}`);
+  });
+}
+
+main().catch(console.log);
+```
+
+Example with queues:
+
+```javascript
+import { SolidActions, WorkflowQueue } from "@dbos-inc/dbos-sdk";
+import express from "express";
+
+export const app = express();
+app.use(express.json());
+
+const queue = new WorkflowQueue("example_queue");
+
+async function taskFunction(n: number) {
+  await SolidActions.sleep(5000);
+  SolidActions.logger.info(`Task ${n} completed!`)
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction);
+
+async function queueFunction() {
+  SolidActions.logger.info("Enqueueing tasks!")
+  const handles = []
+  for (let i = 0; i < 10; i++) {
+    handles.push(await SolidActions.startWorkflow(taskWorkflow, { queueName: queue.name })(i))
+  }
+  const results = []
+  for (const h of handles) {
+    results.push(await h.getResult())
+  }
+  SolidActions.logger.info(`Successfully completed ${results.length} tasks`)
+}
+const queueWorkflow = SolidActions.registerWorkflow(queueFunction)
+
+app.get("/", async (req, res) => {
+  await queueWorkflow();
+  res.send();
+});
+
+async function main() {
+  SolidActions.setConfig({
+    "name": "dbos-node-starter",
+    "systemDatabaseUrl": process.env.SolidActions_SYSTEM_DATABASE_URL,
+  });
+  await SolidActions.launch();
+  const PORT = 3000;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server is running on http://localhost:${PORT}`);
+  });
+}
+
+main().catch(console.log);
+```
+
+### Scheduled Workflow
+
+You can schedule SolidActions workflows to run exactly once per time interval.
+To do this, use the the `SolidActions.registerScheduled` method or the `SolidActions.scheduled` decorator and specify the schedule in crontab syntax. For example:
+
+- A scheduled workflow MUST specify a crontab schedule.
+- It MUST take in two arguments, scheduled and actual time. Both are Date of when the workflow started.
+
+```typescript
+async function scheduledFunction(schedTime: Date, startTime: Date) {
+  SolidActions.logger.info(`I am a workflow scheduled to run every 30 seconds`);
+}
+
+const scheduledWorkflow = SolidActions.registerWorkflow(scheduledFunction);
+SolidActions.registerScheduled(scheduledWorkflow, { crontab: '*/30 * * * * *' });
+```
+
+Or using decorators:
+
+```typescript
+class ScheduledExample {
+  @SolidActions.workflow()
+  @SolidActions.scheduled({ crontab: '*/30 * * * * *' })
+  static async scheduledWorkflow(schedTime: Date, startTime: Date) {
+    SolidActions.logger.info(`I am a workflow scheduled to run every 30 seconds`);
+  }
+}
+```
+
+## Workflow Documentation:
+
+Workflows provide **durable execution** so you can write programs that are **resilient to any failure**.
+Workflows are comprised of steps, which wrap ordinary TypeScript (or JavaScript) functions.
+If a workflow is interrupted for any reason (e.g., an executor restarts or crashes), when your program restarts the workflow automatically resumes execution from the last completed step.
+
+To write a workflow, register a TypeScript function with `SolidActions.registerWorkflow`.
+The function's inputs and outputs must be serializable to JSON.
+For example:
+
+```typescript
+async function stepOne() {
+  SolidActions.logger.info('Step one completed!');
+}
+
+async function stepTwo() {
+  SolidActions.logger.info('Step two completed!');
+}
+
+async function workflowFunction() {
+  await SolidActions.runStep(() => stepOne(), { name: 'stepOne' });
+  await SolidActions.runStep(() => stepTwo(), { name: 'stepTwo' });
+}
+const workflow = SolidActions.registerWorkflow(workflowFunction);
+
+await workflow();
+```
+
+Alternatively, you can register workflows and steps with decorators:
+
+```typescript
+export class Example {
+  @SolidActions.step()
+  static async stepOne() {
+    SolidActions.logger.info('Step one completed!');
+  }
+
+  @SolidActions.step()
+  static async stepTwo() {
+    SolidActions.logger.info('Step two completed!');
+  }
+
+  // Call steps from workflows
+  @SolidActions.workflow()
+  static async exampleWorkflow() {
+    await Toolbox.stepOne();
+    await Toolbox.stepTwo();
+  }
+}
+
+await Example.exampleWorkflow();
+```
+
+## Starting Workflows In The Background
+
+One common use-case for workflows is building reliable background tasks that keep running even when your program is interrupted, restarted, or crashes.
+You can use `SolidActions.startWorkflow` to start a workflow in the background.
+If you start a workflow this way, it returns a workflow handle, from which you can access information about the workflow or wait for it to complete and retrieve its result.
+
+Here's an example:
+
+```javascript
+class Example {
+    @SolidActions.workflow()
+    static async exampleWorkflow(var1: string, var2: string) {
+        return var1 + var2;
+    }
+}
+
+async function main() {
+    // Start exampleWorkflow in the background
+    const handle = await SolidActions.startWorkflow(Example).exampleWorkflow("one", "two");
+    // Wait for the workflow to complete and return its results
+    const result = await handle.getResult();
+}
+```
+
+After starting a workflow in the background, you can use `SolidActions.retrieveWorkflow` to retrieve a workflow's handle from its ID.
+You can also retrieve a workflow's handle from outside of your SolidActions application with 'SolidActionsClient.retrieveWorkflow`.
+
+If you need to run many workflows in the background and manage their concurrency or flow control, you can also use SolidActions queues.
+
+## Workflow IDs and Idempotency
+
+Every time you execute a workflow, that execution is assigned a unique ID, by default a UUID.
+You can access this ID through the `SolidActions.workflowID` context variable.
+Workflow IDs are useful for communicating with workflows and developing interactive workflows.
+
+You can set the workflow ID of a workflow as an argument to `SolidActions.startWorkflow()`.
+Workflow IDs must be **globally unique** for your application.
+An assigned workflow ID acts as an idempotency key: if a workflow is called multiple times with the same ID, it executes only once.
+This is useful if your operations have side effects like making a payment or sending an email.
+Workflow IDs are also useful for communicating with workflows and developing interactive workflows - see Communicating with Workflows for more details.
+
+For example:
+
+```javascript
+class Example {
+    @SolidActions.workflow()
+    static async exampleWorkflow(var1: string, var2: string) {
+        // ...
+    }
+}
+
+async function main() {
+    const myID: string = ...
+    const handle = await SolidActions.startWorkflow(Example, {workflowID: myID}).exampleWorkflow("one", "two");
+    const result = await handle.getResult();
+}
+```
+
+## Determinism
+
+Workflows are in most respects normal TypeScript functions.
+They can have loops, branches, conditionals, and so on.
+However, a workflow function must be **deterministic**: if called multiple times with the same inputs, it should invoke the same steps with the same inputs in the same order (given the same return values from those steps).
+If you need to perform a non-deterministic operation like accessing the database, calling a third-party API, generating a random number, or getting the local time, you shouldn't do it directly in a workflow function.
+Instead, you should do all database operations in transactions and all other non-deterministic operations in steps.
+
+For example, **don't do this**:
+
+```javascript
+class Example {
+  @SolidActions.workflow()
+  static async exampleWorkflow() {
+    // Don't make an HTTP request in a workflow function
+    const body = await fetch('https://example.com').then((r) => r.text());
+    await Example.exampleTransaction(body);
+  }
+}
+```
+
+Instead, do this:
+
+```javascript
+class Example {
+  @SolidActions.workflow()
+  static async exampleWorkflow() {
+    // Don't make an HTTP request in a workflow function
+    const body = await SolidActions.runStep(
+      async () => {
+        return await fetch('https://example.com').then((r) => r.text());
+      },
+      { name: 'fetchBody' },
+    );
+    await Example.exampleTransaction(body);
+  }
+}
+```
+
+Or this:
+
+```javascript
+class Example {
+  @SolidActions.step()
+  static async fetchBody() {
+    // Instead, make HTTP requests in steps
+    return await fetch('https://example.com').then((r) => r.text());
+  }
+
+  @SolidActions.workflow()
+  static async exampleWorkflow() {
+    const body = await Example.fetchBody();
+    await Example.exampleTransaction(body);
+  }
+}
+```
+
+### Running Steps In Parallel
+
+Initiating several concurrent steps in a workflow, followed by awaiting them with `Promise.allSettled`, is valid as long as the steps are started in a deterministic order. For example the following is allowed:
+
+```typescript
+const results = await Promise.allSettled([step1('arg1'), step2('arg2'), step3('arg3'), step4('arg4')]);
+```
+
+This is allowed because each step is started in a well-defined sequence before awaiting.
+
+By contrast, the following is not allowed:
+
+```typescript
+const results = await Promise.allSettled([
+  async () => {
+    await step1('arg1');
+    await step2('arg3');
+  },
+  async () => {
+    await step3('arg2');
+    await step4('arg4');
+  },
+]);
+```
+
+Here, `step2` and `step4` may be started in either order since their execution depends on the relative time taken by `step1` and `step3`.
+
+If you need to run sequences of operations concurrently, start child workflows with `startWorkflow` and await the results from their `WorkflowHandle`s.
+
+Avoid using `Promise.all` because of how it handles errors and rejections. When any promise rejects, `Promise.all` immediately fails, leaving the other promises unresolved. If one of those later throws an unhandled exception, it can crash your Node.js process. Instead, prefer `Promise.allSettled`, which safely waits for all promises to complete and reports their outcomes.
+
+## Workflow Timeouts
+
+You can set a timeout for a workflow by passing a `timeoutMS` argument to `SolidActions.startWorkflow`.
+When the timeout expires, the workflow **and all its children** are cancelled.
+Cancelling a workflow sets its status to `CANCELLED` and preempts its execution at the beginning of its next step.
+
+Timeouts are **start-to-completion**: a workflow's timeout does not begin until the workflow starts execution.
+Also, timeouts are **durable**: they are stored in the database and persist across restarts, so workflows can have very long timeouts.
+
+Example syntax:
+
+```javascript
+async function taskFunction(task) {
+    // ...
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction);
+
+async function main() {
+  const task = ...
+  const timeout = ... // Timeout in milliseconds
+  const handle = await SolidActions.startWorkflow(taskWorkflow, {timeoutMS: timeout})(task);
+}
+```
+
+## Durable Sleep
+
+You can use `SolidActions.sleep()` to put your workflow to sleep for any period of time.
+This sleep is **durable**&mdash;SolidActions saves the wakeup time in the database so that even if the workflow is interrupted and restarted multiple times while sleeping, it still wakes up on schedule.
+
+Sleeping is useful for scheduling a workflow to run in the future (even days, weeks, or months from now).
+For example:
+
+```javascript
+@SolidActions.workflow()
+static async exampleWorkflow(timeToSleep, task) {
+    await SolidActions.sleep(timeToSleep);
+    await runTask(task);
+}
+```
+
+## Debouncing Workflows
+
+You can create a `Debouncer` to debounce your workflows.
+Debouncing delays workflow execution until some time has passed since the workflow has last been called.
+This is useful for preventing wasted work when a workflow may be triggered multiple times in quick succession.
+For example, if a user is editing an input field, you can debounce their changes to execute a processing workflow only after they haven't edited the field for some time:
+
+### Debouncer
+
+```typescript
+new Debouncer<Args extends unknown[], Return>(
+  params: DebouncerConfig<Args, Return>
+)
+```
+
+```typescript
+interface DebouncerConfig<Args extends unknown[], Return> {
+  workflow: (...args: Args) => Promise<Return>;
+  startWorkflowParams?: StartWorkflowParams;
+  debounceTimeoutMs?: number;
+}
+```
+
+**Parameters:**
+
+- **workflow**: The workflow to debounce. Note that workflows from configured instances cannot be debounced.
+- **startWorkflowParams**: Optional workflow parameters, as in `startWorkflow`. Applied to all workflows started from this debouncer.
+- **debounceTimeoutMs**: After this time elapses since the first time a workflow is submitted from this debouncer, the workflow is started regardless of the debounce period.
+
+### debouncer.debounce
+
+```typescript
+debouncer.debounce(
+  debounceKey: string,
+  debouncePeriodMs: number,
+  ...args: Args
+): Promise<WorkflowHandle<Return>>
+```
+
+Submit a workflow for execution but delay it by `debouncePeriodMs`.
+Returns a handle to the workflow.
+The workflow may be debounced again, which further delays its execution (up to `debounceTimeoutMs`).
+When the workflow eventually executes, it uses the **last** set of inputs passed into `debounce`.
+After the workflow begins execution, the next call to `debounce` starts the debouncing process again for a new workflow execution.
+
+**Parameters:**
+
+- **debounceKey**: A key used to group workflow executions that will be debounced together. For example, if the debounce key is set to customer ID, each customer's workflows would be debounced separately.
+- **debouncePeriodMs**: Delay this workflow's execution by this period in milliseconds.
+- **...args**: Variadic workflow arguments.
+
+**Example Syntax**:
+
+```typescript
+async function processInput(userInput: string) {
+  ...
+}
+const processInputWorkflow = SolidActions.registerWorkflow(processInput);
+
+// Each time a user submits a new input, debounce the processInput workflow.
+// The workflow will wait until 60 seconds after the user stops submitting new inputs,
+// then process the last input submitted.
+const debouncer = new Debouncer({
+  workflow: processInputWorkflow,
+});
+
+async function onUserInputSubmit(userId: string, userInput: string) {
+  const debounceKey = userId;
+  const debouncePeriodMs = 60000; // 60 seconds
+  await debouncer.debounce(debounceKey, debouncePeriodMs, userInput);
+}
+```
+
+## Workflow Versioning and Recovery
+
+Because SolidActions recovers workflows by re-executing them using information saved in the database, a workflow cannot safely be recovered if its code has changed since the workflow was started.
+To guard against this, SolidActions _versions_ applications and their workflows.
+When SolidActions is launched, it computes an application version from a hash of the source code of its workflows (this can be overridden through the `applicationVersion`) configuration parameter.
+All workflows are tagged with the application version on which they started.
+
+When SolidActions tries to recover workflows, it only recovers workflows whose version matches the current application version.
+This prevents unsafe recovery of workflows that depend on different code.
+You cannot change the version of a workflow, but you can use `SolidActions.forkWorkflow` to restart a workflow from a specific step on a specific code version.
+
+## Workflow Communication
+
+SolidActions provides a few different ways to communicate with your workflows.
+You can:
+
+- Send messages to workflows
+- Publish events from workflows for clients to read
+- Stream values from workflows to clients
+
+## Workflow Messaging and Notifications
+
+You can send messages to a specific workflow.
+This is useful for signaling a workflow or sending notifications to it while it's running.
+
+<img src={require('@site/static/img/workflow-communication/workflow-messages.png').default} alt="SolidActions Steps" width="750" className="custom-img"/>
+
+### Send
+
+```typescript
+SolidActions.send<T>(destinationID: string, message: T, topic?: string): Promise<void>;
+```
+
+You can call `SolidActions.send()` to send a message to a workflow.
+Messages can optionally be associated with a topic and are queued on the receiver per topic.
+
+You can also call `send` from outside of your SolidActions application with the SolidActions Client.
+
+### Recv
+
+```typescript
+SolidActions.recv<T>(topic?: string, timeoutSeconds?: number): Promise<T | null>
+```
+
+Workflows can call `SolidActions.recv()` to receive messages sent to them, optionally for a particular topic.
+Each call to `recv()` waits for and consumes the next message to arrive in the queue for the specified topic, returning `null` if the wait times out.
+If the topic is not specified, this method only receives messages sent without a topic.
+
+### Messages Example
+
+Messages are especially useful for sending notifications to a workflow.
+For example, in the e-commerce demo, the checkout workflow, after redirecting customers to a secure payments service, must wait for a notification from that service that the payment has finished processing.
+
+To wait for this notification, the payments workflow uses `recv()`, executing failure-handling code if the notification doesn't arrive in time:
+
+```javascript
+@SolidActions.workflow()
+static async checkoutWorkflow(...): Promise<void> {
+  ...
+  const notification = await SolidActions.recv<string>(PAYMENT_STATUS, timeout);
+  if (notification) {
+      ... // Handle the notification.
+  } else {
+      ... // Handle a timeout.
+  }
+}
+```
+
+A webhook waits for the payment processor to send the notification, then uses `send()` to forward it to the workflow:
+
+```javascript
+static async paymentWebhook(): Promise<void> {
+  const notificationMessage = ... // Parse the notification.
+  const workflowID = ... // Retrieve the workflow ID from notification metadata.
+  await SolidActions.send(workflowID, notificationMessage, PAYMENT_STATUS);
+}
+```
+
+### Reliability Guarantees
+
+All messages are persisted to the database, so if `send` completes successfully, the destination workflow is guaranteed to be able to `recv` it.
+If you're sending a message from a workflow, SolidActions guarantees exactly-once delivery.
+If you're sending a message from normal TypeScript code, you can specify an idempotency key for `send` to guarantee exactly-once delivery.
+
+## Workflow Events
+
+Workflows can publish _events_, which are key-value pairs associated with the workflow.
+They are useful for publishing information about the status of a workflow or to send a result to clients while the workflow is running.
+
+<img src={require('@site/static/img/workflow-communication/workflow-events.png').default} alt="SolidActions Steps" width="750" className="custom-img"/>
+
+### setEvent
+
+```typescript
+SolidActions.setEvent<T>(key: string, value: T): Promise<void>
+```
+
+Any workflow can call `SolidActions.setEvent` to publish a key-value pair, or update its value if has already been published.
+
+### getEvent
+
+```typescript
+SolidActions.getEvent<T>(workflowID: string, key: string, timeoutSeconds?: number): Promise<T | null>
+```
+
+You can call `SolidActions.getEvent` to retrieve the value published by a particular workflow ID for a particular key.
+If the event does not yet exist, this call waits for it to be published, returning `null` if the wait times out.
+
+You can also call `getEvent` from outside of your SolidActions application with SolidActions Client.
+
+### Events Example
+
+Events are especially useful for writing interactive workflows that communicate information to their caller.
+For example, in the e-commerce demo, the checkout workflow, after validating an order, directs the customer to a secure payments service to handle credit card processing.
+To communicate the payments URL to the customer, it uses events.
+
+The checkout workflow emits the payments URL using `setEvent()`:
+
+```javascript
+@SolidActions.workflow()
+static async checkoutWorkflow(...): Promise<void> {
+  ...
+  const paymentsURL = ...
+  await SolidActions.setEvent(PAYMENT_URL, paymentsURL);
+  ...
+}
+```
+
+The HTTP handler that originally started the workflow uses `getEvent()` to await this URL, then redirects the customer to it:
+
+```javascript
+static async webCheckout(...): Promise<void> {
+  const handle = await SolidActions.startWorkflow(Shop).checkoutWorkflow(...);
+  const url = await SolidActions.getEvent<string>(handle.workflowID, PAYMENT_URL);
+  if (url === null) {
+    SolidActions.koaContext.redirect(`${origin}/checkout/cancel`);
+  } else {
+    SolidActions.koaContext.redirect(url);
+  }
+}
+```
+
+### Reliability Guarantees
+
+All events are persisted to the database, so the latest version of an event is always retrievable.
+Additionally, if `getEvent` is called in a workflow, the retrieved value is persisted in the database so workflow recovery can use that value, even if the event is later updated.
+
+## Workflow Streaming
+
+Workflows can stream data in real time to clients.
+This is useful for streaming results from a long-running workflow or LLM call or for monitoring or progress reporting.
+
+<img src={require('@site/static/img/workflow-communication/workflow-streams.png').default} alt="SolidActions Steps" width="750" className="custom-img"/>
+
+### Writing to Streams
+
+```typescript
+SolidActions.writeStream<T>(key: string, value: T): Promise<void>
+```
+
+You can write values to a stream from a workflow or its steps using `SolidActions.writeStream`.
+A workflow may have any number of streams, each identified by a unique key.
+
+When you are done writing to a stream, you should close it with `SolidActions.closeStream`.
+Otherwise, streams are automatically closed when the workflow terminates.
+
+```typescript
+SolidActions.closeStream(key: string): Promise<void>
+```
+
+SolidActions streams are immutable and append-only.
+Writes to a stream from a workflow happen exactly-once.
+Writes to a stream from a step happen at-least-once; if a step fails and is retried, it may write to the stream multiple times.
+Readers will see all values written to the stream from all tries of the step in the order in which they were written.
+
+**Example syntax:**
+
+```typescript
+async function producerWorkflowFunction() {
+  await SolidActions.writeStream('example_key', { step: 1, data: 'value1' });
+  await SolidActions.writeStream('example_key', { step: 2, data: 'value2' });
+  await SolidActions.closeStream('example_key'); // Signal completion
+}
+
+const producerWorkflow = SolidActions.registerWorkflow(producerWorkflowFunction);
+```
+
+### Reading from Streams
+
+```typescript
+SolidActions.readStream<T>(workflowID: string, key: string): AsyncGenerator<T, void, unknown>
+```
+
+You can read values from a stream from anywhere using `SolidActions.readStream`.
+This function reads values from a stream identified by a workflow ID and key, yielding each value in order until the stream is closed or the workflow terminates.
+
+You can also read from a stream from outside a SolidActions application with a SolidActions Client.
+
+**Example syntax:**
+
+```typescript
+for await (const value of SolidActions.readStream(workflowID, 'example_key')) {
+  console.log(`Received: ${JSON.stringify(value)}`);
+}
+```
+
+## Steps
+
+When using SolidActions workflows, you should call any function that performs complex operations or accesses external APIs or services as a _step_.
+If a workflow is interrupted, upon restart it automatically resumes execution from the **last completed step**.
+
+You can use `SolidActions.runStep` to call a function as a step. For a function to be used as a step, it should have a return value that can be serialized as JSON, and should not have non-durable side effects. ALWAYS call steps this way unless otherwise specify.
+
+```javascript
+async function generateRandomNumber() {
+  return Math.random();
+}
+
+async function workflowFunction() {
+  const randomNumber = await SolidActions.runStep(() => generateRandomNumber(), { name: 'generateRandomNumber' });
+}
+const workflow = SolidActions.registerWorkflow(workflowFunction);
+```
+
+Alternatively, you can register a function as a step using `SolidActions.registerStep`:
+NEVER do this unless specifically asked, ALWAYS use SolidActions.runStep instead.
+
+```javascript
+async function generateRandomNumber() {
+  return Math.random();
+}
+const randomStep = SolidActions.registerStep(generateRandomNumber);
+
+async function workflowFunction() {
+  const randomNumber = await randomStep();
+}
+const workflow = SolidActions.registerWorkflow(workflowFunction);
+```
+
+Or use the `@SolidActions.step()` decorator:
+NEVER do this unless specifically asked, ALWAYS use SolidActions.runStep instead.
+
+```typescript
+export class Example {
+  @SolidActions.step()
+  static async generateRandomNumber() {
+    return Math.random();
+  }
+
+  @SolidActions.workflow()
+  static async exampleWorkflow() {
+    await Example.generateRandomNumber();
+  }
+}
+```
+
+### Configurable Retries
+
+You can optionally configure a step to automatically retry any exception a set number of times with exponential backoff.
+This is useful for automatically handling transient failures, like making requests to unreliable APIs.
+Retries are configurable through arguments to the step decorator:
+
+```typescript
+export interface StepConfig {
+  retriesAllowed?: boolean; // Should failures be retried? (default false)
+  intervalSeconds?: number; // Seconds to wait before the first retry attempt (default 1).
+  maxAttempts?: number; // Maximum number of retry attempts (default 3). If errors occur more times than this, throw an exception.
+  backoffRate?: number; // Multiplier by which the retry interval increases after a retry attempt (default 2).
+}
+```
+
+For example, let's configure this step to retry exceptions (such as if `example.com` is temporarily down) up to 10 times:
+
+```javascript
+async function fetchFunction() {
+  return await fetch('https://example.com').then((r) => r.text());
+}
+
+async function workflowFunction() {
+  const randomNumber = await SolidActions.runStep(() => fetchFunction(), {
+    name: 'fetchFunction',
+    retriesAllowed: true,
+    maxAttempts: 10,
+  });
+}
+```
+
+Or if registering the step:
+
+```javascript
+async function fetchFunction() {
+  return await fetch('https://example.com').then((r) => r.text());
+}
+const fetchStep = SolidActions.registerStep(fetchFunction, {
+  retriesAllowed: true,
+  maxAttempts: 10,
+});
+```
+
+Or if using decorators:
+
+```javascript
+@SolidActions.step({retriesAllowed: true, maxAttempts: 10})
+static async exampleStep() {
+  return await fetch("https://example.com").then(r => r.text());
+}
+```
+
+## Queues
+
+You can use queues to run many workflows at once with managed concurrency.
+Queues provide _flow control_, letting you manage how many workflows run at once or how often workflows are started.
+
+To create a queue, specify its name:
+
+```javascript
+import { SolidActions, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+
+const queue = new WorkflowQueue('example_queue');
+```
+
+You can then enqueue any workflow by passing the queue as an argument to `SolidActions.startWorkflow`.
+Enqueuing a function submits it for execution and returns a handle to it.
+Queued tasks are started in first-in, first-out (FIFO) order.
+
+```javascript
+const queue = new WorkflowQueue("example_queue");
+
+class Tasks {
+  @SolidActions.workflow()
+  static async processTask(task) {
+    // ...
+  }
+}
+
+async function main() {
+  const task = ...
+  const handle = await SolidActions.startWorkflow(Tasks, {queueName: queue.name}).processTask(task)
+}
+```
+
+### Queue Example
+
+Here's an example of a workflow using a queue to process tasks in parallel:
+
+```javascript
+import { SolidActions, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+
+const queue = new WorkflowQueue('example_queue');
+
+async function taskFunction(task) {
+  // ...
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction, { name: 'taskWorkflow' });
+
+async function queueFunction(tasks) {
+  const handles = [];
+
+  // Enqueue each task so all tasks are processed concurrently.
+  for (const task of tasks) {
+    handles.push(await SolidActions.startWorkflow(taskWorkflow, { queueName: queue.name })(task));
+  }
+
+  // Wait for each task to complete and retrieve its result.
+  // Return the results of all tasks.
+  const results = [];
+  for (const h of handles) {
+    results.push(await h.getResult());
+  }
+  return results;
+}
+const queueWorkflow = SolidActions.registerWorkflow(queueFunction, { name: 'queueWorkflow' });
+```
+
+### Enqueueing from Another Application
+
+Often, you want to enqueue a workflow from outside your SolidActions application.
+For example, let's say you have an API server and a data processing service.
+You're using SolidActions to build a durable data pipeline in the data processing service.
+When the API server receives a request, it should enqueue the data pipeline for execution on the data processing service.
+
+You can use the SolidActions Client to enqueue workflows from outside your SolidActions application by connecting directly to your SolidActions application's system database.
+Since the SolidActions Client is designed to be used from outside your SolidActions application, workflow and queue metadata must be specified explicitly.
+
+For example, this code enqueues the `dataPipeline` workflow on the `pipelineQueue` queue with `task` as an argument.
+
+```ts
+import { SolidActionsClient } from '@dbos-inc/dbos-sdk';
+
+const client = await SolidActionsClient.create({ systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL });
+
+type ProcessTask = typeof Tasks.processTask;
+await client.enqueue<ProcessTask>(
+  {
+    workflowName: 'dataPipeline',
+    queueName: 'pipelineQueue',
+  },
+  task,
+);
+```
+
+### Managing Concurrency
+
+You can control how many workflows from a queue run simultaneously by configuring concurrency limits.
+This helps prevent resource exhaustion when workflows consume significant memory or processing power.
+
+#### Worker Concurrency
+
+Worker concurrency sets the maximum number of workflows from a queue that can run concurrently on a single SolidActions process.
+This is particularly useful for resource-intensive workflows to avoid exhausting the resources of any process.
+For example, this queue has a worker concurrency of 5, so each process will run at most 5 workflows from this queue simultaneously:
+
+```javascript
+import { SolidActions, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+
+const queue = new WorkflowQueue('example_queue', { workerConcurrency: 5 });
+```
+
+#### Global Concurrency
+
+Global concurrency limits the total number of workflows from a queue that can run concurrently across all SolidActions processes in your application.
+For example, this queue will have a maximum of 10 workflows running simultaneously across your entire application.
+
+:::warning
+Worker concurrency limits are recommended for most use cases.
+Take care when using a global concurrency limit as any `PENDING` workflow on the queue counts toward the limit, including workflows from previous application versions
+:::
+
+```javascript
+import { SolidActions, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+
+const queue = new WorkflowQueue('example_queue', { concurrency: 10 });
+```
+
+#### In-Order Processing
+
+You can use a queue with `concurrency=1` to guarantee sequential, in-order processing of events.
+Only a single event will be processed at a time.
+For example, this app processes events sequentially in the order of their arrival:
+
+```javascript
+import { SolidActions, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+import express from 'express';
+
+const serialQueue = new WorkflowQueue('in_order_queue', { concurrency: 1 });
+const app = express();
+
+class Tasks {
+  @SolidActions.workflow()
+  static async processTask(task) {
+    // ... process task
+  }
+}
+
+app.get('/events/:event', async (req, res) => {
+  await SolidActions.startWorkflow(Tasks, { queueName: serialQueue.name }).processTask(req.params);
+  await res.send('Workflow Started!');
+});
+
+// Launch SolidActions and start the server
+async function main() {
+  await SolidActions.launch();
+  app.listen(3000, () => {});
+}
+
+main().catch(console.log);
+```
+
+### Rate Limiting
+
+You can set _rate limits_ for a queue, limiting the number of functions that it can start in a given period.
+Rate limits are global across all SolidActions processes using this queue.
+For example, this queue has a limit of 50 with a period of 30 seconds, so it may not start more than 50 functions in 30 seconds:
+
+```javascript
+const queue = new WorkflowQueue('example_queue', { rateLimit: { limitPerPeriod: 50, periodSec: 30 } });
+```
+
+Rate limits are especially useful when working with a rate-limited API, such as many LLM APIs.
+
+### Setting Timeouts
+
+You can set a timeout for an enqueued workflow by passing a `timeoutMS` argument to `SolidActions.startWorkflow`.
+When the timeout expires, the workflow **and all its children** are cancelled.
+Cancelling a workflow sets its status to `CANCELLED` and preempts its execution at the beginning of its next step.
+
+Timeouts are **start-to-completion**: a workflow's timeout does not begin until the workflow is dequeued and starts execution.
+Also, timeouts are **durable**: they are stored in the database and persist across restarts, so workflows can have very long timeouts.
+
+Example syntax:
+
+```javascript
+const queue = new WorkflowQueue("example_queue");
+
+async function taskFunction(task) {
+    // ...
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction, {"name": "taskWorkflow"});
+
+async function main() {
+  const task = ...
+  const timeout = ... // Timeout in milliseconds
+  const handle = await SolidActions.startWorkflow(taskWorkflow, {queueName: queue.name, timeoutMS: timeout})(task);
+}
+```
+
+### Partitioning Queues
+
+You can **partition** queues to distribute work across dynamically created queue partitions.
+When you enqueue a workflow on a partitioned queue, you must supply a queue partition key.
+Partitioned queues dequeue workflows and apply flow control limits for individual partitions, not for the entire queue.
+Essentially, you can think of each partition as a "subqueue" you dynamically create by enqueueing a workflow with a partition key.
+
+For example, suppose you want your users to each be able to run at most one task at a time.
+You can do this with a partitioned queue with a maximum concurrency limit of 1 where the partition key is user ID.
+
+**Example Syntax**
+
+```ts
+const queue = new WorkflowQueue('example_queue', { partitionQueue: true, concurrency: 1 });
+
+async function onUserTaskSubmission(userID: string, task: Task) {
+  // Partition the task queue by user ID. As the queue has a
+  // maximum concurrency of 1, this means that at most one
+  // task can run at once per user (but tasks from different
+  // users can run concurrently).
+  await SolidActions.startWorkflow(taskWorkflow, {
+    queueName: queue.name,
+    enqueueOptions: { queuePartitionKey: userID },
+  })(task);
+}
+```
+
+### Deduplication
+
+You can set a deduplication ID for an enqueued workflow as an argument to `SolidActions.startWorkflow`.
+At any given time, only one workflow with a specific deduplication ID can be enqueued in the specified queue.
+If a workflow with a deduplication ID is currently enqueued or actively executing (status `ENQUEUED` or `PENDING`), subsequent workflow enqueue attempt with the same deduplication ID in the same queue will raise a `SolidActionsQueueDuplicatedError` exception.
+
+For example, this is useful if you only want to have one workflow active at a time per user&mdash;set the deduplication ID to the user's ID.
+
+Example syntax:
+
+```javascript
+const queue = new WorkflowQueue("example_queue");
+
+async function taskFunction(task) {
+    // ...
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction, {"name": "taskWorkflow"});
+
+async function main() {
+  const task = ...
+  const dedup: string = ...
+  try {
+    const handle = await SolidActions.startWorkflow(taskWorkflow, {queueName: queue.name, enqueueOptions: {deduplicationID: dedup}})(task);
+  } catch (e) {
+    // Handle SolidActionsQueueDuplicatedError
+  }
+}
+```
+
+### Priority
+
+You can set a priority for an enqueued workflow as an argument to `SolidActions.startWorkflow`.
+Workflows with the same priority are dequeued in **FIFO (first in, first out)** order. Priority values can range from `1` to `2,147,483,647`, where **a low number indicates a higher priority**.
+If using priority, you must set `usePriority: true` on your queue.
+
+:::tip
+Workflows without assigned priorities have the highest priority and are dequeued before workflows with assigned priorities.
+:::
+
+Example syntax:
+
+```javascript
+const queue = new WorkflowQueue("example_queue", {usePriority: true});
+
+async function taskFunction(task) {
+    // ...
+}
+const taskWorkflow = SolidActions.registerWorkflow(taskFunction, {"name": "taskWorkflow"});
+
+async function main() {
+  const task = ...
+  const priority: number = ...
+  const handle = await SolidActions.startWorkflow(taskWorkflow, {queueName: queue.name, enqueueOptions: {priority: priority}})(task);
+}
+```
+
+## Classes
+
+You can use class instance methods as workflows and steps.
+Any class instance method can be freely used as a step using the SolidActions.step decorator or SolidActions.runstep; there are no special requirements.
+To use a class instance method as a workflow, you must use the SolidActions.workflow decorator and the class must inherit from `ConfiguredInstance`.
+For example:
+
+```typescript
+class MyClass extends ConfiguredInstance {
+  cfg: MyConfig;
+  constructor(name: string, config: MyConfig) {
+    super(name);
+    this.cfg = cfg;
+  }
+
+  override async initialize(): Promise<void> {
+    // ... Validate this.cfg; will be called at SolidActions.launch()
+  }
+
+  @SolidActions.workflow()
+  async testWorkflow(p: string): Promise<void> {
+    // ... Operations that use this.cfg
+  }
+}
+
+const myClassInstance = new MyClass('instanceA');
+```
+
+When you create a new instance of such a class, the constructor for the base `ConfiguredInstance` must be called with a `name`.
+This `name` should be unique among instances of the same class.
+Additionally, all `ConfiguredInstance` classes must be instantiated before SolidActions.launch() is called.
+
+The reason for these requirements is to enable workflow recovery. When you create a new instance of, SolidActions stores it in a global registry indexed by `name`. When SolidActions needs to recover a workflow belonging to that class, it looks up the `name` so it can run the workflow using the right class instance. While names are used by SolidActions Transact internally to find the correct object instance across system restarts, they are also potentially useful for monitoring, tracing, and debugging.
+You should AVOID using ConfiguredInstance if at all possible and instead use registerWorkflow on regular non-class functions.
+
+### Testing SolidActions Functions
+
+Unless otherwise specified, recommend testing SolidActions applications with jest.
+
+You MUST use this beforeAll to reset SolidActions between tests:
+
+```javascript
+beforeAll(async () => {
+  SolidActions.setConfig({
+    name: 'my-app',
+    databaseUrl: process.env.SolidActions_TESTING_DATABASE_URL,
+  });
+  await SolidActions.launch();
+});
+```
+
+### Logging
+
+ALWAYS log errors like this:
+
+```typescript
+SolidActions.logger.error(`Error: ${(error as Error).message}`);
+```
+
+## Workflow Handles
+
+A workflow handle represents the state of a particular active or completed workflow execution.
+You obtain a workflow handle when using `SolidActions.startWorkflow` to start a workflow in the background.
+If you know a workflow's identity, you can also retrieve its handle using `SolidActions.retrieveWorkflow`.
+
+Workflow handles have the following methods:
+
+### handle.workflowID
+
+```typescript
+handle.workflowID(): string;
+```
+
+Retrieve the ID of the workflow.
+
+### handle.getResult
+
+```typescript
+handle.getResult(): Promise<R>;
+```
+
+Wait for the workflow to complete, then return its result.
+
+### handle.getStatus
+
+```typescript
+handle.getStatus(): Promise<WorkflowStatus>;
+```
+
+Retrieve the WorkflowStatus of the workflow:
+
+### Workflow Status
+
+Some workflow introspection and management methods return a `WorkflowStatus`.
+This object has the following definition:
+
+```typescript
+export interface WorkflowStatus {
+  // The workflow ID
+  readonly workflowID: string;
+  // The workflow status. Must be one of ENQUEUED, PENDING, SUCCESS, ERROR, CANCELLED, or RETRIES_EXCEEDED
+  readonly status: string;
+  // The name of the workflow function.
+  readonly workflowName: string;
+  // The name of the workflow's class, if any
+  readonly workflowClassName: string; // The class name holding the workflow function.
+  // The name with which the workflow's class instance was configured, if any.
+  readonly workflowConfigName?: string;
+  // If the workflow was enqueued, the name of the queue.
+  readonly queueName?: string;
+  // The workflow's output, if any.
+  readonly output?: unknown;
+  // The error thrown by the workflow, if any.
+  readonly error?: unknown;
+  // The deserialized workflow inputs.
+  readonly input?: unknown[];
+  // The ID of the executor (process) that most recently executed this workflow.
+  readonly executorId?: string;
+  // The application version on which this workflow started.
+  readonly applicationVersion?: string;
+  // The number of times this workflow has been started.
+  readonly recoveryAttempts?: number;
+  // Workflow start time, as a UNIX epoch timestamp in milliseconds
+  readonly createdAt: number;
+  // Last time the workflow status was updated, as a UNIX epoch timestamp in milliseconds. For a completed workflow, this is the workflow completion timestamp.
+  readonly updatedAt?: number;
+  // The timeout specified for this workflow, if any. Timeouts are start-to-close.
+  readonly timeoutMS?: number | null;
+  // The deadline at which this workflow times out, if any. Not set until the workflow begins execution.
+  readonly deadlineEpochMS?: number;
+}
+```
+
+## SolidActions Variables
+
+### SolidActions.workflowID
+
+```typescript
+SolidActions.workflowID: string | undefined;
+```
+
+Return the ID of the current workflow, if in a workflow.
+
+### SolidActions.stepID
+
+```typescript
+SolidActions.stepID: string | undefined;
+```
+
+Return the unique ID of the current step within a workflow.
+
+### SolidActions.stepStatus
+
+```typescript
+SolidActions.stepStatus: StepStatus | undefined;
+```
+
+Return the status of the currently executing step.
+This object has the following properties:
+
+```typescript
+interface StepStatus {
+  // The unique ID of this step in its workflow.
+  stepID: number;
+  // For steps with automatic retries, which attempt number (zero-indexed) is currently executing.
+  currentAttempt?: number;
+  // For steps with automatic retries, the maximum number of attempts that will be made before the step fails.
+  maxAttempts?: number;
+}
+```
+
+## Workflow Management Methods
+
+### SolidActions.listWorkflows
+
+```typescript
+SolidActions.listWorkflows(
+  input: GetWorkflowsInput
+): Promise<WorkflowStatus[]>
+```
+
+```typescript
+interface GetWorkflowsInput {
+  workflowIDs?: string[];
+  workflowName?: string;
+  status?: string;
+  startTime?: string;
+  endTime?: string;
+  applicationVersion?: string;
+  authenticatedUser?: string;
+  limit?: number;
+  offset?: number;
+  sortDesc?: boolean;
+}
+```
+
+Retrieve a list of WorkflowStatus of all workflows matching specified criteria.
+
+**Parameters:**
+
+- **workflowIDs**: Retrieve workflows with these IDs.
+- **workflowName**: Retrieve workflows with this name.
+- **status**: Retrieve workflows with this status (Must be `ENQUEUED`, `PENDING`, `SUCCESS`, `ERROR`, `CANCELLED`, or `RETRIES_EXCEEDED`)
+- **startTime**: Retrieve workflows started after this (RFC 3339-compliant) timestamp.
+- **endTime**: Retrieve workflows started before this (RFC 3339-compliant) timestamp.
+- **applicationVersion**: Retrieve workflows tagged with this application version.
+- **authenticatedUser**: Retrieve workflows run by this authenticated user.
+- **limit**: Retrieve up to this many workflows.
+- **offset**: Skip this many workflows from the results returned (for pagination).
+- **sortDesc**: Whether to sort the results in descending (`True`) or ascending (`False`) order by workflow start time.
+
+### SolidActions.listQueuedWorkflows
+
+```typescript
+SolidActions.listQueuedWorkflows(
+  input: GetQueuedWorkflowsInput
+): Promise<WorkflowStatus[]>
+```
+
+```typescript
+interface GetQueuedWorkflowsInput {
+  workflowName?: string;
+  status?: string;
+  queueName?: number;
+  startTime?: string;
+  endTime?: string;
+  limit?: number;
+  offset?: number;
+  sortDesc?: boolean;
+}
+```
+
+Retrieve a list of WorkflowStatus of all **currently enqueued** workflows matching specified criteria.
+
+**Parameters:**
+
+- **workflowName**: Retrieve workflows with this name.
+- **status**: Retrieve workflows with this status (Must be `ENQUEUED`, `PENDING`, `SUCCESS`, `ERROR`, `CANCELLED`, or `RETRIES_EXCEEDED`)
+- **queueName**: Retrieve workflows running on this queue.
+- **startTime**: Retrieve workflows started after this (RFC 3339-compliant) timestamp.
+- **endTime**: Retrieve workflows started before this (RFC 3339-compliant) timestamp.
+- **limit**: Retrieve up to this many workflows.
+- **offset**: Skip this many workflows from the results returned (for pagination).
+- **sortDesc**: Whether to sort the results in descending (`True`) or ascending (`False`) order by workflow start time.
+
+### SolidActions.listWorkflowSteps
+
+```typescript
+SolidActions.listWorkflowSteps(
+  workflowID: string)
+: Promise<StepInfo[]>
+```
+
+Retrieve the steps of a workflow.
+This is a list of `StepInfo` objects, with the following structure:
+
+```typescript
+interface StepInfo {
+  // The unique ID of the step in the workflow. Zero-indexed.
+  readonly functionID: number;
+  // The name of the step
+  readonly name: string;
+  // The step's output, if any
+  readonly output: unknown;
+  // The error the step threw, if any
+  readonly error: Error | null;
+  // If the step starts or retrieves the result of a workflow, its ID
+  readonly childWorkflowID: string | null;
+}
+```
+
+### SolidActions.cancelWorkflow
+
+```typescript
+cancelWorkflow(
+  workflowID: string
+): Promise<void>
+```
+
+Cancel a workflow.
+This sets is status to `CANCELLED`, removes it from its queue (if it is enqueued) and preempts its execution (interrupting it at the beginning of its next step)
+
+### SolidActions.resumeWorkflow
+
+```typescript
+SolidActions.resumeWorkflow<T>(
+  workflowID: string
+): Promise<WorkflowHandle<Awaited<T>>>
+```
+
+Resume a workflow.
+This immediately starts it from its last completed step.
+You can use this to resume workflows that are cancelled or have exceeded their maximum recovery attempts.
+You can also use this to start an enqueued workflow immediately, bypassing its queue.
+
+### SolidActions.forkWorkflow
+
+```typescript
+static async forkWorkflow<T>(
+  workflowID: string,
+  startStep: number,
+  options?: { newWorkflowID?: string; applicationVersion?: string; timeoutMS?: number },
+): Promise<WorkflowHandle<Awaited<T>>>
+```
+
+Start a new execution of a workflow from a specific step.
+The input step ID (`startStep`) must match the `functionID` of the step returned by `listWorkflowSteps`.
+The specified `startStep` is the step from which the new workflow will start, so any steps whose ID is less than `startStep` will not be re-executed.
+
+**Parameters:**
+
+- **workflowID**: The ID of the workflow to fork.
+- **startStep**: The ID of the step from which to start the forked workflow. Must match the `functionID` of the step in the original workflow execution.
+- **newWorkflowID**: The ID of the new workflow created by the fork. If not specified, a random UUID is used.
+- **applicationVersion**: The application version on which the forked workflow will run. Useful for "patching" workflows that failed due to a bug in the previous application version.
+- **timeoutMS**: A timeout for the forked workflow in milliseconds.
+
+## Configuring SolidActions
+
+To configure SolidActions, pass in a configuration with `SolidActions.setConfig` before you call `SolidActions.launch`.
+For example:
+
+```javascript
+SolidActions.setConfig({
+  name: 'my-app',
+  systemDatabaseUrl: process.env.SolidActions_SYSTEM_DATABASE_URL,
+});
+await SolidActions.launch();
+```
+
+A configuration object has the following fields.
+All fields except `name` are optional.
+
+```javascript
+export interface SolidActionsConfig {
+  name?: string;
+
+  systemDatabaseUrl?: string;
+  systemDatabasePoolSize?: number;
+  systemDatabasePool?: Pool;
+
+  enableOTLP?: boolean;
+  logLevel?: string;
+  otlpLogsEndpoints?: string[];
+  otlpTracesEndpoints?: string[];
+
+  runAdminServer?: boolean;
+  adminPort?: number;
+
+  applicationVersion?: string;
+}
+```
+
+- **name**: Your application's name.
+- **systemDatabaseUrl**: A connection string to a Postgres database in which SolidActions can store internal state. The supported format is:
+
+```
+postgresql://[username]:[password]@[hostname]:[port]/[database name]
+```
+
+The default is:
+
+```
+postgresql://postgres:dbos@localhost:5432/[application name]_dbos_sys
+```
+
+If the Postgres database referenced by this connection string does not exist, SolidActions will attempt to create it.
+
+- **systemDatabasePoolSize**: The size of the connection pool used for the SolidActions system database. Defaults to 10.
+- **systemDatabasePool**: A custom `node-postgres` connection pool to use to connect to your system database. If provided, SolidActions will not create a connection pool but use this instead.
+- **enableOTLP**: Enable SolidActions OpenTelemetry tracing and export. Defaults to False.
+- **logLevel**: Configure the SolidActions logger severity. Defaults to `info`.
+- **otlpTracesEndpoints**: SolidActions operations automatically generate OpenTelemetry Traces. Use this field to declare a list of OTLP-compatible receivers.
+- **otlpLogsEndpoints**: SolidActions operations automatically generate OpenTelemetry Logs. Use this field to declare a list of OTLP-compatible receivers.
+- **runAdminServer**: Whether to run an HTTP admin server for workflow management operations. Defaults to True.
+- **adminPort**: The port on which the admin server runs. Defaults to 3001.
+- **applicationVersion**: The code version for this application and its workflows.

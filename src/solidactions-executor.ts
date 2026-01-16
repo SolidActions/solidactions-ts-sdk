@@ -1,0 +1,1148 @@
+import {
+  SolidActionsError,
+  SolidActionsInitializationError,
+  SolidActionsWorkflowConflictError,
+  SolidActionsNotRegisteredError,
+  SolidActionsDebuggerError,
+  SolidActionsMaxStepRetriesError,
+  SolidActionsWorkflowCancelledError,
+  SolidActionsUnexpectedStepError,
+  SolidActionsInvalidQueuePriorityError,
+  SolidActionsAwaitedWorkflowCancelledError,
+  SolidActionsQueueDuplicatedError,
+} from './error';
+import {
+  InvokedHandle,
+  type WorkflowHandle,
+  type WorkflowParams,
+  RetrievedHandle,
+  StatusString,
+  type WorkflowStatus,
+  type StepInfo,
+  WorkflowConfig,
+  DEFAULT_MAX_RECOVERY_ATTEMPTS,
+} from './workflow';
+
+import { type StepConfig } from './step';
+import { TelemetryCollector } from './telemetry/collector';
+import { getActiveSpan, runWithTrace, SpanStatusCode, Tracer } from './telemetry/traces';
+import { SolidActionsContextualLogger, GlobalLogger } from './telemetry/logs';
+import { TelemetryExporter } from './telemetry/exporters';
+import {
+  type SystemDatabase,
+  HttpSystemDatabase,
+  type WorkflowStatusInternal,
+  type SystemDatabaseStoredResult,
+} from './system_database';
+import { SolidActionsHttpConfig } from './config';
+import { randomUUID } from 'node:crypto';
+import {
+  getRegisteredFunctionClassName,
+  getRegisteredFunctionName,
+  getConfiguredInstance,
+  getLifecycleListeners,
+  UntypedAsyncFunction,
+  TypedAsyncFunction,
+  getFunctionRegistrationByName,
+  getAllRegisteredFunctions,
+  getFunctionRegistration,
+  getAllRegisteredClassNames,
+  getClassRegistrationByName,
+  getRegisteredFunctionFullName,
+} from './decorators';
+import type { step_info } from '../schemas/system_db_schema';
+import {
+  runInStepContext,
+  getNextWFID,
+  functionIDGetIncrement,
+  runWithParentContext,
+  getCurrentContextStore,
+  SolidActionsLocalCtx,
+  runWithTopContext,
+} from './context';
+import { deserializeError, serializeError } from 'serialize-error';
+import { globalParams, sleepms } from './utils';
+import { SolidActionsSerializer, serializeFunctionInputOutput } from './serialization';
+import { SolidActions, GetWorkflowsInput } from '.';
+
+import { debugTriggerPoint, DEBUG_TRIGGER_WORKFLOW_ENQUEUE } from './debugpoint';
+import * as crypto from 'crypto';
+import { forkWorkflow, listWorkflows, listWorkflowSteps, toWorkflowStatus } from './workflow_management';
+
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+interface SolidActionsNull {}
+const solidActionsNull: SolidActionsNull = {};
+
+/* Interface for SolidActions configuration */
+export interface SolidActionsConfig {
+  name?: string;
+
+  // HTTP API configuration
+  api?: {
+    url: string; // Base API URL
+    key: string; // API key / Bearer token
+    timeout?: number; // Request timeout in ms (default: 30000)
+    maxRetries?: number; // Max retry attempts (default: 3)
+  };
+
+  enableOTLP?: boolean;
+  logLevel?: string;
+  addContextMetadata?: boolean;
+  otlpTracesEndpoints?: string[];
+  otlpLogsEndpoints?: string[];
+
+  adminPort?: number;
+  runAdminServer?: boolean;
+
+  applicationVersion?: string;
+  executorID?: string;
+
+  serializer?: SolidActionsSerializer;
+  enablePatching?: boolean;
+}
+
+export interface SolidActionsRuntimeConfig {
+  admin_port: number;
+  runAdminServer: boolean;
+  start: string[];
+  setup: string[];
+}
+
+export interface TelemetryConfig {
+  logs?: LoggerConfig;
+  OTLPExporter?: OTLPExporterConfig;
+}
+
+export interface OTLPExporterConfig {
+  logsEndpoint?: string[];
+  tracesEndpoint?: string[];
+}
+
+export interface LoggerConfig {
+  logLevel?: string;
+  silent?: boolean;
+  addContextMetadata?: boolean;
+  forceConsole?: boolean;
+}
+
+export type SolidActionsConfigInternal = {
+  name?: string;
+
+  // HTTP API configuration
+  api: SolidActionsHttpConfig;
+
+  serializer: SolidActionsSerializer;
+  telemetry: TelemetryConfig;
+
+  http?: {
+    cors_middleware?: boolean;
+    credentials?: boolean;
+    allowed_origins?: string[];
+  };
+};
+
+export interface InternalWorkflowParams extends WorkflowParams {
+  readonly tempWfType?: string;
+  readonly tempWfName?: string;
+  readonly tempWfClass?: string;
+  readonly isRecoveryDispatch?: boolean;
+  readonly isQueueDispatch?: boolean;
+}
+
+export const OperationType = {
+  HANDLER: 'handler',
+  WORKFLOW: 'workflow',
+  TRANSACTION: 'transaction',
+  STEP: 'step',
+} as const;
+
+export const TempWorkflowType = {
+  step: 'step',
+  send: 'send',
+} as const;
+
+/**
+ * State item to be kept in the system database on behalf of clients
+ */
+export interface SolidActionsExternalState {
+  /** Name of event receiver service */
+  service: string;
+  /** Fully qualified function name for which state is kept */
+  workflowFnName: string;
+  /** subkey within the service+workflowFnName */
+  key: string;
+  /** Value kept for the service+workflowFnName+key combination */
+  value?: string;
+  /** Updated time (used to version the value) */
+  updateTime?: number;
+  /** Updated sequence number (used to version the value) */
+  updateSeq?: bigint;
+}
+
+export interface SolidActionsExecutorOptions {
+  systemDatabase?: SystemDatabase;
+  debugMode?: boolean;
+}
+
+export class SolidActionsExecutor {
+  initialized: boolean;
+  // System Database
+  readonly systemDatabase: SystemDatabase;
+
+  // Temporary workflows are created by calling transaction/send/recv directly from the executor class
+  static readonly #tempWorkflowName = 'temp_workflow';
+
+  readonly telemetryCollector: TelemetryCollector;
+
+  static readonly defaultNotificationTimeoutSec = 60;
+
+  readonly #debugMode: boolean;
+
+  readonly logger: GlobalLogger;
+  readonly ctxLogger: SolidActionsContextualLogger;
+  readonly tracer: Tracer;
+  readonly serializer: SolidActionsSerializer;
+
+  readonly executorID: string = globalParams.executorID;
+
+  static globalInstance: SolidActionsExecutor | undefined = undefined;
+
+  /* WORKFLOW EXECUTOR LIFE CYCLE MANAGEMENT */
+  constructor(
+    readonly config: SolidActionsConfigInternal,
+    { systemDatabase, debugMode }: SolidActionsExecutorOptions = {},
+  ) {
+    this.#debugMode = debugMode ?? false;
+
+    if (config.telemetry.OTLPExporter) {
+      const OTLPExporter = new TelemetryExporter(config.telemetry.OTLPExporter);
+      this.telemetryCollector = new TelemetryCollector(OTLPExporter);
+    } else {
+      // We always setup a collector to drain the signals queue, even if we don't have an exporter.
+      this.telemetryCollector = new TelemetryCollector();
+    }
+    this.logger = new GlobalLogger(this.telemetryCollector, this.config.telemetry.logs, this.appName);
+    this.ctxLogger = new SolidActionsContextualLogger(this.logger, () => getActiveSpan());
+    this.tracer = new Tracer(this.telemetryCollector, this.appName);
+    this.serializer = config.serializer;
+
+    if (this.#debugMode) {
+      this.logger.info('Running in debug mode!');
+    }
+
+    if (systemDatabase) {
+      this.logger.debug('Using provided system database');
+      this.systemDatabase = systemDatabase;
+    } else {
+      // HTTP mode - use HTTP-based system database
+      this.logger.debug('Using HTTP system database');
+      this.systemDatabase = new HttpSystemDatabase(
+        config.api,
+        this.executorID,
+        globalParams.appVersion,
+        this.logger,
+        this.serializer,
+      );
+    }
+
+    this.initialized = false;
+    SolidActionsExecutor.globalInstance = this;
+  }
+
+  get appName(): string | undefined {
+    return this.config.name;
+  }
+
+  async init(): Promise<void> {
+    if (this.initialized) {
+      this.logger.error('Workflow executor already initialized!');
+      return;
+    }
+    try {
+      await this.systemDatabase.init(this.#debugMode);
+    } catch (err) {
+      if (err instanceof SolidActionsInitializationError) {
+        throw err;
+      }
+      this.logger.error(err);
+      let message = 'Failed to initialize workflow executor: ';
+      if (err instanceof AggregateError) {
+        for (const error of err.errors as Error[]) {
+          message += `${error.message}; `;
+        }
+      } else if (err instanceof Error) {
+        message += err.message;
+      } else {
+        message += String(err);
+      }
+      throw new SolidActionsInitializationError(message, err instanceof Error ? err : undefined);
+    }
+    this.initialized = true;
+
+    // Only execute init code if under non-debug mode
+    if (!this.#debugMode) {
+      // Compute the application version if not provided
+      if (globalParams.appVersion === '') {
+        globalParams.appVersion = this.computeAppVersion();
+        globalParams.wasComputed = true;
+      }
+
+      // Any initialization hooks
+      const classnames = getAllRegisteredClassNames();
+      for (const cls of classnames) {
+        // Init its configurations
+        const creg = getClassRegistrationByName(cls);
+        for (const [_cfgname, cfg] of creg.configuredInstances) {
+          await cfg.initialize();
+        }
+      }
+
+      this.logger.info(`Initializing SolidActions (v${globalParams.solidActionsVersion})`);
+      this.logger.info(`HTTP API: ${this.config.api.apiUrl}`);
+      this.logger.info(`Executor ID: ${this.executorID}`);
+      this.logger.info(`Application version: ${globalParams.appVersion}`);
+
+      await this.recoverPendingWorkflows([this.executorID]);
+    }
+
+    this.logger.info('SolidActions launched!');
+  }
+
+  async destroy() {
+    try {
+      await this.systemDatabase.awaitRunningWorkflows();
+      await this.systemDatabase.destroy();
+      await this.logger.destroy();
+
+      if (SolidActionsExecutor.globalInstance === this) {
+        SolidActionsExecutor.globalInstance = undefined;
+      }
+    } catch (err) {
+      const e = err as Error;
+      this.logger.error(e);
+      throw err;
+    }
+  }
+
+  // This could return WF, or the function underlying a temp wf
+  #getFunctionInfoFromWFStatus(wf: WorkflowStatusInternal) {
+    const methReg = getFunctionRegistrationByName(wf.workflowClassName, wf.workflowName);
+    return { methReg, configuredInst: getConfiguredInstance(wf.workflowClassName, wf.workflowConfigName) };
+  }
+
+  static reviveResultOrError<R = unknown>(r: SystemDatabaseStoredResult, serializer: SolidActionsSerializer) {
+    if (!r.error) {
+      return serializer.parse(r.output ?? null) as R;
+    } else {
+      throw deserializeError(serializer.parse(r.error));
+    }
+  }
+
+  async workflow<T extends unknown[], R>(
+    wf: TypedAsyncFunction<T, R>,
+    params: InternalWorkflowParams,
+    ...args: T
+  ): Promise<WorkflowHandle<R>> {
+    return this.internalWorkflow(wf, params, undefined, undefined, ...args);
+  }
+
+  // If callerWFID and functionID are set, it means the workflow is invoked from within a workflow.
+  async internalWorkflow<T extends unknown[], R>(
+    wf: TypedAsyncFunction<T, R>,
+    params: InternalWorkflowParams,
+    callerID?: string,
+    callerFunctionID?: number,
+    ...args: T
+  ): Promise<WorkflowHandle<R>> {
+    const workflowID: string = params.workflowUUID ? params.workflowUUID : randomUUID();
+    const presetID: boolean = params.workflowUUID ? true : false;
+    const timeoutMS = params.timeoutMS ?? undefined;
+    // If a timeout is explicitly specified, use it over any propagated deadline
+    const deadlineEpochMS = params.timeoutMS
+      ? // Queued workflows are assigned a deadline on dequeue. Otherwise, compute the deadline immediately
+        params.queueName
+        ? undefined
+        : Date.now() + params.timeoutMS
+      : // if no timeout is specified, use the propagated deadline (if any)
+        params.deadlineEpochMS;
+
+    const pctx = { ...getCurrentContextStore() }; // function ID was already incremented...
+
+    let wConfig: WorkflowConfig = {};
+    const wInfo = getFunctionRegistration(wf);
+    const wfNames = getRegisteredFunctionFullName(wf);
+    let wfname = wfNames.name;
+    let wfclassname = wfNames.className;
+
+    const isTempWorkflow = SolidActionsExecutor.#tempWorkflowName === wfname || !!params.tempWfType;
+
+    if (!isTempWorkflow) {
+      if (!wInfo || !wInfo.workflowConfig) {
+        throw new SolidActionsNotRegisteredError(wf.name);
+      }
+      wConfig = wInfo.workflowConfig;
+    } else if (params.tempWfName) {
+      wfname = params.tempWfName;
+      wfclassname = params.tempWfClass ?? '';
+    }
+
+    const maxRecoveryAttempts = wConfig.maxRecoveryAttempts
+      ? wConfig.maxRecoveryAttempts
+      : DEFAULT_MAX_RECOVERY_ATTEMPTS;
+
+    const span = this.tracer.startSpan(wfname, {
+      status: StatusString.PENDING,
+      operationUUID: workflowID,
+      operationType: OperationType.WORKFLOW,
+      operationName: wInfo?.name ?? wf.name,
+      authenticatedUser: pctx?.authenticatedUser ?? '',
+      authenticatedRoles: pctx?.authenticatedRoles ?? [],
+      assumedRole: pctx?.assumedRole ?? '',
+    });
+
+    const funcArgs = serializeFunctionInputOutput(args, [wfname, '<arguments>'], this.serializer);
+    args = funcArgs.deserialized;
+
+    const internalStatus: WorkflowStatusInternal = {
+      workflowUUID: workflowID,
+      status: params.queueName !== undefined ? StatusString.ENQUEUED : StatusString.PENDING,
+      workflowName: wfname,
+      workflowClassName: wfclassname,
+      workflowConfigName: params.configuredInstance?.name || '',
+      queueName: params.queueName,
+      output: null,
+      error: null,
+      authenticatedUser: pctx?.authenticatedUser || '',
+      assumedRole: pctx?.assumedRole || '',
+      authenticatedRoles: pctx?.authenticatedRoles || [],
+      request: pctx?.request || {},
+      executorId: globalParams.executorID,
+      applicationVersion: globalParams.appVersion,
+      applicationID: globalParams.appID,
+      createdAt: Date.now(), // Remember the start time of this workflow,
+      timeoutMS: timeoutMS,
+      deadlineEpochMS: deadlineEpochMS,
+      input: funcArgs.stringified,
+      priority: 0,
+    };
+
+    if (isTempWorkflow) {
+      internalStatus.workflowName = `${SolidActionsExecutor.#tempWorkflowName}-${params.tempWfType}-${params.tempWfName}`;
+    }
+
+    let $deadlineEpochMS: number | undefined = undefined;
+    let shouldExecute: boolean | undefined = undefined;
+    const serializer = this.serializer;
+
+    // Synchronously set the workflow's status to PENDING and record workflow inputs.
+    // We have to do it for all types of workflows because operation_outputs table has a foreign key constraint on workflow status table.
+    if (this.#debugMode) {
+      const wfStatus = await this.systemDatabase.getWorkflowStatus(workflowID);
+      if (!wfStatus) {
+        throw new SolidActionsDebuggerError(`Failed to find inputs for workflow UUID ${workflowID}`);
+      }
+
+      // Make sure we use the same input.
+      if (funcArgs.stringified !== wfStatus.input) {
+        throw new SolidActionsDebuggerError(
+          `Detected different inputs for workflow UUID ${workflowID}.\n Received: ${funcArgs.stringified}\n Original: ${wfStatus.input}`,
+        );
+      }
+    } else {
+      if (callerFunctionID !== undefined && callerID !== undefined) {
+        const result = await this.systemDatabase.getOperationResultAndThrowIfCancelled(callerID, callerFunctionID);
+        if (result) {
+          if (result.error) {
+            throw deserializeError(serializer.parse(result.error));
+          }
+          return new RetrievedHandle(this.systemDatabase, result.childWorkflowID!);
+        }
+      }
+      let ires;
+      try {
+        ires = await this.systemDatabase.initWorkflowStatus(internalStatus, randomUUID(), {
+          maxRetries: maxRecoveryAttempts,
+          isDequeuedRequest: params.isQueueDispatch,
+          isRecoveryRequest: params.isRecoveryDispatch,
+        });
+      } catch (e) {
+        if (e instanceof SolidActionsQueueDuplicatedError && callerID && callerFunctionID) {
+          await this.systemDatabase.recordOperationResult(
+            callerID,
+            callerFunctionID,
+            internalStatus.workflowName,
+            true,
+            Date.now(),
+            { error: serializer.stringify(serializeError(e)) },
+          );
+        }
+        throw e;
+      }
+
+      if (callerFunctionID !== undefined && callerID !== undefined) {
+        await this.systemDatabase.recordOperationResult(
+          callerID,
+          callerFunctionID,
+          internalStatus.workflowName,
+          true,
+          Date.now(),
+          {
+            childWorkflowID: workflowID,
+          },
+        );
+      }
+
+      $deadlineEpochMS = ires.deadlineEpochMS;
+      shouldExecute = ires.shouldExecuteOnThisExecutor;
+      await debugTriggerPoint(DEBUG_TRIGGER_WORKFLOW_ENQUEUE);
+    }
+
+    async function callPromiseWithTimeout(
+      callPromise: Promise<R>,
+      deadlineEpochMS: number,
+      sysdb: SystemDatabase,
+    ): Promise<R> {
+      let timeoutID: ReturnType<typeof setTimeout> | undefined = undefined;
+      const timeoutResult = {};
+      const timeoutPromise = new Promise<R>((_, reject) => {
+        timeoutID = setTimeout(reject, deadlineEpochMS - Date.now(), timeoutResult);
+      });
+
+      try {
+        return await Promise.race([callPromise, timeoutPromise]);
+      } catch (err) {
+        if (err === timeoutResult) {
+          await sysdb.cancelWorkflow(workflowID);
+          await callPromise.catch(() => {});
+          throw new SolidActionsWorkflowCancelledError(workflowID);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutID);
+      }
+    }
+
+    async function handleWorkflowError(err: Error, exec: SolidActionsExecutor) {
+      // Record the error.
+      const e = err as Error & { solidactions_already_logged?: boolean };
+      exec.logger.error(e);
+      e.solidactions_already_logged = true;
+      internalStatus.error = serializer.stringify(serializeError(e));
+      internalStatus.status = StatusString.ERROR;
+      if (!exec.#debugMode) {
+        await exec.systemDatabase.recordWorkflowError(workflowID, internalStatus);
+      }
+      span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
+    }
+
+    const runWorkflow = async () => {
+      let result: R;
+
+      // Execute the workflow.
+      try {
+        const callResult = await runWithTrace(span, async () => {
+          return await runWithParentContext(
+            pctx,
+            {
+              presetID,
+              workflowTimeoutMS: undefined, // Becomes deadline
+              deadlineEpochMS,
+              workflowId: workflowID,
+              logger: this.ctxLogger,
+              curWFFunctionId: undefined,
+            },
+            () => {
+              const callPromise = wf.call(params.configuredInstance, ...args);
+
+              if ($deadlineEpochMS === undefined) {
+                return callPromise;
+              } else {
+                return callPromiseWithTimeout(callPromise, $deadlineEpochMS, this.systemDatabase);
+              }
+            },
+          );
+        });
+
+        if (this.#debugMode) {
+          function resultsMatch(recordedResult: Awaited<R>, callResult: Awaited<R>): boolean {
+            if (recordedResult === null) {
+              return callResult === undefined || callResult === null;
+            }
+            return serializer.stringify(recordedResult) === serializer.stringify(callResult);
+          }
+
+          const recordedResult = SolidActionsExecutor.reviveResultOrError<Awaited<R>>(
+            (await this.systemDatabase.awaitWorkflowResult(workflowID))!,
+            this.serializer,
+          );
+          if (!resultsMatch(recordedResult, callResult)) {
+            this.logger.error(
+              `Detect different output for the workflow UUID ${workflowID}!\n Received: ${serializer.stringify(callResult)}\n Original: ${serializer.stringify(recordedResult)}`,
+            );
+          }
+          result = recordedResult;
+        } else {
+          result = callResult!;
+        }
+
+        const funcResult = serializeFunctionInputOutput(result, [wfname, '<result>'], this.serializer);
+        result = funcResult.deserialized;
+        internalStatus.output = funcResult.stringified;
+        internalStatus.status = StatusString.SUCCESS;
+        if (!this.#debugMode) {
+          await this.systemDatabase.recordWorkflowOutput(workflowID, internalStatus);
+        }
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (err) {
+        if (err instanceof SolidActionsWorkflowConflictError) {
+          // Retrieve the handle and wait for the result.
+          const retrievedHandle = this.retrieveWorkflow<R>(workflowID);
+          result = await retrievedHandle.getResult();
+          span.setAttribute('cached', true);
+          span.setStatus({ code: SpanStatusCode.OK });
+        } else if (err instanceof SolidActionsWorkflowCancelledError) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+          internalStatus.error = err.message;
+          if (err.workflowID === workflowID) {
+            internalStatus.status = StatusString.CANCELLED;
+            throw err;
+          } else {
+            const e = new SolidActionsAwaitedWorkflowCancelledError(err.workflowID);
+            await handleWorkflowError(e as Error, this);
+            throw e;
+          }
+        } else {
+          await handleWorkflowError(err as Error, this);
+          throw err;
+        }
+      } finally {
+        this.tracer.endSpan(span);
+      }
+      return result;
+    };
+
+    if (
+      this.#debugMode ||
+      (shouldExecute &&
+        (params.queueName === undefined || params.executeWorkflow) &&
+        !this.systemDatabase.checkForRunningWorkflow(workflowID))
+    ) {
+      const workflowPromise: Promise<R> = runWorkflow();
+
+      this.systemDatabase.registerRunningWorkflow(workflowID, workflowPromise);
+
+      // Return the normal handle that doesn't capture errors.
+      return new InvokedHandle(this.systemDatabase, workflowPromise, workflowID, wf.name);
+    } else {
+      return new RetrievedHandle(this.systemDatabase, workflowID);
+    }
+  }
+
+  async runStepTempWF<T extends unknown[], R>(
+    stepFn: TypedAsyncFunction<T, R>,
+    params: WorkflowParams,
+    ...args: T
+  ): Promise<R> {
+    return await (await this.startStepTempWF(stepFn, params, undefined, undefined, ...args)).getResult();
+  }
+
+  async startStepTempWF<T extends unknown[], R>(
+    stepFn: TypedAsyncFunction<T, R>,
+    params: InternalWorkflowParams,
+    callerWFID?: string,
+    callerFunctionID?: number,
+    ...args: T
+  ): Promise<WorkflowHandle<R>> {
+    // Create a workflow and call external.
+    const temp_workflow = async (...args: T) => {
+      return await this.callStepFunction(stepFn, undefined, undefined, params.configuredInstance ?? null, ...args);
+    };
+
+    return await this.internalWorkflow(
+      temp_workflow,
+      {
+        ...params,
+        tempWfType: TempWorkflowType.step,
+        tempWfName: getRegisteredFunctionName(stepFn),
+        tempWfClass: getRegisteredFunctionClassName(stepFn),
+      },
+      callerWFID,
+      callerFunctionID,
+      ...args,
+    );
+  }
+
+  /**
+   * Execute a step function.
+   * If it encounters any error, retry according to its configured retry policy until the maximum number of attempts is reached, then throw an SolidActionsError.
+   * The step may execute many times, but once it is complete, it will not re-execute.
+   */
+  async callStepFunction<T extends unknown[], R>(
+    stepFn: TypedAsyncFunction<T, R>,
+    stepFnName: string | undefined,
+    stepConfig: StepConfig | undefined,
+    clsInst: object | null,
+    ...args: T
+  ): Promise<R> {
+    stepFnName = stepFnName ?? stepFn.name ?? '<unnamed>';
+    const startTime = Date.now();
+    if (!stepConfig) {
+      const stepReg = getFunctionRegistration(stepFn);
+      stepConfig = stepReg?.stepConfig;
+    }
+    if (stepConfig === undefined) {
+      throw new SolidActionsNotRegisteredError(stepFnName);
+    }
+
+    // Intentionally advance the function ID before any awaits, then work with a copy of the context.
+    const funcID = functionIDGetIncrement();
+    const lctx = { ...getCurrentContextStore()! };
+    const wfid = lctx.workflowId!;
+
+    await this.systemDatabase.checkIfCanceled(wfid);
+
+    const maxRetryIntervalSec = 3600; // Maximum retry interval: 1 hour
+
+    const span = this.tracer.startSpan(stepFnName, {
+      operationUUID: wfid,
+      operationType: OperationType.STEP,
+      operationName: stepFnName,
+      authenticatedUser: lctx.authenticatedUser ?? '',
+      assumedRole: lctx.assumedRole ?? '',
+      authenticatedRoles: lctx.authenticatedRoles ?? [],
+      retriesAllowed: stepConfig.retriesAllowed,
+      intervalSeconds: stepConfig.intervalSeconds,
+      maxAttempts: stepConfig.maxAttempts,
+      backoffRate: stepConfig.backoffRate,
+    });
+
+    // Check if this execution previously happened, returning its original result if it did.
+    const checkr = await this.systemDatabase.getOperationResultAndThrowIfCancelled(wfid, funcID);
+    if (checkr) {
+      if (checkr.functionName !== stepFnName) {
+        throw new SolidActionsUnexpectedStepError(wfid, funcID, stepFnName, checkr.functionName ?? '?');
+      }
+      const check = SolidActionsExecutor.reviveResultOrError<R>(checkr, this.serializer);
+      span.setAttribute('cached', true);
+      span.setStatus({ code: SpanStatusCode.OK });
+      this.tracer.endSpan(span);
+      return check;
+    }
+
+    if (this.#debugMode) {
+      throw new SolidActionsDebuggerError(
+        `Failed to find the recorded output for the step: workflow UUID: ${wfid}, step number: ${funcID}`,
+      );
+    }
+
+    const maxAttempts = stepConfig.maxAttempts ?? 3;
+
+    // Execute the step function.  If it throws an exception, retry with exponential backoff.
+    // After reaching the maximum number of retries, throw an SolidActionsError.
+    let result: R | SolidActionsNull = solidActionsNull;
+    let err: Error | SolidActionsNull = solidActionsNull;
+    const errors: Error[] = [];
+    if (stepConfig.retriesAllowed) {
+      let attemptNum = 0;
+      let intervalSeconds: number = stepConfig.intervalSeconds ?? 1;
+      if (intervalSeconds > maxRetryIntervalSec) {
+        this.logger.warn(
+          `Step config interval exceeds maximum allowed interval, capped to ${maxRetryIntervalSec} seconds!`,
+        );
+      }
+      while (result === solidActionsNull && attemptNum++ < (maxAttempts ?? 3)) {
+        try {
+          await this.systemDatabase.checkIfCanceled(wfid);
+
+          let cresult: R | undefined;
+          await runWithTrace(span, async () => {
+            await runInStepContext(lctx, funcID, maxAttempts, attemptNum, async () => {
+              const sf = stepFn as unknown as (...args: T) => Promise<R>;
+              cresult = await sf.call(clsInst, ...args);
+            });
+          });
+          result = cresult!;
+        } catch (error) {
+          const e = error as Error;
+          errors.push(e);
+          this.logger.warn(
+            `Error in step being automatically retried. Attempt ${attemptNum} of ${maxAttempts}. ${e.stack}`,
+          );
+          span.addEvent(
+            `Step attempt ${attemptNum + 1} failed`,
+            { retryIntervalSeconds: intervalSeconds, error: (error as Error).message },
+            performance.now(),
+          );
+          if (attemptNum < maxAttempts) {
+            // Sleep for an interval, then increase the interval by backoffRate.
+            // Cap at the maximum allowed retry interval.
+            await sleepms(intervalSeconds * 1000);
+            intervalSeconds *= stepConfig.backoffRate ?? 2;
+            intervalSeconds = intervalSeconds < maxRetryIntervalSec ? intervalSeconds : maxRetryIntervalSec;
+          }
+        }
+      }
+    } else {
+      try {
+        let cresult: R | undefined;
+        await runWithTrace(span, async () => {
+          await runInStepContext(lctx, funcID, maxAttempts, undefined, async () => {
+            const sf = stepFn as unknown as (...args: T) => Promise<R>;
+            cresult = await sf.call(clsInst, ...args);
+          });
+        });
+        result = cresult!;
+      } catch (error) {
+        err = error as Error;
+      }
+    }
+
+    // `result` can only be solidActionsNull when the step timed out
+    if (result === solidActionsNull) {
+      // Record the error, then throw it.
+      err = err === solidActionsNull ? new SolidActionsMaxStepRetriesError(stepFnName, maxAttempts, errors) : err;
+      await this.systemDatabase.recordOperationResult(wfid, funcID, stepFnName, true, startTime, {
+        error: this.serializer.stringify(serializeError(err)),
+      });
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      this.tracer.endSpan(span);
+      throw err as Error;
+    } else {
+      // Record the execution and return.
+      const funcResult = serializeFunctionInputOutput(result, [stepFnName, '<result>'], this.serializer);
+      await this.systemDatabase.recordOperationResult(wfid, funcID, stepFnName, true, startTime, {
+        output: funcResult.stringified,
+      });
+      span.setStatus({ code: SpanStatusCode.OK });
+      this.tracer.endSpan(span);
+      return funcResult.deserialized as R;
+    }
+  }
+
+  async runSendTempWF<T>(destinationId: string, message: T, topic?: string, idempotencyKey?: string): Promise<void> {
+    // Create a workflow and call send.
+    const temp_workflow = async (destinationId: string, message: T, topic?: string) => {
+      const ctx = getCurrentContextStore();
+      const functionID: number = functionIDGetIncrement();
+      await this.systemDatabase.send(
+        ctx!.workflowId!,
+        functionID,
+        destinationId,
+        this.serializer.stringify(message),
+        topic,
+      );
+    };
+    const workflowUUID = idempotencyKey ? destinationId + idempotencyKey : undefined;
+    return (
+      await this.workflow(
+        temp_workflow,
+        {
+          workflowUUID: workflowUUID,
+          tempWfType: TempWorkflowType.send,
+          configuredInstance: null,
+        },
+        destinationId,
+        message,
+        topic,
+      )
+    ).getResult();
+  }
+
+  /**
+   * Wait for a workflow to emit an event, then return its value.
+   */
+  async getEvent<T>(
+    workflowUUID: string,
+    key: string,
+    timeoutSeconds: number = SolidActionsExecutor.defaultNotificationTimeoutSec,
+  ): Promise<T | null> {
+    return this.serializer.parse(await this.systemDatabase.getEvent(workflowUUID, key, timeoutSeconds)) as T;
+  }
+
+  /**
+   * Fork a workflow.
+   * The forked workflow will be assigned a new ID.
+   */
+  forkWorkflow(
+    workflowID: string,
+    startStep: number,
+    options: { newWorkflowID?: string; applicationVersion?: string; timeoutMS?: number } = {},
+  ): Promise<string> {
+    const newWorkflowID = options.newWorkflowID ?? getNextWFID(undefined);
+    return forkWorkflow(this.systemDatabase, workflowID, startStep, { ...options, newWorkflowID });
+  }
+
+  /**
+   * Retrieve a handle for a workflow UUID.
+   */
+  retrieveWorkflow<R>(workflowID: string): WorkflowHandle<R> {
+    return new RetrievedHandle(this.systemDatabase, workflowID);
+  }
+
+  async runInternalStep<T>(
+    callback: () => Promise<T>,
+    functionName: string,
+    workflowID: string,
+    functionID: number,
+    childWfId?: string,
+  ): Promise<T> {
+    const startTime = Date.now();
+    const result = await this.systemDatabase.getOperationResultAndThrowIfCancelled(workflowID, functionID);
+    if (result) {
+      if (result.functionName !== functionName) {
+        throw new SolidActionsUnexpectedStepError(workflowID, functionID, functionName, result.functionName!);
+      }
+      return SolidActionsExecutor.reviveResultOrError<T>(result, this.serializer);
+    }
+    try {
+      const output: T = await callback();
+      const funcOutput = serializeFunctionInputOutput(output, [functionName, '<result>'], this.serializer);
+      await this.systemDatabase.recordOperationResult(workflowID, functionID, functionName, true, startTime, {
+        output: funcOutput.stringified,
+        childWorkflowID: childWfId,
+      });
+      return funcOutput.deserialized;
+    } catch (e) {
+      await this.systemDatabase.recordOperationResult(workflowID, functionID, functionName, false, startTime, {
+        error: this.serializer.stringify(serializeError(e)),
+        childWorkflowID: childWfId,
+      });
+
+      throw e;
+    }
+  }
+
+  async getWorkflowStatus(workflowID: string, callerID?: string, callerFN?: number): Promise<WorkflowStatus | null> {
+    // use sysdb getWorkflowStatus directly in order to support caller ID/FN params
+    const status = await this.systemDatabase.getWorkflowStatus(workflowID, callerID, callerFN);
+    return status ? toWorkflowStatus(status, this.serializer) : null;
+  }
+
+  async listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]> {
+    return listWorkflows(this.systemDatabase, input);
+  }
+
+  async listWorkflowSteps(workflowID: string): Promise<StepInfo[] | undefined> {
+    return listWorkflowSteps(this.systemDatabase, workflowID);
+  }
+
+  /* INTERNAL HELPERS */
+  /**
+   * A recovery process that by default runs during executor init time.
+   * It runs to completion all pending workflows that were executing when the previous executor failed.
+   */
+  async recoverPendingWorkflows(executorIDs: string[] = ['local']): Promise<WorkflowHandle<unknown>[]> {
+    if (this.#debugMode) {
+      throw new SolidActionsDebuggerError('Cannot recover pending workflows in debug mode.');
+    }
+
+    const handlerArray: WorkflowHandle<unknown>[] = [];
+    for (const execID of executorIDs) {
+      this.logger.debug(`Recovering workflows assigned to executor: ${execID}`);
+      const pendingWorkflows = await this.systemDatabase.getPendingWorkflows(execID, globalParams.appVersion);
+      if (pendingWorkflows.length > 0) {
+        this.logger.info(
+          `Recovering ${pendingWorkflows.length} workflows from application version ${globalParams.appVersion}`,
+        );
+      } else {
+        this.logger.info(`No workflows to recover from application version ${globalParams.appVersion}`);
+      }
+      for (const pendingWorkflow of pendingWorkflows) {
+        this.logger.debug(`Recovering workflow: ${pendingWorkflow.workflowUUID}`);
+        try {
+          handlerArray.push(await this.executeWorkflowId(pendingWorkflow.workflowUUID, { isRecoveryDispatch: true }));
+        } catch (e) {
+          this.logger.warn(`Recovery of workflow ${pendingWorkflow.workflowUUID} failed: ${(e as Error).message}`);
+        }
+      }
+    }
+    return handlerArray;
+  }
+
+  async initEventReceivers() {
+    for (const lcl of getLifecycleListeners()) {
+      await lcl.initialize?.();
+    }
+  }
+
+  async deactivateEventReceivers() {
+    this.logger.debug('Deactivating lifecycle listeners');
+    for (const lcl of getLifecycleListeners()) {
+      try {
+        await lcl.destroy?.();
+      } catch (err) {
+        const e = err as Error;
+        this.logger.warn(`Error destroying lifecycle listener: ${e.message}`);
+      }
+    }
+  }
+
+  async executeWorkflowId(
+    workflowID: string,
+    options?: {
+      startNewWorkflow?: boolean;
+      isRecoveryDispatch?: boolean;
+      isQueueDispatch?: boolean;
+    },
+  ): Promise<WorkflowHandle<unknown>> {
+    const wfStatus = await this.systemDatabase.getWorkflowStatus(workflowID);
+    if (!wfStatus) {
+      this.logger.error(`Failed to find workflow status for workflowUUID: ${workflowID}`);
+      throw new SolidActionsError(`Failed to find workflow status for workflow UUID: ${workflowID}`);
+    }
+
+    if (!wfStatus?.input) {
+      this.logger.error(`Failed to find inputs for workflowUUID: ${workflowID}`);
+      throw new SolidActionsError(`Failed to find inputs for workflow UUID: ${workflowID}`);
+    }
+    const inputs = this.serializer.parse(wfStatus.input) as unknown[];
+    const recoverCtx = this.#getRecoveryContext(workflowID, wfStatus);
+
+    const { methReg, configuredInst } = this.#getFunctionInfoFromWFStatus(wfStatus);
+
+    // If starting a new workflow, assign a new UUID. Otherwise, use the workflow's original UUID.
+    const workflowStartID = !!options?.startNewWorkflow ? undefined : workflowID;
+
+    if (methReg?.workflowConfig) {
+      return await runWithTopContext(recoverCtx, async () => {
+        return await this.workflow(
+          methReg.registeredFunction as UntypedAsyncFunction,
+          {
+            workflowUUID: workflowStartID,
+            configuredInstance: configuredInst,
+            queueName: wfStatus.queueName,
+            executeWorkflow: true,
+            deadlineEpochMS: wfStatus.deadlineEpochMS,
+            isRecoveryDispatch: !!options?.isRecoveryDispatch,
+            isQueueDispatch: !!options?.isQueueDispatch,
+          },
+          ...inputs,
+        );
+      });
+    }
+
+    // Should be temporary workflows. Parse the name of the workflow.
+    const wfName = wfStatus.workflowName;
+    const nameArr = wfName.split('-');
+    if (!nameArr[0].startsWith(SolidActionsExecutor.#tempWorkflowName)) {
+      throw new SolidActionsError(
+        `Cannot find workflow function for a non-temporary workflow, ID ${workflowID}, class '${wfStatus.workflowClassName}', function '${wfName}'; did you change your code?`,
+      );
+    }
+
+    if (nameArr[1] === TempWorkflowType.step) {
+      const stepReg = getFunctionRegistrationByName(wfStatus.workflowClassName, nameArr[2]);
+      if (!stepReg?.stepConfig) {
+        this.logger.error(`Cannot find step info for ID ${workflowID}, name ${nameArr[2]}`);
+        throw new SolidActionsNotRegisteredError(nameArr[2]);
+      }
+      return await runWithTopContext(recoverCtx, async () => {
+        return await this.startStepTempWF(
+          stepReg.registeredFunction as UntypedAsyncFunction,
+          {
+            workflowUUID: workflowStartID,
+            configuredInstance: configuredInst,
+            queueName: wfStatus.queueName, // Probably null
+            executeWorkflow: true,
+            isRecoveryDispatch: !!options?.isRecoveryDispatch,
+            isQueueDispatch: !!options?.isQueueDispatch,
+          },
+          undefined,
+          undefined,
+          ...inputs,
+        );
+      });
+    } else if (nameArr[1] === TempWorkflowType.send) {
+      const swf = async (destinationID: string, message: unknown, topic?: string) => {
+        const ctx = getCurrentContextStore();
+        const functionID: number = functionIDGetIncrement();
+        await this.systemDatabase.send(
+          ctx!.workflowId!,
+          functionID,
+          destinationID,
+          this.serializer.stringify(message),
+          topic,
+        );
+      };
+      const temp_workflow = swf as UntypedAsyncFunction;
+      return await runWithTopContext(recoverCtx, async () => {
+        return this.workflow(
+          temp_workflow,
+          {
+            tempWfName: nameArr[2],
+            tempWfType: TempWorkflowType.send,
+            workflowUUID: workflowStartID,
+            queueName: wfStatus.queueName,
+            executeWorkflow: true,
+            isRecoveryDispatch: !!options?.isRecoveryDispatch,
+            isQueueDispatch: !!options?.isQueueDispatch,
+          },
+          ...inputs,
+        );
+      });
+    } else {
+      this.logger.error(`Unrecognized temporary workflow! UUID ${workflowID}, name ${wfName}`);
+      throw new SolidActionsNotRegisteredError(wfName);
+    }
+  }
+
+  async getEventDispatchState(svc: string, wfn: string, key: string): Promise<SolidActionsExternalState | undefined> {
+    return await this.systemDatabase.getEventDispatchState(svc, wfn, key);
+  }
+  async upsertEventDispatchState(state: SolidActionsExternalState): Promise<SolidActionsExternalState> {
+    return await this.systemDatabase.upsertEventDispatchState(state);
+  }
+
+  #getRecoveryContext(_workflowID: string, status: WorkflowStatusInternal): SolidActionsLocalCtx {
+    // Note: this doesn't inherit the original parent context's span.
+    const oc: SolidActionsLocalCtx = {};
+    oc.request = status.request;
+    oc.authenticatedUser = status.authenticatedUser;
+    oc.authenticatedRoles = status.authenticatedRoles;
+    oc.assumedRole = status.assumedRole;
+    return oc;
+  }
+
+  async cancelWorkflow(workflowID: string): Promise<void> {
+    await this.systemDatabase.cancelWorkflow(workflowID);
+    this.logger.info(`Cancelling workflow ${workflowID}`);
+  }
+
+  async getWorkflowSteps(workflowID: string): Promise<step_info[]> {
+    const outputs = await this.systemDatabase.getAllOperationResults(workflowID);
+    return outputs.map((row) => {
+      return {
+        function_id: row.function_id,
+        function_name: row.function_name ?? '<unknown>',
+        child_workflow_id: row.child_workflow_id,
+        output: row.output !== null ? this.serializer.parse(row.output) : null,
+        error: row.error !== null ? deserializeError(this.serializer.parse(row.error as unknown as string)) : null,
+      };
+    });
+  }
+
+  async resumeWorkflow(workflowID: string): Promise<void> {
+    await this.systemDatabase.resumeWorkflow(workflowID);
+  }
+
+  /**
+    An application's version is computed from a hash of the source of its workflows.
+    This is guaranteed to be stable given identical source code because it uses an MD5 hash
+    and because it iterates through the workflows in sorted order.
+    This way, if the app's workflows are updated (which would break recovery), its version changes.
+    App version can be manually set through the SolidActions__APPVERSION environment variable.
+   */
+  computeAppVersion(): string {
+    const hasher = crypto.createHash('md5');
+    const sortedWorkflowSource = Array.from(getAllRegisteredFunctions())
+      .filter((e) => e.workflowConfig)
+      .map((i) => i.origFunction.toString())
+      .sort();
+    // Different SolidActions versions should produce different hashes.
+    sortedWorkflowSource.push(globalParams.solidActionsVersion);
+    for (const sourceCode of sortedWorkflowSource) {
+      hasher.update(sourceCode);
+    }
+    return hasher.digest('hex');
+  }
+}
