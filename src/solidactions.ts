@@ -362,7 +362,7 @@ export class SolidActions {
     globalParams.appVersion = process.env.SOLIDACTIONS__APPVERSION || '';
     globalParams.wasComputed = false;
     globalParams.appID = process.env.SOLIDACTIONS__APPID || '';
-    globalParams.executorID = process.env.SOLIDACTIONS__VMID || 'local';
+    globalParams.executorID = process.env.SOLIDACTIONS_RUN_ID || 'local';
 
     recordSolidActionsShutdown();
   }

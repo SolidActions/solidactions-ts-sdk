@@ -50,7 +50,7 @@ export function defaultEnableOTLP() {
 export const globalParams = {
   appVersion: process.env.SOLIDACTIONS__APPVERSION || '', // The one true source of appVersion
   wasComputed: false, // Was app version set or computed? Stored procs don't support computed versions.
-  executorID: process.env.SOLIDACTIONS__VMID || 'local', // The one true source of executorID
+  executorID: process.env.SOLIDACTIONS_RUN_ID || 'local', // The one true source of executorID
   appID: process.env.SOLIDACTIONS__APPID || '', // The one true source of appID
   enableOTLP: defaultEnableOTLP(), // Whether OTLP is enabled
   solidActionsVersion: loadSolidActionsVersion(), // The version of the SolidActions library
