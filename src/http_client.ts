@@ -18,6 +18,7 @@ export interface HttpClientConfig {
   timeout?: number; // Default: 30000ms
   maxRetries?: number; // Default: 3
   retryDelay?: number; // Default: 1000ms (base for exponential)
+  maxRetryDelay?: number; // Optional cap for exponential backoff (e.g., 60000ms)
 }
 
 export interface HttpRequestOptions {
@@ -40,6 +41,7 @@ export class HttpClient {
   private readonly timeout: number;
   private readonly maxRetries: number;
   private readonly retryDelay: number;
+  private readonly maxRetryDelay?: number;
   private logger?: GlobalLogger;
 
   constructor(config: HttpClientConfig, logger?: GlobalLogger) {
@@ -48,6 +50,7 @@ export class HttpClient {
     this.timeout = config.timeout ?? 30000;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryDelay = config.retryDelay ?? 1000;
+    this.maxRetryDelay = config.maxRetryDelay;
     this.logger = logger;
   }
 
@@ -106,7 +109,7 @@ export class HttpClient {
           if (attempt < this.maxRetries) {
             const delay = this.calculateRetryDelay(attempt, response);
             this.logger?.warn(
-              `HTTP request failed with status ${response.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${this.maxRetries})`,
+              `[SolidActions SDK] HTTP request failed with status ${response.status}, retrying in ${Math.round(delay)}ms (attempt ${attempt + 1}/${this.maxRetries})`,
             );
             await this.sleep(delay);
             continue;
@@ -134,7 +137,7 @@ export class HttpClient {
           if (attempt < this.maxRetries) {
             const delay = this.calculateRetryDelay(attempt);
             this.logger?.warn(
-              `Network error during HTTP request, retrying in ${delay}ms (attempt ${attempt + 1}/${this.maxRetries}): ${lastError.message}`,
+              `[SolidActions SDK] Network error, retrying in ${Math.round(delay)}ms (attempt ${attempt + 1}/${this.maxRetries}): ${lastError.message}`,
             );
             await this.sleep(delay);
             continue;
@@ -265,8 +268,12 @@ export class HttpClient {
   }
 
   /**
-   * Calculate retry delay with exponential backoff and jitter
+   * Calculate retry delay with exponential backoff and jitter.
    * Formula: delay * 2^attempt + random(0, delay * 0.5)
+   *
+   * If maxRetryDelay is configured, the delay is capped at that value
+   * (with jitter still added). This prevents extremely long delays
+   * for high retry counts.
    */
   private calculateRetryDelay(attempt: number, response?: Response): number {
     // Check for Retry-After header
@@ -289,7 +296,14 @@ export class HttpClient {
     // Exponential backoff with jitter
     const baseDelay = this.retryDelay * Math.pow(2, attempt);
     const jitter = Math.random() * (this.retryDelay * 0.5);
-    return baseDelay + jitter;
+    let delay = baseDelay + jitter;
+
+    // Cap at maxRetryDelay if configured
+    if (this.maxRetryDelay && delay > this.maxRetryDelay) {
+      delay = this.maxRetryDelay + jitter;
+    }
+
+    return delay;
   }
 
   /**

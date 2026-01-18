@@ -43,15 +43,20 @@ export class HttpSystemDatabase implements SystemDatabase {
     logger: GlobalLogger,
     serializer: SolidActionsSerializer,
   ) {
+    // HTTP client with extended retry: 10 retries, ~2 minute window
+    // This ensures transient Laravel outages don't cause workflow failures
     this.client = new HttpClient(
       {
         baseUrl: config.apiUrl,
         apiKey: config.apiKey,
         timeout: config.timeout,
-        maxRetries: config.maxRetries,
+        maxRetries: 10,
+        retryDelay: 1000,
+        maxRetryDelay: 60000, // Cap at 60 seconds between retries
       },
       logger,
     );
+
     this.executorID = executorID;
     this.appVersion = appVersion;
     this.logger = logger;
