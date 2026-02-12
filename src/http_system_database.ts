@@ -460,6 +460,14 @@ export class HttpSystemDatabase implements SystemDatabase {
   }
 
   // ==========================================
+  // Webhook Output Methods
+  // ==========================================
+
+  async setWebhookOutput(workflowID: string, body: unknown): Promise<void> {
+    await this.client.put(`/runs/status/${encodeURIComponent(workflowID)}/webhook-output`, { body });
+  }
+
+  // ==========================================
   // Event Methods
   // ==========================================
 

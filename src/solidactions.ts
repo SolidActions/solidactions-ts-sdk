@@ -1131,6 +1131,37 @@ export class SolidActions {
   }
 
   /**
+   * Set the webhook response body for sync webhooks.
+   * When a workflow is triggered via a sync webhook (response: wait/sync),
+   * this method controls what the webhook caller receives.
+   *
+   * Without respond(), the webhook returns the workflow's return value (which may
+   * include SuperJSON wrappers). With respond(), the webhook returns exactly
+   * the body you provide, as clean JSON.
+   *
+   * This method is idempotent — if called multiple times, the last write wins.
+   * It does NOT create a durable checkpoint (no functionIDGetIncrement).
+   *
+   * Must be called between steps (not inside a step or transaction).
+   *
+   * @param body - The data to return to the webhook caller (any JSON-serializable value)
+   */
+  static async respond(body: unknown): Promise<void> {
+    ensureSolidActionsIsLaunched('respond');
+    if (!SolidActions.isWithinWorkflow()) {
+      throw new SolidActionsInvalidWorkflowTransitionError(
+        'Attempt to call `SolidActions.respond` outside of a workflow',
+      );
+    }
+    if (!SolidActions.isInWorkflow()) {
+      throw new SolidActionsInvalidWorkflowTransitionError(
+        'Invalid call to `SolidActions.respond` inside a `step` or `transaction`',
+      );
+    }
+    await SolidActionsExecutor.globalInstance!.systemDatabase.setWebhookOutput(SolidActions.workflowID!, body);
+  }
+
+  /**
    * Get the value of a workflow event, or wait for it to be set.
    * This function can be called inside or outside of SolidActions workflow functions.
    * If this function is called from within a workflow, its result is durably checkpointed.

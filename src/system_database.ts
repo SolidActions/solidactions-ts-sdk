@@ -126,6 +126,8 @@ export interface SystemDatabase {
     timeoutSeconds?: number,
   ): Promise<string | null>;
 
+  setWebhookOutput(workflowID: string, body: unknown): Promise<void>;
+
   setEvent(workflowID: string, functionID: number, key: string, value: string | null): Promise<void>;
   getEvent(
     workflowID: string,
