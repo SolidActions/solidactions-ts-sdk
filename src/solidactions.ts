@@ -1131,8 +1131,8 @@ export class SolidActions {
   }
 
   /**
-   * Set the webhook response body for sync webhooks.
-   * When a workflow is triggered via a sync webhook (response: wait/sync),
+   * Set the webhook response body for wait-mode webhooks.
+   * When a workflow is triggered via a wait-mode webhook (response: wait),
    * this method controls what the webhook caller receives.
    *
    * Without respond(), the webhook returns the workflow's return value (which may
