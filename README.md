@@ -165,11 +165,32 @@ await client.cancelWorkflow(workflowId);
 await client.resumeWorkflow(workflowId);
 ```
 
+## Deploying Workflows
+
+Use the [`@solidactions/cli`](https://www.npmjs.com/package/@solidactions/cli) to deploy your workflows:
+
+```bash
+npm install -g @solidactions/cli
+
+# Authenticate
+solidactions init <api-key>
+
+# Deploy your project
+solidactions deploy <project-name> <path>
+```
+
+The CLI handles project creation, source upload, Docker builds, environment variables, and scheduling. See the [CLI repo](https://github.com/SolidActions/solidactions-cli) for full documentation.
+
 ## Documentation
 
-See `solidactions-ai-prompt.md` for comprehensive SDK documentation including:
+See [`docs/sdk-reference.md`](docs/sdk-reference.md) for comprehensive SDK documentation including:
 
-- Workflow and step patterns
-- Durable sleep, messaging, and events
-- Queues and concurrency control
+- Lifecycle: `SolidActions.run()`, `setConfig()`/`launch()`/`shutdown()`, `getInput()`
+- Workflows: registration, determinism rules, IDs and idempotency, timeouts, child workflows
+- Steps: `runStep()`, configurable retries, parallel execution with `Promise.allSettled()`
+- Durable primitives: `sleep()`, `now()`, `randomUUID()`
+- Communication: `send()`/`recv()` messaging, `setEvent()`/`getEvent()` events, streaming, `respond()`
+- Workflow handles and management: `listWorkflows()`, `cancelWorkflow()`, `forkWorkflow()`
+- SolidActionsClient: standalone HTTP client for external workflow queries
+- Configuration, custom serialization, testing, and error classes
 - Recovery and versioning
