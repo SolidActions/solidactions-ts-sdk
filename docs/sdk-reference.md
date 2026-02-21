@@ -1058,26 +1058,77 @@ SolidActions.logger.debug('Step details', { stepId: SolidActions.stepID });
 
 ---
 
-## Testing
+## Local Development
 
-Use Jest or Vitest with `setConfig`/`launch`/`shutdown` for test isolation:
+Run workflows locally without deploying to SolidActions using the in-memory mock server. This is ideal for fast iteration on workflow logic.
+
+### Using the CLI (recommended)
+
+```bash
+npm install -g @solidactions/cli
+
+# Run a workflow locally — no deploy, no auth, no backend needed
+solidactions dev src/my-workflow.ts -i '{"key": "value"}'
+```
+
+The `dev` command starts an in-memory mock server, sets the required SDK environment variables, and runs your workflow file directly. All step execution works normally — only platform features like durable sleep wakeups and cross-process messaging are no-ops.
+
+### Using the mock server directly
+
+Import `createMockServer` from `@solidactions/sdk/testing` for custom test setups:
 
 ```typescript
+import { createMockServer } from '@solidactions/sdk/testing';
 import { SolidActions } from '@solidactions/sdk';
 
+const server = await createMockServer();
+
+SolidActions.setConfig({
+  name: 'test-app',
+  api: { url: server.baseUrl, key: 'test-key' },
+});
+await SolidActions.launch();
+
+// Run your workflow...
+
+await SolidActions.shutdown();
+await server.stop();
+```
+
+The mock server implements the full SolidActions HTTP API in memory — workflows, steps, messages, events, streams, and queues all work.
+
+### What works locally vs what doesn't
+
+| Works                          | No-op locally                   |
+| ------------------------------ | ------------------------------- |
+| Sequential & parallel steps    | Durable sleep scheduler wakeups |
+| Child workflows                | Cross-process messaging         |
+| Events (`setEvent`/`getEvent`) | Tenant env var injection        |
+| Streams                        | Webhook `respond()`             |
+| Retries with backoff           | Persistent recovery after crash |
+
+## Testing
+
+Use Jest or Vitest with the mock server for test isolation (no real backend needed):
+
+```typescript
+import { createMockServer, MockHttpServer } from '@solidactions/sdk/testing';
+import { SolidActions } from '@solidactions/sdk';
+
+let server: MockHttpServer;
+
 beforeAll(async () => {
+  server = await createMockServer();
   SolidActions.setConfig({
     name: 'test-app',
-    api: {
-      url: process.env.SOLIDACTIONS_API_URL!,
-      key: process.env.SOLIDACTIONS_API_KEY!,
-    },
+    api: { url: server.baseUrl, key: 'test-key' },
   });
   await SolidActions.launch();
 });
 
 afterAll(async () => {
   await SolidActions.shutdown();
+  await server.stop();
 });
 ```
 
