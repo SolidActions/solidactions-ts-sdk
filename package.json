@@ -1,6 +1,6 @@
 {
   "name": "@solidactions/sdk",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "SolidActions SDK - Durable workflow execution framework",
   "license": "MIT",
   "repository": {
@@ -37,6 +37,11 @@
       "import": "./dist/src/index.js",
       "require": "./dist/src/index.js",
       "types": "./dist/src/index.d.ts"
+    },
+    "./testing": {
+      "import": "./dist/src/testing/index.js",
+      "require": "./dist/src/testing/index.js",
+      "types": "./dist/src/testing/index.d.ts"
     }
   },
   "workspaces": [

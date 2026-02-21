@@ -9,7 +9,7 @@ import { SolidActions, StatusString } from '../src';
 import { sleepms } from '../src/utils';
 import { HttpSystemDatabase } from '../src/system_database';
 import { GlobalLogger } from '../src/telemetry/logs';
-import { MockHttpServer, createMockServer } from './http_mock_server';
+import { MockHttpServer, createMockServer } from '../src/testing/mock_server';
 
 // Global mock server instance for tests
 let globalMockServer: MockHttpServer | null = null;

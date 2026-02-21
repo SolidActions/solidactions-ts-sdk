@@ -4,7 +4,7 @@
 
 import { HttpClient } from '../src/http_client';
 import { HttpSystemDatabase } from '../src/http_system_database';
-import { createMockServer, MockHttpServer } from './http_mock_server';
+import { createMockServer, MockHttpServer } from '../src/testing/mock_server';
 import { GlobalLogger } from '../src/telemetry/logs';
 import { StatusString } from '../src/workflow';
 import {
