@@ -18,14 +18,7 @@ import {
 } from './workflow';
 import { sleepms, globalParams } from './utils';
 import { SolidActionsJSON, SolidActionsSerializer } from './serialization';
-import {
-  forkWorkflow,
-  getWorkflow,
-  listQueuedWorkflows,
-  listWorkflows,
-  listWorkflowSteps,
-  toWorkflowStatus,
-} from './workflow_management';
+import { forkWorkflow, getWorkflow, listWorkflows, listWorkflowSteps, toWorkflowStatus } from './workflow_management';
 import { SolidActionsExecutor } from './solidactions-executor';
 import { SolidActionsAwaitedWorkflowCancelledError } from './error';
 
@@ -198,10 +191,6 @@ export class SolidActionsClient {
 
   listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]> {
     return listWorkflows(this.systemDatabase, input);
-  }
-
-  listQueuedWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]> {
-    return listQueuedWorkflows(this.systemDatabase, input);
   }
 
   listWorkflowSteps(workflowID: string): Promise<StepInfo[] | undefined> {

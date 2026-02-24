@@ -1095,7 +1095,7 @@ await SolidActions.shutdown();
 await server.stop();
 ```
 
-The mock server implements the full SolidActions HTTP API in memory — workflows, steps, messages, events, streams, and queues all work.
+The mock server implements the full SolidActions HTTP API in memory — workflows, steps, messages, events, and streams all work.
 
 ### What works locally vs what doesn't
 
@@ -1150,10 +1150,12 @@ afterEach(async () => {
 
 ## Error Classes
 
-All SDK errors extend `SolidActionsError`:
+All SDK errors extend `SolidActionsError`. Errors are exported under the `Error` namespace:
 
 ```typescript
-import { SolidActionsError } from '@solidactions/sdk';
+import { Error } from '@solidactions/sdk';
+
+// Use as Error.SolidActionsError, Error.SolidActionsWorkflowConflictError, etc.
 ```
 
 | Error Class                                    | When Thrown                                                   |
