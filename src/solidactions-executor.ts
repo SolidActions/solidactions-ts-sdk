@@ -531,6 +531,7 @@ export class SolidActionsExecutor {
       internalStatus.status = StatusString.ERROR;
       if (!exec.#debugMode) {
         await exec.systemDatabase.recordWorkflowError(workflowID, internalStatus);
+        await exec.systemDatabase.reportWorkflowComplete(workflowID, 'failed', undefined, e.message);
       }
       span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
     }
@@ -591,6 +592,7 @@ export class SolidActionsExecutor {
         internalStatus.status = StatusString.SUCCESS;
         if (!this.#debugMode) {
           await this.systemDatabase.recordWorkflowOutput(workflowID, internalStatus);
+          await this.systemDatabase.reportWorkflowComplete(workflowID, 'completed', result);
         }
         span.setStatus({ code: SpanStatusCode.OK });
       } catch (err) {

@@ -130,6 +130,25 @@ export class HttpSystemDatabase implements SystemDatabase {
     });
   }
 
+  async reportWorkflowComplete(
+    workflowID: string,
+    status: 'completed' | 'failed',
+    output?: unknown,
+    error?: string,
+  ): Promise<void> {
+    try {
+      await this.client.post(`/runs/status/${encodeURIComponent(workflowID)}/workflow-complete`, {
+        status,
+        output,
+        error,
+      });
+    } catch (err) {
+      // Non-fatal: infrastructure signal (NF webhook/reaper) is the fallback
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Failed to report workflow completion for ${workflowID} (${status}): ${errMsg}`);
+    }
+  }
+
   async getWorkflowStatus(
     workflowID: string,
     callerID?: string,

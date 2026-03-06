@@ -59,6 +59,12 @@ export interface SystemDatabase {
   ): Promise<{ status: string; shouldExecuteOnThisExecutor: boolean; deadlineEpochMS?: number }>;
   recordWorkflowOutput(workflowID: string, status: WorkflowStatusInternal): Promise<void>;
   recordWorkflowError(workflowID: string, status: WorkflowStatusInternal): Promise<void>;
+  reportWorkflowComplete(
+    workflowID: string,
+    status: 'completed' | 'failed',
+    output?: unknown,
+    error?: string,
+  ): Promise<void>;
 
   getPendingWorkflows(executorID: string, appVersion: string): Promise<GetPendingWorkflowsOutput[]>;
 
