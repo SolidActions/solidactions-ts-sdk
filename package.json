@@ -9,7 +9,7 @@
   },
   "homepage": "https://solidactions.com/",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "keywords": [
     "solidactions",
