@@ -389,6 +389,59 @@ export class SolidActions {
   }
 
   /**
+   * Get workflow input, with async fallback to WORKFLOW_INPUT_URL.
+   *
+   * Resolution order:
+   * 1. WORKFLOW_INPUT env var (parsed as JSON)
+   * 2. WORKFLOW_INPUT_URL env var (fetched via HTTP GET with Bearer auth)
+   * 3. Empty object
+   *
+   * The URL fallback supports large webhook payloads that exceed
+   * environment variable size limits. The endpoint is expected to
+   * return raw JSON (the trigger_input array).
+   *
+   * @returns Parsed input or empty object if not available
+   */
+  static async getInputAsync<T = Record<string, unknown>>(): Promise<T> {
+    // Try WORKFLOW_INPUT first (same as getInput)
+    const raw = process.env.WORKFLOW_INPUT;
+    if (raw) {
+      try {
+        return JSON.parse(raw) as T;
+      } catch {
+        return {} as T;
+      }
+    }
+
+    // Fallback: fetch from WORKFLOW_INPUT_URL
+    const url = process.env.WORKFLOW_INPUT_URL;
+    if (!url) {
+      return {} as T;
+    }
+
+    const apiKey = process.env.SOLIDACTIONS_API_KEY;
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch workflow input from WORKFLOW_INPUT_URL: ${response.status} ${response.statusText}`,
+      );
+    }
+    const text = await response.text();
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return {} as T;
+    }
+  }
+
+  /**
    * Run a workflow with minimal boilerplate.
    * Handles launch(), startWorkflow(), getResult(), and shutdown().
    *
@@ -415,7 +468,7 @@ export class SolidActions {
   ): Promise<void> {
     try {
       await SolidActions.launch();
-      const input = options?.input ?? SolidActions.getInput<T>();
+      const input = options?.input ?? (await SolidActions.getInputAsync<T>());
       const handle = await SolidActions.startWorkflow(workflow, {
         workflowID: options?.workflowID,
       })(input);
