@@ -61,6 +61,7 @@
   "devDependencies": {
     "@eslint/js": "^9.22.0",
     "@solidactions/otel": "packages/otel",
+    "@types/jest": "^30.0.0",
     "@types/node": "^20.19.1",
     "@types/supertest": "^6.0.2",
     "@types/ws": "^8.18.0",
