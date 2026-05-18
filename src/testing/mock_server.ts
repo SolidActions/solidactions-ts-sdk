@@ -652,16 +652,34 @@ export class MockHttpServer {
   private getOperation(workflowUUID: string, functionId: number): { status: number; body: unknown } {
     const ops = this.store.operations.get(workflowUUID) || [];
     const op = ops.find((o) => o.functionId === functionId);
+    const workflow = this.store.workflows.get(workflowUUID);
+    const runCancelled = workflow?.status === StatusString.CANCELLED;
     if (!op) {
+      // Mirror the real OperationController::show: a CANCELLED run
+      // short-circuits EVERY operation fetch with cancelled:true even when no
+      // operation row exists for the requested functionID, so the SDK's
+      // getOperationResultAndThrowIfCancelled throws and the workflow aborts
+      // on its next durable checkpoint. Otherwise the empty result is null.
+      if (runCancelled) {
+        return {
+          status: 200,
+          body: {
+            output: null,
+            error: null,
+            cancelled: true,
+            childWorkflowID: null,
+            functionName: null,
+          },
+        };
+      }
       return { status: 200, body: null };
     }
-    const workflow = this.store.workflows.get(workflowUUID);
     return {
       status: 200,
       body: {
         output: op.output,
         error: op.error,
-        cancelled: workflow?.status === StatusString.CANCELLED,
+        cancelled: runCancelled,
         childWorkflowID: op.childWorkflowId,
         functionName: op.functionName,
       },
