@@ -103,7 +103,7 @@ import { StepConfig } from './step';
 // Task 2.3: the one-shot compat path — run() = ContextAdapter -> invoke() -> RuntimeAdapter.
 //
 // invoke()/contextAdapter/runtimeAdapter/HttpClient are required LAZILY inside
-// run()/#reportOneShotCompletion (call-time require()) to avoid a module-load
+// run()/#initOneShotStatusRow/#reportOneShotTerminalState (call-time require()) to avoid a module-load
 // cycle: http_system_database -> workflow -> solidactions -> invoke ->
 // invoke-system-database -> (extends) http_system_database. A STATIC import of
 // the invoke chain here re-enters http_system_database before its
@@ -689,7 +689,11 @@ export class SolidActions {
    *
    * Best-effort swallow (symmetric with the terminal-state swallows): a
    * one-shot process must not crash on a transient persistence blip; the
-   * reaper reconciles. The HTTP primitive is replicated via HttpClient (the
+   * reaper reconciles. (NOTE the non-transient case: see the Task 2.5 HAZARD
+   * at `applicationID` below — an empty appId 422s this create, which then
+   * cascades to the step/output PUTs 404ing and being silently swallowed;
+   * the e2e parity gate, not this swallow, is what must catch that.)
+   * The HTTP primitive is replicated via HttpClient (the
    * same lazy-require the Task 2.3 POST used): HttpSystemDatabase.initWorkflowStatus
    * is an instance method on a class the one-shot path does not (and must not,
    * per the invoke.ts architecture) construct, so the faithful path is to
