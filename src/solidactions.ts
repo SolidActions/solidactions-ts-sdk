@@ -26,6 +26,7 @@ import {
   InternalWFHandle,
   isWorkflowActive,
   RetrievedHandle,
+  StatusString,
   StepInfo,
   WorkflowConfig,
   WorkflowHandle,
@@ -542,20 +543,34 @@ export class SolidActions {
     // descriptor re-applies <T>, so this widening cast is sound.
     const result = await invoke<T, R>(descriptor, ctx as unknown as InvokeCtx<T>);
 
-    // Reproduce the legacy backend completion signal from the InvokeResult.
+    // Reproduce the legacy backend completion sequence from the InvokeResult.
     //
-    // Legacy run() POSTed completion indirectly: the executor called
-    // systemDatabase.recordWorkflowOutput/Error (PUT .../output|/error, which
-    // mutates a status row the executor had already created) AND
-    // systemDatabase.reportWorkflowComplete (POST .../workflow-complete — a
-    // fire-and-forget infra signal whose errors are swallowed).
+    // Legacy run() persisted terminal state via the executor's TWO-step
+    // sequence (src/solidactions-executor.ts runWorkflow / handleWorkflowError):
+    //   1. systemDatabase.recordWorkflowOutput / recordWorkflowError —
+    //      `PUT /runs/status/<id>/output|error` with {output|error, status}.
+    //      This is the ONLY write the real Laravel backend persists into
+    //      RunStatus.output|error (RunStatusController::workflowComplete
+    //      DISCARDS the POST body's output/error and only syncs status).
+    //   2. systemDatabase.reportWorkflowComplete —
+    //      `POST /runs/status/<id>/workflow-complete` — a fire-and-forget infra
+    //      signal whose errors are swallowed.
     //
-    // The invoke() engine (InvokeSystemDatabase) deliberately does NOT create
-    // that status row (see invoke.ts header), so the row-mutating PUTs have no
-    // row to update on the one-shot path. The faithful, row-independent
-    // completion signal is reportWorkflowComplete; we reproduce exactly that
-    // POST here from the InvokeResult. Recreating the legacy status-row
-    // lifecycle is Task 2.4b convergence work, not 2.3/2.4a.
+    // Task 2.4b: reproduce BOTH, in that order, from the InvokeResult. Identity
+    // (workflowID) comes strictly from ctx.run.runUuid (the ALS/ctx scope) —
+    // NEVER bootParams (re-reading bootParams would re-globalize the row, the
+    // exact regression deglobalization removed).
+    //
+    // Run-row creation: the legacy executor also called initWorkflowStatus
+    // (`POST /runs/status`) to CREATE the row before the PUTs. The one-shot
+    // run() path deliberately does NOT reproduce that: in production the
+    // Laravel trigger-dispatch path creates the run row BEFORE the one-shot
+    // process starts (the invoke() engine never calls initWorkflowStatus — see
+    // invoke.ts header), so the PUTs mutate a pre-existing row. Re-creating it
+    // here would be redundant and would force re-deriving the row's executor /
+    // app identity (the deglobalized fields) from somewhere — exactly what
+    // 2.4a removed. The Task 2.5 e2e gate confirms trigger-dispatch owns row
+    // creation.
     await SolidActions.#reportOneShotCompletion(ctx.api, ctx.run.runUuid, result);
 
     process.exit(oneShotRuntimeAdapter.exitCodeFor(result));
@@ -601,14 +616,39 @@ export class SolidActions {
   }
 
   /**
-   * Reproduce the legacy `reportWorkflowComplete` POST from an InvokeResult.
+   * Reproduce the legacy terminal status-row sequence from an InvokeResult.
    *
-   * Mirrors HttpSystemDatabase.reportWorkflowComplete:
-   *   POST /runs/status/<id>/workflow-complete { status, output?, error? }
-   * with `status: 'completed' | 'failed'` and errors swallowed (the infra
-   * webhook/reaper is the fallback). Suspension is terminal-neutral for the
-   * one-shot process (exit 0) and posts nothing here — the sleep/recv schedule
-   * was already POSTed by InvokeSystemDatabase before it threw.
+   * Mirrors the legacy executor's two-step terminal sequence
+   * (src/solidactions-executor.ts) exactly, in order:
+   *
+   *  1. The durable status-row write — the ONLY write the real backend
+   *     persists into RunStatus.output|error:
+   *       - completed → HttpSystemDatabase.recordWorkflowOutput:
+   *         `PUT /runs/status/<id>/output { output, status: 'SUCCESS' }`
+   *       - failed    → HttpSystemDatabase.recordWorkflowError:
+   *         `PUT /runs/status/<id>/error  { error,  status: 'ERROR' }`
+   *     (legacy `internalStatus.status` was StatusString.SUCCESS / .ERROR; the
+   *     PUT body's `status` is that value verbatim.)
+   *  2. HttpSystemDatabase.reportWorkflowComplete:
+   *     `POST /runs/status/<id>/workflow-complete { status, output?|error? }`
+   *     with `status: 'completed' | 'failed'`.
+   *
+   * `workflowID` is ctx.run.runUuid (the ALS/ctx scope) — never bootParams.
+   *
+   * Errors on BOTH calls are swallowed (the infra webhook/reaper is the
+   * fallback, matching legacy reportWorkflowComplete's swallow; the PUT is
+   * best-effort here for symmetry — a one-shot process that already produced
+   * its result must not crash on a transient persistence blip, the reaper
+   * reconciles). The HTTP primitive is replicated via HttpClient (the same
+   * lazy-require the Task 2.3 POST used): HttpSystemDatabase.recordWorkflow*
+   * are instance methods on a class the one-shot path does not (and must not,
+   * per the invoke.ts architecture) construct, so the faithful path is to
+   * issue the identical PUT shape directly — see the Task 1.2 precedent
+   * (InvokeSystemDatabase replicating the POST it could not reach).
+   *
+   * Suspension is terminal-neutral for the one-shot process (exit 0): no
+   * status-row write — the sleep/recv schedule was already POSTed by
+   * InvokeSystemDatabase before it threw.
    */
   static async #reportOneShotCompletion(
     api: { url: string; key: string },
@@ -623,16 +663,45 @@ export class SolidActions {
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
     const { HttpClient } = require('./http_client') as typeof import('./http_client');
     const client = new HttpClient({ baseUrl: api.url, apiKey: api.key }, SolidActions.logger as GlobalLogger);
+    const encodedID = encodeURIComponent(workflowID);
+
+    // Step 1: durable status-row write (recordWorkflowOutput/recordWorkflowError
+    // shape, verbatim). Best-effort: a swallow here matches the swallow on the
+    // legacy reportWorkflowComplete and keeps the one-shot process from
+    // crashing post-result on a transient blip (the reaper reconciles).
     try {
       if (result.status === 'completed') {
-        await client.post(`/runs/status/${encodeURIComponent(workflowID)}/workflow-complete`, {
+        await client.put(`/runs/status/${encodedID}/output`, {
+          output: result.output,
+          status: StatusString.SUCCESS,
+        });
+      } else {
+        const err = result.error;
+        const message = err instanceof Error ? err.message : String(err);
+        await client.put(`/runs/status/${encodedID}/error`, {
+          error: message,
+          status: StatusString.ERROR,
+        });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      (SolidActions.logger as GlobalLogger).warn(
+        `Failed to persist one-shot status-row ${result.status === 'completed' ? 'output' : 'error'} ` +
+          `for ${workflowID}: ${errMsg}`,
+      );
+    }
+
+    // Step 2: fire-and-forget completion signal (reportWorkflowComplete shape).
+    try {
+      if (result.status === 'completed') {
+        await client.post(`/runs/status/${encodedID}/workflow-complete`, {
           status: 'completed',
           output: result.output,
         });
       } else {
         const err = result.error;
         const message = err instanceof Error ? err.message : String(err);
-        await client.post(`/runs/status/${encodeURIComponent(workflowID)}/workflow-complete`, {
+        await client.post(`/runs/status/${encodedID}/workflow-complete`, {
           status: 'failed',
           error: message,
         });

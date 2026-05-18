@@ -940,6 +940,76 @@ export class MockHttpServer {
     }
     return undefined;
   }
+
+  /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `PUT /runs/status/<id>/output` (the durable success status-row
+   * write — HttpSystemDatabase.recordWorkflowOutput), or undefined if none.
+   *
+   * Returns the requestLog index alongside the body+workflowID so tests can
+   * assert ORDER (the PUT must precede the workflow-complete POST) and prove the
+   * path's run id is the ctx run uuid. The /output route HAS a store handler
+   * (recordOutput); this accessor still reads requestLog only — it never mutates
+   * store or affects routing.
+   */
+  lastOutputPut():
+    | { index: number; workflowID: string; body: { output?: unknown; status?: unknown } }
+    | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/output$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'PUT' && m) {
+        return {
+          index: i,
+          workflowID: decodeURIComponent(m[1]),
+          body: entry.body as { output?: unknown; status?: unknown },
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `PUT /runs/status/<id>/error` (the durable failure status-row
+   * write — HttpSystemDatabase.recordWorkflowError), or undefined if none.
+   * Same shape/contract as {@link lastOutputPut}.
+   */
+  lastErrorPut():
+    | { index: number; workflowID: string; body: { error?: unknown; status?: unknown } }
+    | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/error$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'PUT' && m) {
+        return {
+          index: i,
+          workflowID: decodeURIComponent(m[1]),
+          body: entry.body as { error?: unknown; status?: unknown },
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the requestLog index of the most recent
+   * workflow-complete POST, or undefined if none. Pairs with
+   * {@link lastOutputPut}/{@link lastErrorPut} for order-sensitive assertions
+   * (PUT index must be < this index). Inspects requestLog only.
+   */
+  lastWorkflowCompleteIndex(): number | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/workflow-complete$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return i;
+      }
+    }
+    return undefined;
+  }
 }
 
 /**
