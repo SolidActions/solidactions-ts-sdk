@@ -168,6 +168,10 @@ export async function invoke<I, O>(
     executorID: String(ctx.run.triggerId),
     appId: ctx.app.appId,
     appVersion: ctx.app.appVersion,
+    // Task 2.6: public API base URL, ctx-sourced (never process.env), so the
+    // bridged SolidActions.getSignalUrls can build signal URLs on the invoke
+    // path without reading SOLIDACTIONS_API_URL/APP_URL.
+    apiUrl: ctx.api.url,
     functionIDCounter: 0,
   };
   // Build the durable primitives once; attach to ctx (for descriptor bodies that

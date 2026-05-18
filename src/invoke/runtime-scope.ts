@@ -37,6 +37,14 @@ export interface RuntimeParams {
   /** Application version string for this invocation. */
   readonly appVersion: string;
   /**
+   * Public API base URL for this invocation (from ctx.api.url — never a
+   * process.env read). Task 2.6: the bridged SolidActions.getSignalUrls needs
+   * the public base URL on the invoke path; the legacy method read it from
+   * SOLIDACTIONS_API_URL/APP_URL env, which the one-shot invoke path no longer
+   * carries. Threaded here, ctx-sourced, so getSignalUrls stays env-free.
+   */
+  readonly apiUrl: string;
+  /**
    * Monotonic durable function-id counter for this run. Each durable operation
    * (step/sleep/recv/send) consumes the next id; mutated in place so a single
    * run's primitives stay correctly ordered.

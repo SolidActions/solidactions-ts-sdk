@@ -116,7 +116,7 @@ import { StepConfig } from './step';
 // `solidactions` (e.g. `invoke-system-database`'s `http_system_database`
 // dependency is made type-only / the shared HttpClient base is extracted) —
 // NOT merely when the legacy executor or globalParams is deleted.
-import { getCurrentPrimitives } from './invoke/runtime-scope';
+import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
 import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
@@ -895,11 +895,20 @@ export class SolidActions {
     reject: string;
     custom: (action: string) => string;
   } {
-    /* boot-only */ // legacy runner transport (SOLIDACTIONS_API_URL / APP_URL env); the invoke() path derives URLs from ctx.api
-    const baseApiUrl =
-      process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') || // (also collapsed a pre-existing duplicated SOLIDACTIONS_API_URL operand here — X||X||Y ≡ X||Y, behavior-neutral)
-      process.env.APP_URL ||
-      'http://localhost:8000';
+    // Task 2.6: under the one-shot run() path a legacy-API body runs inside
+    // invoke()'s ALS scope, which carries the public API base URL sourced
+    // strictly from ctx.api.url (threaded into runtimeParams.apiUrl — never a
+    // process.env read on the invoke path). Use it when in an invoke scope;
+    // otherwise fall back to the legacy runner transport env
+    // (SOLIDACTIONS_API_URL / APP_URL) so the non-invoke path stays
+    // byte-unchanged. Both strip the internal-API suffix to yield the public
+    // host signal URLs are served from.
+    const scope = getCurrentScope();
+    const baseApiUrl = scope
+      ? scope.runtimeParams.apiUrl.replace('/api/internal', '')
+      : process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') ||
+        process.env.APP_URL ||
+        'http://localhost:8000';
 
     const workflowId = SolidActions.workflowID;
     if (!workflowId) {
@@ -988,7 +997,15 @@ export class SolidActions {
 
   /** Get the current workflow ID */
   static get workflowID(): string | undefined {
-    return getCurrentContextStore()?.workflowId;
+    // Task 2.6: when a legacy-registered workflow body runs under the one-shot
+    // run() path it executes inside invoke()'s ALS scope (not the legacy
+    // context store, which is never populated on that path). Read the scope's
+    // workflow id FIRST; fall back to the legacy context store when not in an
+    // invoke scope so the non-invoke legacy path stays byte-unchanged. This
+    // getter is consumed broadly (isWithinWorkflow/isInWorkflow,
+    // getSignalUrls, event/message/multistep workflows) — fixing it here
+    // resolves several dependent bridges at once.
+    return getCurrentScope()?.runtimeParams.workflowID ?? getCurrentContextStore()?.workflowId;
   }
 
   /**
@@ -1043,7 +1060,10 @@ export class SolidActions {
    *   transaction, or procedure), false otherwise
    */
   static isWithinWorkflow(): boolean {
-    return getCurrentContextStore()?.workflowId !== undefined;
+    // Task 2.6: mirror the workflowID getter — an active invoke scope means we
+    // ARE within a workflow (legacy-API body under the one-shot run() path).
+    // Scope-first, then legacy context store (non-invoke path byte-unchanged).
+    return getCurrentScope() !== undefined || getCurrentContextStore()?.workflowId !== undefined;
   }
 
   /**
@@ -1506,6 +1526,22 @@ export class SolidActions {
    * @param idempotencyKey - Optional key for sending the message exactly once
    */
   static async send<T>(destinationID: string, message: T, topic?: string, idempotencyKey?: string): Promise<void> {
+    // Task 2.6: invoke-scope bridge (see setEvent for the rationale). Sender is
+    // the invoke-scope workflow id; the `destinationID` from the PUBLIC API is
+    // preserved so cross-workflow sends keep working (NOT regressed to the
+    // self-send-only ctx primitive). Invoke-ALS function id, not legacy
+    // functionIDGetIncrement. Non-invoke path is byte-unchanged legacy below.
+    const scope = getCurrentScope();
+    if (scope) {
+      return scope.executor.send(
+        scope.runtimeParams.workflowID,
+        nextFunctionID(),
+        destinationID,
+        SolidActionsJSON.stringify(message),
+        topic,
+      );
+    }
+
     ensureSolidActionsIsLaunched('send');
     if (SolidActions.isWithinWorkflow()) {
       if (!SolidActions.isInWorkflow()) {
@@ -1543,6 +1579,37 @@ export class SolidActions {
    * @returns Any message received, or `null` if the timeout expires
    */
   static async recv<T>(topic?: string, timeoutSeconds?: number): Promise<T | null> {
+    // Task 2.6: invoke-scope bridge (see setEvent for the rationale). Preserves
+    // BOTH `topic` and `timeoutSeconds` from the public API and the legacy
+    // two-functionID semantics (a function id for the recv and a separate one
+    // for the timeout). The ALS-scoped engine is InvokeSystemDatabase, whose
+    // recv() POSTs /wait then throws SuspensionRequired (invoke() maps that to
+    // { status: 'suspended' } → run() skips terminal writes and exits 0;
+    // scheduler resumes on signal/timeout). Invoke-ALS function ids, not legacy
+    // functionIDGetIncrement. Non-invoke path is byte-unchanged legacy below.
+    //
+    // CODEX-FLAG (not masking): a pre-existing backend hazard, NOT fixable in
+    // the SDK and NOT fixed here — the backend /wait handler sets the run
+    // status to `waiting` (Laravel MessageController.php:265), but the wakeup
+    // sweep ProcessScheduledActions.php:124 only re-dispatches runs in
+    // `waiting_signal`. So a recv-suspended one-shot run may not be woken by
+    // the scheduler. Flag for the Phase-2 e2e gate / a separate backend or
+    // harness fix; the SDK-side bridge here is correct (it preserves topic +
+    // timeout and suspends properly).
+    const scope = getCurrentScope();
+    if (scope) {
+      const functionID = nextFunctionID();
+      const timeoutFunctionID = nextFunctionID();
+      const raw = await scope.executor.recv(
+        scope.runtimeParams.workflowID,
+        functionID,
+        timeoutFunctionID,
+        topic,
+        timeoutSeconds,
+      );
+      return SolidActionsJSON.parse(raw) as T;
+    }
+
     ensureSolidActionsIsLaunched('recv');
     if (SolidActions.isWithinWorkflow()) {
       if (!SolidActions.isInWorkflow()) {
@@ -1575,6 +1642,23 @@ export class SolidActions {
    * @param value - The value to associate with `key`
    */
   static async setEvent<T>(key: string, value: T): Promise<void> {
+    // Task 2.6: a legacy-registered workflow body running under the one-shot
+    // run() path executes inside invoke()'s ALS scope (not the legacy
+    // executor). Delegate to the ALS-scoped engine with the invoke-scope
+    // identity + an invoke-ALS function id (NOT legacy functionIDGetIncrement).
+    // ensureSolidActionsIsLaunched() is a legacy-launch guard that does not
+    // apply to the invoke() path, so it is intentionally skipped here. When
+    // NOT in an invoke scope, behavior is byte-unchanged legacy below.
+    const scope = getCurrentScope();
+    if (scope) {
+      return scope.executor.setEvent(
+        scope.runtimeParams.workflowID,
+        nextFunctionID(),
+        key,
+        SolidActionsJSON.stringify(value),
+      );
+    }
+
     ensureSolidActionsIsLaunched('setEvent');
     if (SolidActions.isWithinWorkflow()) {
       if (!SolidActions.isInWorkflow()) {
@@ -1612,6 +1696,21 @@ export class SolidActions {
    * @param body - The data to return to the webhook caller (any JSON-serializable value)
    */
   static async respond(body: unknown): Promise<void> {
+    // Task 2.6: invoke-scope bridge (see setEvent for the rationale). respond
+    // is NOT a durable checkpoint (no function id, matching the legacy path).
+    // The webhook-output PUT MUST be awaited end-to-end before control returns:
+    // the backend publishes the Redis wait-mode webhook response INSIDE
+    // recordWebhookOutput (Laravel RunStatusController.php:307), so a
+    // fire-and-forget would race the one-shot process.exit and drop the
+    // caller's response. `await` here + the caller's `await SolidActions.respond`
+    // guarantees the PUT completes before run() proceeds to exit. Non-invoke
+    // path is byte-unchanged legacy below.
+    const scope = getCurrentScope();
+    if (scope) {
+      await scope.executor.setWebhookOutput(scope.runtimeParams.workflowID, body);
+      return;
+    }
+
     ensureSolidActionsIsLaunched('respond');
     if (!SolidActions.isWithinWorkflow()) {
       throw new SolidActionsInvalidWorkflowTransitionError(
