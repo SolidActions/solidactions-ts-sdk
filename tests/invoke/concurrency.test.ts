@@ -156,5 +156,11 @@ describe('invoke concurrency — identity isolation', () => {
     });
 
     expect(srv.assertNoIdentityCrossContamination(expectedKeyByRun)).toBe(true);
+
+    // Guard: prove the identity assertion above inspected real requests (not a vacuous pass on an empty log).
+    // Each invoke runs one ctx.step → at minimum a GET operations + a POST operation = 2 workflow-scoped requests.
+    // Uses the same path regex as assertNoIdentityCrossContamination() (/^\/runs\/status\/([^/?]+)/) so the
+    // guard and the assertion classify "workflow-scoped" identically.
+    expect(srv.requestLog.filter(e => /^\/runs\/status\/([^/?]+)/.test(e.path)).length).toBeGreaterThanOrEqual(N * 2);
   });
 });

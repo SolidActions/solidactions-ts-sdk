@@ -857,7 +857,7 @@ export class MockHttpServer {
       }
 
       // Dimension B: the bearer that actually rode on this request.
-      const rawAuth = entry.headers['authorization'] ?? entry.headers['Authorization'];
+      const rawAuth = entry.headers['authorization'];
       const authHeader = Array.isArray(rawAuth) ? rawAuth[0] : rawAuth;
       const prefix = 'Bearer ';
       if (typeof authHeader !== 'string' || !authHeader.startsWith(prefix)) {
