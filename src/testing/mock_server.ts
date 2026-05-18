@@ -995,6 +995,33 @@ export class MockHttpServer {
   }
 
   /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `POST /runs/status` run-row CREATE (the legacy
+   * HttpSystemDatabase.initWorkflowStatus shape), or undefined if none.
+   *
+   * This is the row-create the real backend requires before recordOutput /
+   * recordError can 200 (those 404 on an absent row). Returns the requestLog
+   * index alongside the body so tests can assert ORDER (the CREATE must precede
+   * the output/error PUT) and prove the create path runs without external
+   * seeding. The `POST /runs/status` route maps to the createWorkflow store
+   * handler; this accessor still reads requestLog only — it never mutates store
+   * or affects routing. The path match is exact (no trailing segment) so it
+   * never collides with `/runs/status/<id>/...` sub-routes.
+   */
+  lastRunStatusCreate():
+    | { index: number; body: Record<string, unknown> }
+    | undefined {
+    const re = /^\/(?:runs\/status|workflows)$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return { index: i, body: entry.body as Record<string, unknown> };
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Task 2.4b (READ-ONLY): the requestLog index of the most recent
    * workflow-complete POST, or undefined if none. Pairs with
    * {@link lastOutputPut}/{@link lastErrorPut} for order-sensitive assertions
