@@ -30,7 +30,15 @@
  *  - no-seed    → with NO pre-seeded row, the one-shot path itself issues the
  *                 `POST /runs/status` create BEFORE the output PUT, proving the
  *                 create path works without external seeding.
- *  - suspended  → NEITHER row create nor PUT (and exit 0).
+ *  - no-seed +  → with NO pre-seeded row AND a STEP-ful body, the row create
+ *    stepful      precedes the FIRST step-record POST
+ *                 (`POST /runs/status/<id>/operations`) — proving the row
+ *                 exists BEFORE invoke() runs the body (Task 2.4b ordering
+ *                 fix; the real-Daytona parity break this suite missed because
+ *                 the stepless no-seed case never POSTed a step pre-create).
+ *  - suspended  → row create still happens (BEFORE invoke, so the step +
+ *                 durable sleep schedule 200), but NEITHER output/error PUT
+ *                 nor workflow-complete POST (run not terminal; exit 0).
  *
  * Mock wiring mirrors run-compat.test.ts: the one-shot ContextAdapter maps
  * SOLIDACTIONS_API_URL/KEY/RUN_ID → ctx.api.url/key + ctx.run.runUuid.
@@ -240,19 +248,116 @@ it('NO pre-seeded row → run() itself POSTs /runs/status (row create) BEFORE th
   expect(outputPut!.index).toBeLessThan(completeIdx!);
 });
 
-it('suspended (sleep) → NEITHER row create nor output/error PUT, exit 0', async () => {
+it('NO pre-seeded row + STEP-ful body → run() POSTs /runs/status (row create) BEFORE the workflow body records ANY step; the step record then 200s and the run completes', async () => {
+  // REGRESSION (real-Daytona Task 2.4b ordering break): the existing no-seed
+  // case above used a STEPLESS workflow, so the workflow body never POSTed a
+  // step BEFORE the row-create — it could not catch the create-vs-run
+  // inversion. Here the body calls SolidActions.runStep() AT LEAST ONCE (mirror
+  // run-compat.test.ts's sleep/step legacy-workflow registration). On a real
+  // trigger run DispatchTriggerToDaytona does NOT create the row, so the
+  // step's recordOperationResult `POST /runs/status/<id>/operations` runs
+  // against an absent row. If the row-create POST happens AFTER invoke()
+  // (the pre-fix #reportOneShotCompletion Step 0), that operations POST 404s
+  // ("Workflow not found" — the mock mirrors the real backend's "Run not
+  // found"), invoke()'s body try/catch records the run FAILED, and exit is 1.
+  // The fix moves the row-create BEFORE invoke().
+  const STEP_RUN_ID = '00000000-0000-4000-8000-00000000024d';
+  srv.store.workflows.delete(STEP_RUN_ID); // belt-and-suspenders: never seeded
+  srv.store.operations.delete(STEP_RUN_ID);
+  expect(srv.store.workflows.has(STEP_RUN_ID)).toBe(false);
+
+  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => {
+    const doubled = await SolidActions.runStep(() => input.n * 2);
+    return doubled + 1;
+  });
+  const code = await expectProcessExit(
+    () => SolidActions.run(wf),
+    {
+      SOLIDACTIONS_API_URL: srv.baseUrl,
+      SOLIDACTIONS_API_KEY: 'test-api-key',
+      SOLIDACTIONS_RUN_ID: STEP_RUN_ID,
+      WORKFLOW_INPUT: JSON.stringify({ n: 20 }),
+    },
+  );
+  // The run completes (exit 0) — proving the step's recordOperationResult got
+  // 200, not 404. Pre-fix this is 1 (run recorded FAILED, phase 'run').
+  expect(code).toBe(0);
+
+  // The row-create POST must precede the FIRST step-record POST
+  // (`POST /runs/status/<id>/operations`) — i.e. the row exists before the
+  // workflow body records any step. Raw on-the-wire path match, mirroring the
+  // established read-only requestLog accessors (lastRunStatusCreate etc.).
+  const rowCreate = srv.lastRunStatusCreate();
+  expect(rowCreate).toBeTruthy();
+  expect(rowCreate!.body.workflowUUID).toBe(STEP_RUN_ID);
+
+  const opsPostRe = /^\/(?:runs\/status|workflows)\/[^/]+\/operations$/;
+  const firstOpsPostIndex = srv.requestLog.findIndex(
+    (e) => e.method === 'POST' && opsPostRe.test(e.path),
+  );
+  expect(firstOpsPostIndex).toBeGreaterThanOrEqual(0); // a step WAS recorded
+  expect(rowCreate!.index).toBeLessThan(firstOpsPostIndex);
+
+  // The output PUT 200'd (row existed) and the result is persisted: (20*2)+1.
+  const outputPut = srv.lastOutputPut();
+  expect(outputPut).toBeTruthy();
+  expect(outputPut!.workflowID).toBe(STEP_RUN_ID);
+  expect(SolidActionsJSON.parse(outputPut!.body.output as string)).toEqual(41);
+  expect(SolidActionsJSON.parse(srv.store.workflows.get(STEP_RUN_ID)!.output as string)).toEqual(41);
+  expect(srv.lastWorkflowComplete()!.status).toBe('completed');
+});
+
+it('suspended (sleep, no pre-seed) → row create BEFORE invoke (step record + sleep schedule 200) but NEITHER output nor error PUT, exit 0', async () => {
+  // Task 2.4b ORDERING FIX: the row CREATE now happens BEFORE invoke()
+  // REGARDLESS of outcome — suspended runs need the row too: their step
+  // recordOperationResult AND durable sleep/recv schedule POST
+  // `/runs/status/<id>/...` sub-routes that 404 on an absent row (same real
+  // "Run not found" failure mode). Use a FRESH, NON-pre-seeded run id so this
+  // proves the create runs ahead of the body's step + sleep without external
+  // seeding (the seeded RUN_ID would mask it). What stays terminal-NEUTRAL on
+  // suspension is the OUTPUT/ERROR PUT and the workflow-complete POST — never
+  // the row create.
+  const SUSP_RUN_ID = '00000000-0000-4000-8000-00000000024e';
+  srv.store.workflows.delete(SUSP_RUN_ID); // belt-and-suspenders: never seeded
+  srv.store.operations.delete(SUSP_RUN_ID);
+  expect(srv.store.workflows.has(SUSP_RUN_ID)).toBe(false);
+
   const wf = SolidActions.registerWorkflow(async () => {
     await SolidActions.runStep(() => 'step-A');
     await SolidActions.sleepms(60_000);
     return 'after-sleep';
   });
-  const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  const code = await expectProcessExit(
+    () => SolidActions.run(wf),
+    {
+      SOLIDACTIONS_API_URL: srv.baseUrl,
+      SOLIDACTIONS_API_KEY: 'test-api-key',
+      SOLIDACTIONS_RUN_ID: SUSP_RUN_ID,
+      WORKFLOW_INPUT: '{}',
+    },
+  );
   expect(code).toBe(0);
 
-  // Suspension is terminal-neutral: no row create, no status-row output/error.
-  expect(srv.lastRunStatusCreate()).toBeUndefined();
+  // The row WAS created (before invoke), so the step record + sleep schedule
+  // both 200'd against an existing row instead of 404ing.
+  const rowCreate = srv.lastRunStatusCreate();
+  expect(rowCreate).toBeTruthy();
+  expect(rowCreate!.body.workflowUUID).toBe(SUSP_RUN_ID);
+  expect(srv.store.workflows.has(SUSP_RUN_ID)).toBe(true);
+
+  // Row-create precedes the FIRST step-record POST (proving create-before-run).
+  const opsPostRe = /^\/(?:runs\/status|workflows)\/[^/]+\/operations$/;
+  const firstOpsPostIndex = srv.requestLog.findIndex(
+    (e) => e.method === 'POST' && opsPostRe.test(e.path),
+  );
+  expect(firstOpsPostIndex).toBeGreaterThanOrEqual(0); // step-A WAS recorded
+  expect(rowCreate!.index).toBeLessThan(firstOpsPostIndex);
+
+  // Terminal-neutral on suspension: NO durable output/error PUT and NO
+  // workflow-complete POST (the run is not terminal yet).
   expect(srv.lastOutputPut()).toBeUndefined();
   expect(srv.lastErrorPut()).toBeUndefined();
+  expect(srv.lastWorkflowCompleteIndex()).toBeUndefined();
   // The sleep schedule was still posted (Task 2.3 contract unchanged).
   expect(srv.lastSleepSchedule()).toBeTruthy();
 });

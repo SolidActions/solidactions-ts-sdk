@@ -561,23 +561,20 @@ export class SolidActions {
       (workflow as { name?: string }).name ||
       'workflow';
 
-    // ctx.input is `unknown` until the engine parses WORKFLOW_INPUT; the workflow
-    // descriptor re-applies <T>, so this widening cast is sound.
-    const result = await invoke<T, R>(descriptor, ctx as unknown as InvokeCtx<T>);
-
-    // Reproduce the legacy backend status-row lifecycle from the InvokeResult.
-    //
-    // Legacy run() persisted terminal state via the executor's THREE-step
-    // sequence (src/solidactions-executor.ts internalWorkflow / runWorkflow /
-    // handleWorkflowError):
+    // Reproduce the legacy backend status-row lifecycle. Legacy run() persisted
+    // it via the executor's THREE-step sequence (src/solidactions-executor.ts
+    // internalWorkflow / runWorkflow / handleWorkflowError), and CRUCIALLY the
+    // CREATE happened DURING internalWorkflow() — BEFORE the user body ran:
     //   0. systemDatabase.initWorkflowStatus (src/solidactions-executor.ts:464
     //      `POST /runs/status` with the `internalStatus` body built at
     //      :407-428) — CREATES the RunStatus row. The real backend's
-    //      RunStatusController::recordOutput/recordError 404 (no upsert) when
-    //      the row is absent, and DispatchTriggerToDaytona never creates it, so
-    //      WITHOUT this create a real trigger run's output/error is silently
-    //      never persisted. store() is idempotent for an existing
-    //      PENDING/ENQUEUED row, so reproducing it here is safe.
+    //      RunStatusController::recordOutput/recordError AND the per-step
+    //      recordOperationResult (`POST /runs/status/<id>/operations`) all 404
+    //      ("Run not found"; no upsert) when the row is absent, and
+    //      DispatchTriggerToDaytona never creates it. The legacy executor
+    //      created the row in internalWorkflow() BEFORE running the user body,
+    //      so the body's step()→recordOperationResult always hit an existing
+    //      row. store() is idempotent for an existing PENDING/ENQUEUED row.
     //   1. systemDatabase.recordWorkflowOutput / recordWorkflowError —
     //      `PUT /runs/status/<id>/output|error` with {output|error, status}.
     //      This is the ONLY write the real Laravel backend persists into
@@ -587,7 +584,16 @@ export class SolidActions {
     //      `POST /runs/status/<id>/workflow-complete` — a fire-and-forget infra
     //      signal whose errors are swallowed.
     //
-    // Task 2.4b: reproduce ALL THREE, in that order, from the InvokeResult.
+    // Task 2.4b ORDERING FIX (real-Daytona parity break): step 0 (the row
+    // CREATE) MUST run BEFORE invoke() executes the workflow body. The body's
+    // step() → InvokeSystemDatabase.recordOperationResult POSTs
+    // `/runs/status/<id>/operations`, which 404s "Run not found" if the row
+    // doesn't exist yet. Previously the CREATE lived in
+    // #reportOneShotCompletion (POST-invoke), inverting create-vs-run and
+    // recording every step-ful run FAILED on real Daytona. Restored to the
+    // legacy ordering: #initOneShotStatusRow (before invoke) +
+    // #reportOneShotTerminalState (after).
+    //
     // Every identity field comes strictly from ctx (the ALS/ctx scope) —
     // NEVER bootParams (re-reading bootParams would re-globalize the row, the
     // exact regression deglobalization removed):
@@ -597,7 +603,19 @@ export class SolidActions {
     //   applicationVersion = ctx.app.appVersion
     //   createdAt          = Date.now()
     //   workflowName       = derived above (legacy getRegisteredFunctionFullName)
-    await SolidActions.#reportOneShotCompletion(ctx, workflowName, result);
+    //
+    // The CREATE is awaited BEFORE invoke() regardless of the eventual outcome:
+    // suspended runs need the row too (their durable sleep/recv schedule POSTs
+    // are `/runs/status/<id>/...` sub-routes that 404 on an absent row).
+    await SolidActions.#initOneShotStatusRow(ctx, workflowName);
+
+    // ctx.input is `unknown` until the engine parses WORKFLOW_INPUT; the workflow
+    // descriptor re-applies <T>, so this widening cast is sound.
+    const result = await invoke<T, R>(descriptor, ctx as unknown as InvokeCtx<T>);
+
+    // Steps 1+2: the durable status-row PUT then the fire-and-forget POST,
+    // reproduced from the InvokeResult AFTER invoke() returns (as before).
+    await SolidActions.#reportOneShotTerminalState(ctx, result);
 
     process.exit(oneShotRuntimeAdapter.exitCodeFor(result));
   }
@@ -642,49 +660,26 @@ export class SolidActions {
   }
 
   /**
-   * Reproduce the legacy status-row lifecycle from an InvokeResult.
+   * Step 0 of the legacy status-row lifecycle — the run-row CREATE.
    *
-   * Mirrors the legacy executor's terminal sequence
-   * (src/solidactions-executor.ts) exactly, in order:
+   * This is HttpSystemDatabase.initWorkflowStatus (src/http_system_database.ts:108-117):
+   * `POST /runs/status` with body `{ ...internalStatus, ownerXid, options }`,
+   * where `internalStatus` is the WorkflowStatusInternal the legacy executor
+   * built at src/solidactions-executor.ts:407-428 and `ownerXid` is the
+   * `randomUUID()` legacy passed at :464. The real backend's
+   * RunStatusController::recordOutput/recordError AND the per-step
+   * recordOperationResult (`POST /runs/status/<id>/operations`) all 404
+   * ("Run not found"; no upsert) when the row is absent, and
+   * DispatchTriggerToDaytona never creates it.
    *
-   *  0. The run-row CREATE — HttpSystemDatabase.initWorkflowStatus
-   *     (src/http_system_database.ts:108-117): `POST /runs/status` with body
-   *     `{ ...internalStatus, ownerXid, options }`, where `internalStatus` is
-   *     the WorkflowStatusInternal the legacy executor built at
-   *     src/solidactions-executor.ts:407-428 and `ownerXid` is the
-   *     `randomUUID()` legacy passed at :464. The real backend's
-   *     RunStatusController::recordOutput/recordError 404 (no upsert) when the
-   *     row is absent, and DispatchTriggerToDaytona never creates it — so this
-   *     CREATE is what makes the PUTs below 200 on a real trigger run.
-   *     store() is idempotent for an existing PENDING/ENQUEUED row, so issuing
-   *     it here is safe even if some path ever pre-creates the row.
-   *  1. The durable status-row write — the ONLY write the real backend
-   *     persists into RunStatus.output|error:
-   *       - completed → HttpSystemDatabase.recordWorkflowOutput
-   *         (src/http_system_database.ts:120-125):
-   *         `PUT /runs/status/<id>/output { output, status }` where the legacy
-   *         executor set `internalStatus.output = funcResult.stringified`
-   *         (src/solidactions-executor.ts:592, a SolidActionsJSON.stringify'd
-   *         STRING) and `internalStatus.status = StatusString.SUCCESS` (:593).
-   *         The real RunStatusController::recordOutput validates
-   *         `output => nullable|string` (422s a non-string), so the value is
-   *         the stringified form, NOT the raw object.
-   *       - failed    → HttpSystemDatabase.recordWorkflowError
-   *         (src/http_system_database.ts:127-132):
-   *         `PUT /runs/status/<id>/error { error, status }` where the legacy
-   *         executor set `internalStatus.error = serializer.stringify(serializeError(e))`
-   *         (src/solidactions-executor.ts:531) and
-   *         `internalStatus.status = StatusString.ERROR` (:532) — a
-   *         serialize-error + SolidActionsJSON.stringify STRING, NOT a bare
-   *         message. recordError likewise validates `error => nullable|string`.
-   *  2. HttpSystemDatabase.reportWorkflowComplete
-   *     (src/http_system_database.ts:134-151):
-   *     `POST /runs/status/<id>/workflow-complete { status, output?|error? }`
-   *     with `status: 'completed' | 'failed'`. The legacy executor passed the
-   *     BARE `e.message` here (src/solidactions-executor.ts:535
-   *     `reportWorkflowComplete(workflowID, 'failed', undefined, e.message)`),
-   *     so the POST's `error` stays the bare message (only the PUT is the
-   *     serialized form).
+   * ORDERING (Task 2.4b real-Daytona parity fix): the legacy executor created
+   * this row DURING internalWorkflow() — BEFORE running the user body — so the
+   * body's step()→recordOperationResult always hit an existing row. run()
+   * therefore awaits this BEFORE invoke(), regardless of the eventual outcome
+   * (suspended runs need the row too: their durable sleep/recv schedule POSTs
+   * are `/runs/status/<id>/...` sub-routes that 404 on an absent row).
+   * store() is idempotent for an existing PENDING/ENQUEUED row, so issuing it
+   * here is safe even if some path ever pre-creates the row.
    *
    * Every identity field comes strictly from `ctx` (the ALS/ctx scope) — never
    * bootParams: workflowUUID = ctx.run.runUuid, executorId = ctx.run.triggerId,
@@ -692,30 +687,19 @@ export class SolidActions {
    * createdAt = now. `workflowName` is derived in run() the way the legacy
    * executor derived it (getRegisteredFunctionFullName) and threaded in.
    *
-   * Errors on every call are swallowed (the infra webhook/reaper is the
-   * fallback, matching legacy reportWorkflowComplete's swallow; the CREATE and
-   * PUT are best-effort here for symmetry — a one-shot process that already
-   * produced its result must not crash on a transient persistence blip, the
-   * reaper reconciles). The CREATE is awaited BEFORE the PUT so the PUT 200s.
-   * The HTTP primitive is replicated via HttpClient (the same lazy-require the
-   * Task 2.3 POST used): HttpSystemDatabase.initWorkflowStatus/recordWorkflow*
-   * are instance methods on a class the one-shot path does not (and must not,
+   * Best-effort swallow (symmetric with the terminal-state swallows): a
+   * one-shot process must not crash on a transient persistence blip; the
+   * reaper reconciles. The HTTP primitive is replicated via HttpClient (the
+   * same lazy-require the Task 2.3 POST used): HttpSystemDatabase.initWorkflowStatus
+   * is an instance method on a class the one-shot path does not (and must not,
    * per the invoke.ts architecture) construct, so the faithful path is to
-   * issue the identical POST/PUT shapes directly — see the Task 1.2 precedent
+   * issue the identical POST shape directly — see the Task 1.2 precedent
    * (InvokeSystemDatabase replicating the POST it could not reach).
-   *
-   * Suspension is terminal-neutral for the one-shot process (exit 0): no
-   * row-create and no status-row write — the sleep/recv schedule was already
-   * POSTed by InvokeSystemDatabase before it threw.
    */
-  static async #reportOneShotCompletion(
+  static async #initOneShotStatusRow(
     ctx: InvokeCtx,
     workflowName: string,
-    result: InvokeResult,
   ): Promise<void> {
-    if (result.status === 'suspended') {
-      return;
-    }
     // Lazy require() (see import-block comment): http_client is pulled by the
     // invoke chain; a static import here would re-enter the module-load cycle.
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
@@ -725,7 +709,6 @@ export class SolidActions {
       SolidActions.logger as GlobalLogger,
     );
     const workflowID = ctx.run.runUuid;
-    const encodedID = encodeURIComponent(workflowID);
 
     // Step 0: run-row CREATE (initWorkflowStatus shape, verbatim). Mirrors the
     // WorkflowStatusInternal the legacy executor built at
@@ -773,6 +756,79 @@ export class SolidActions {
         `Failed to create one-shot status row for ${workflowID}: ${errMsg}`,
       );
     }
+  }
+
+  /**
+   * Steps 1+2 of the legacy status-row lifecycle — the terminal-state writes,
+   * reproduced from the InvokeResult AFTER invoke() returns.
+   *
+   * Mirrors the legacy executor's terminal sequence
+   * (src/solidactions-executor.ts) exactly, in order:
+   *
+   *  1. The durable status-row write — the ONLY write the real backend
+   *     persists into RunStatus.output|error:
+   *       - completed → HttpSystemDatabase.recordWorkflowOutput
+   *         (src/http_system_database.ts:120-125):
+   *         `PUT /runs/status/<id>/output { output, status }` where the legacy
+   *         executor set `internalStatus.output = funcResult.stringified`
+   *         (src/solidactions-executor.ts:592, a SolidActionsJSON.stringify'd
+   *         STRING) and `internalStatus.status = StatusString.SUCCESS` (:593).
+   *         The real RunStatusController::recordOutput validates
+   *         `output => nullable|string` (422s a non-string), so the value is
+   *         the stringified form, NOT the raw object.
+   *       - failed    → HttpSystemDatabase.recordWorkflowError
+   *         (src/http_system_database.ts:127-132):
+   *         `PUT /runs/status/<id>/error { error, status }` where the legacy
+   *         executor set `internalStatus.error = serializer.stringify(serializeError(e))`
+   *         (src/solidactions-executor.ts:531) and
+   *         `internalStatus.status = StatusString.ERROR` (:532) — a
+   *         serialize-error + SolidActionsJSON.stringify STRING, NOT a bare
+   *         message. recordError likewise validates `error => nullable|string`.
+   *  2. HttpSystemDatabase.reportWorkflowComplete
+   *     (src/http_system_database.ts:134-151):
+   *     `POST /runs/status/<id>/workflow-complete { status, output?|error? }`
+   *     with `status: 'completed' | 'failed'`. The legacy executor passed the
+   *     BARE `e.message` here (src/solidactions-executor.ts:535
+   *     `reportWorkflowComplete(workflowID, 'failed', undefined, e.message)`),
+   *     so the POST's `error` stays the bare message (only the PUT is the
+   *     serialized form).
+   *
+   * Identity is strictly from `ctx` (the ALS/ctx scope) — never bootParams:
+   * workflowID = ctx.run.runUuid. Errors on every call are swallowed (the
+   * infra webhook/reaper is the fallback, matching legacy
+   * reportWorkflowComplete's swallow; the PUT is best-effort here for symmetry
+   * — a one-shot process that already produced its result must not crash on a
+   * transient persistence blip, the reaper reconciles). The row CREATE
+   * (#initOneShotStatusRow) was already awaited BEFORE invoke() so these PUTs
+   * 200. The HTTP primitive is replicated via HttpClient (the same
+   * lazy-require the Task 2.3 POST used): HttpSystemDatabase.recordWorkflow*
+   * are instance methods on a class the one-shot path does not (and must not,
+   * per the invoke.ts architecture) construct, so the faithful path is to
+   * issue the identical PUT/POST shapes directly — see the Task 1.2 precedent
+   * (InvokeSystemDatabase replicating the POST it could not reach).
+   *
+   * Suspension is terminal-neutral for the one-shot process (exit 0): no
+   * status-row output/error write and no completion POST — the sleep/recv
+   * schedule was already POSTed by InvokeSystemDatabase before it threw, and
+   * the row was already created by #initOneShotStatusRow before invoke().
+   */
+  static async #reportOneShotTerminalState(
+    ctx: InvokeCtx,
+    result: InvokeResult,
+  ): Promise<void> {
+    if (result.status === 'suspended') {
+      return;
+    }
+    // Lazy require() (see import-block comment): http_client is pulled by the
+    // invoke chain; a static import here would re-enter the module-load cycle.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
+    const { HttpClient } = require('./http_client') as typeof import('./http_client');
+    const client = new HttpClient(
+      { baseUrl: ctx.api.url, apiKey: ctx.api.key },
+      SolidActions.logger as GlobalLogger,
+    );
+    const workflowID = ctx.run.runUuid;
+    const encodedID = encodeURIComponent(workflowID);
 
     // Step 1: durable status-row write (recordWorkflowOutput/recordWorkflowError
     // shape, verbatim). The value mirrors what the legacy executor put on
