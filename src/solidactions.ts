@@ -103,7 +103,11 @@ import { StepConfig } from './step';
 // breaks tests/http_client.test.ts at load instead of its documented baseline).
 // The lazy-require idiom matches existing usage (src/telemetry/exporters.ts,
 // traces.ts, utils.ts). runtime-scope is safe to import statically: it only
-// type-imports the heavy classes, so it pulls no runtime cycle.
+// type-imports the heavy classes, so it pulls no runtime cycle. This becomes a
+// static import only once the invoke chain no longer transitively imports
+// `solidactions` (e.g. `invoke-system-database`'s `http_system_database`
+// dependency is made type-only / the shared HttpClient base is extracted) —
+// NOT merely when the legacy executor or globalParams is deleted.
 import { getCurrentPrimitives } from './invoke/runtime-scope';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
 import { Conductor } from './conductor/conductor';
@@ -529,6 +533,8 @@ export class SolidActions {
     const descriptor = SolidActions.#toWorkflowDescriptor<T, R>(workflow, options?.input);
     const ctx = oneShotContextAdapter(process.env as Record<string, string>);
 
+    // ctx.input is `unknown` until the engine parses WORKFLOW_INPUT; the workflow
+    // descriptor re-applies <T>, so this widening cast is sound.
     const result = await invoke<T, R>(descriptor, ctx as unknown as InvokeCtx<T>);
 
     // Reproduce the legacy backend completion signal from the InvokeResult.
