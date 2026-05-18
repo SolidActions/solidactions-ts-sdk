@@ -195,6 +195,94 @@ export function runInternalStep<T>(
   return callback();
 }
 
+/**
+ * WORKFLOW_SLUG dispatch-guard process-global state.
+ *
+ * The one-shot contract evaluates a deployed workflow's entrypoint module which
+ * calls top-level `SolidActions.run(wf)`. A parent that `import`s a child whose
+ * own module has a top-level `run(childTask)` would, without this guard, run the
+ * CHILD body against the PARENT's input (Node fully evaluates the imported
+ * module — including its top-level `run()` — before the importer's body). The
+ * guard in `run()` compares the registered workflow identity against the
+ * `WORKFLOW_SLUG` env the app injects (RuntimeEnvBuilder) and makes the
+ * non-matching `run()` an inert no-op.
+ *
+ * These module-level flags + the single `process.on('exit')` handler turn a
+ * deploy/codemod identity mismatch (entrypoint's registered workflow ≠ its
+ * WORKFLOW_SLUG, so NOTHING ever matches) into a loud non-zero exit instead of
+ * a silent never-runs hang.
+ */
+let __anyRunMatched = false;
+let __anyRunSkippedForSlug = false;
+let __failLoudExitHandlerInstalled = false;
+/** Workflow identities seen by run() this process — used only for the FATAL diagnostic. */
+const __runWorkflowNamesSeen = new Set<string>();
+
+/**
+ * Pure decision for the fail-loud `process.on('exit')` handler.
+ *
+ * Returns true ONLY when WORKFLOW_SLUG is a non-empty string, NO `run()` ever
+ * matched it, and at least one `run()` was skipped for a slug mismatch — i.e. a
+ * genuine entrypoint/deploy misconfiguration where the process would otherwise
+ * exit 0 having run nothing. It must NOT fire for:
+ *   - the legitimate imported-child no-op (the entrypoint's own matching run()
+ *     DID run → `matched` is true),
+ *   - absent/empty WORKFLOW_SLUG (legacy/mock/local — guard inactive),
+ *   - a normal run with no skips.
+ *
+ * Factored out as a pure function so it is unit-testable without driving the
+ * real `process.on('exit')` handler under jest.
+ */
+export function __shouldFailLoudOnExit(
+  envSlug: string | undefined,
+  matched: boolean,
+  skipped: boolean,
+): boolean {
+  return (
+    typeof envSlug === 'string' && envSlug.length > 0 && !matched && skipped
+  );
+}
+
+/**
+ * Normalize a workflow identity the way the runner's configSync.ts:191-193
+ * slugify does (lower-case, non-alphanumeric runs → `-`, trim leading/trailing
+ * `-`). A no-op for the current kebab-case names; future-proofs a non-kebab
+ * `config.name` so the guard's comparison stays slug-correct on both sides.
+ */
+export function __normalizeSlug(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+}
+
+/**
+ * Install (once) the fail-loud `process.on('exit')` handler. Idempotent: the
+ * handler is registered a single time for the process lifetime; it reads the
+ * live module-level flags at exit so multiple `run()` calls in one process
+ * (import-then-entrypoint) are accounted for.
+ */
+function __installFailLoudExitHandler(): void {
+  if (__failLoudExitHandlerInstalled) {
+    return;
+  }
+  __failLoudExitHandlerInstalled = true;
+  process.on('exit', () => {
+    const envSlug = process.env.WORKFLOW_SLUG;
+    if (__shouldFailLoudOnExit(envSlug, __anyRunMatched, __anyRunSkippedForSlug)) {
+      const registered =
+        [...__runWorkflowNamesSeen].join(', ') || '(none)';
+      console.error(
+        `[solidactions] FATAL: no workflow matched WORKFLOW_SLUG=${String(envSlug)} ` +
+          `(registered: ${registered}) — entrypoint/deploy mismatch`,
+      );
+      // Signal failure without forcing exit from within an exit handler
+      // (process.exit() inside 'exit' is a no-op / unsafe — set the code).
+      process.exitCode = 1;
+    }
+  });
+}
+
 export class SolidActions {
   ///////
   // Lifecycle
@@ -511,6 +599,58 @@ export class SolidActions {
       workflowID?: string; // Custom workflow ID (reserved; one-shot id comes from SOLIDACTIONS_RUN_ID)
     },
   ): Promise<void> {
+    // --- WORKFLOW_SLUG dispatch guard (SYNCHRONOUS-FIRST) --------------------
+    // These statements MUST run before any `await` (and before the
+    // DEBUG_WORKFLOW_ID branch / status-row init / anything async). The method
+    // is `async`, so synchronous code here executes before the caller's first
+    // microtask — that ordering is what neutralizes a top-level
+    // `run(childTask)` side-effect in an imported child module on a PARENT run.
+    //
+    // Identity is derived the SAME way the rest of run() derives workflowName
+    // (decorators.ts registration → `.name`, else the function's own `.name`).
+    // Both sides are normalized with the runner's exact slugify
+    // (configSync.ts:191-193) so a future non-kebab `config.name` still compares
+    // slug-correctly (no-op for today's kebab names).
+    {
+      const reg = getFunctionRegistration(workflow as object);
+      const wfName = reg?.name || (workflow as { name?: string }).name || '';
+      // Read env DIRECTLY here: the guard must be synchronous and pre-ctx. The
+      // ctx.workflowSlug field (context-adapter) is for downstream use, not this
+      // gate (ctx is built later, after the first await).
+      const expectedSlug = process.env.WORKFLOW_SLUG;
+
+      if (wfName) {
+        __runWorkflowNamesSeen.add(__normalizeSlug(wfName));
+      }
+
+      if (
+        typeof expectedSlug === 'string' &&
+        expectedSlug.length > 0 &&
+        __normalizeSlug(wfName) !== __normalizeSlug(expectedSlug)
+      ) {
+        // Mismatch: this is an imported module's top-level run() for a DIFFERENT
+        // workflow than the one this entrypoint process was dispatched for.
+        // Record the skip and return immediately — NO invoke(), NO status-row
+        // writes, NO process.exit(). Resolving the async fn cleanly discards
+        // the unawaited promise without an unhandledRejection. Also arm the
+        // fail-loud exit handler so a true entrypoint/deploy misconfig (nothing
+        // ever matches) becomes a loud non-zero exit instead of a silent hang.
+        __anyRunSkippedForSlug = true;
+        __installFailLoudExitHandler();
+        return;
+      }
+
+      // Match (or absent/empty WORKFLOW_SLUG → legacy: behavior byte-identical
+      // to before this guard existed). Record the match and arm the handler so
+      // the ZERO-matched misconfig case is still detectable; on a match the
+      // handler stays silent (matched === true).
+      if (typeof expectedSlug === 'string' && expectedSlug.length > 0) {
+        __anyRunMatched = true;
+        __installFailLoudExitHandler();
+      }
+    }
+    // --- end WORKFLOW_SLUG dispatch guard ------------------------------------
+
     // SOLIDACTIONS_DEBUG_WORKFLOW_ID replay stays on the legacy lifecycle — that
     // path owns recorded-result comparison and is not part of one-shot run().
     if (process.env.SOLIDACTIONS_DEBUG_WORKFLOW_ID) {

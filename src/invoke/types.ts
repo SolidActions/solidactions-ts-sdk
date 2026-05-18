@@ -22,6 +22,11 @@ export interface InvokeCtx<I = unknown> {
   run: InvokeCtxRun;
   app: InvokeCtxApp;
   api: { url: string; key: string };
+  /**
+   * Injected by RuntimeEnvBuilder; equals app `workflows.slug`. Absent for
+   * mock/local/older deploys — the dispatch guard treats absent as legacy.
+   */
+  workflowSlug?: string;
   telemetry?: { enabled: boolean };
   mode: 'resident' | 'oneshot' | 'local';
   // durable primitives are attached by invoke() (Task 1.3): step, sleep, recv, send

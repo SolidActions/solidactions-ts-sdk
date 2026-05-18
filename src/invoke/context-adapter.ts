@@ -17,6 +17,7 @@ const RESERVED_KEYS = new Set([
   'TENANT_ID',
   'SA_PROXY_URL',
   'SA_PROXY_TOKEN',
+  'WORKFLOW_SLUG',
 ]);
 
 /** Returns true if the key is reserved (used as a first-class ctx field, not a var). */
@@ -119,6 +120,11 @@ export function oneShotContextAdapter(transport: Record<string, string>): Invoke
     tenantId: transport['TENANT_ID'] ?? '',
   };
 
+  // --- workflow identity ---
+  // Injected by RuntimeEnvBuilder; equals app workflows.slug. Absent for
+  // mock/local/older deploys (kept optional so legacy paths are unchanged).
+  const workflowSlug = transport['WORKFLOW_SLUG'];
+
   // --- vars ---
   const proxyUrl = transport['SA_PROXY_URL'];
   const proxyToken = transport['SA_PROXY_TOKEN'];
@@ -148,6 +154,7 @@ export function oneShotContextAdapter(transport: Record<string, string>): Invoke
     app,
     api,
     mode: 'oneshot',
+    ...(workflowSlug !== undefined ? { workflowSlug } : {}),
     // telemetry omitted: no env signal for it in the one-shot transport
   };
 }
