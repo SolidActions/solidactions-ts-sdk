@@ -2,11 +2,14 @@
 import { defineWorkflow } from '../../src/invoke/define-workflow';
 
 describe('defineWorkflow', () => {
-  it('returns a workflow descriptor exposing run(), no side effects on import', () => {
-    let ran = false;
-    const wf = defineWorkflow({ async run() { ran = true; return 'ok'; } });
+  it('returns the workflow descriptor exposing run()', () => {
+    const wf = defineWorkflow({ run: () => Promise.resolve('ok') });
     expect(typeof wf.run).toBe('function');
-    expect(ran).toBe(false); // defining must not execute
+  });
+  it('defining a workflow does not execute run()', () => {
+    let ran = false;
+    defineWorkflow({ run: () => { ran = true; return Promise.resolve('ok'); } });
+    expect(ran).toBe(false);
   });
   it('rejects a definition missing run()', () => {
     // @ts-expect-error intentional

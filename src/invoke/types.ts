@@ -1,5 +1,14 @@
-export interface InvokeCtxRun { triggerId: string | number; runUuid: string; runSecret: string; workerSessionId: string; }
-export interface InvokeCtxApp { appVersion: string; appId: string; tenantId: string; }
+export interface InvokeCtxRun {
+  triggerId: string | number;
+  runUuid: string;
+  runSecret: string;
+  workerSessionId: string;
+}
+export interface InvokeCtxApp {
+  appVersion: string;
+  appId: string;
+  tenantId: string;
+}
 /** A connection var: opaque key + run-shared proxy (proxyToken is a bearer — treat as secret). */
 export interface ConnectionVar { readonly key: string; readonly proxyUrl: string; readonly proxyToken: string; }
 export type VarValue = string | ConnectionVar;
