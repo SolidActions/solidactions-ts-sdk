@@ -7,9 +7,8 @@
 import { SolidActionsConfig, SolidActionsExecutor } from '../src/solidactions-executor';
 import { SolidActions, StatusString } from '../src';
 import { sleepms } from '../src/utils';
-import { HttpSystemDatabase } from '../src/system_database';
-import { GlobalLogger } from '../src/telemetry/logs';
 import { MockHttpServer, createMockServer } from '../src/testing/mock_server';
+import type { InvokeCtx } from '../src/invoke/types';
 
 // Global mock server instance for tests
 let globalMockServer: MockHttpServer | null = null;
@@ -63,6 +62,43 @@ export function generateHttpTestConfig() {
 }
 
 /**
+ * Build a full InvokeCtx for invoke() tests, wired to the given mock server.
+ *
+ * Defaults: empty input, no vars, deterministic run/app identity, api {url,key}
+ * pointed at the mock server, telemetry off, mode 'oneshot'. `partial` is shallow-
+ * merged last so callers can override any field (commonly just `input`).
+ *
+ * Identity here comes purely from arguments — never process.env / globals —
+ * mirroring how the real runner injects per-request identity into invoke().
+ */
+export function makeCtx<I = unknown>(
+  server: MockHttpServer,
+  partial: Partial<InvokeCtx<I>> & { input: I },
+): InvokeCtx<I> {
+  return {
+    vars: {},
+    run: {
+      triggerId: 'test-trigger',
+      runUuid: '00000000-0000-4000-8000-000000000001',
+      runSecret: 'test-run-secret',
+      workerSessionId: 'test-worker-session',
+    },
+    app: {
+      appVersion: 'v0',
+      appId: 'test-app',
+      tenantId: 'test-tenant',
+    },
+    api: {
+      url: server.baseUrl,
+      key: 'test-api-key',
+    },
+    telemetry: { enabled: false },
+    mode: 'oneshot',
+    ...partial,
+  };
+}
+
+/**
  * Set up mock HTTP server for testing
  * Call this in beforeAll()
  */
@@ -106,7 +142,7 @@ export function getMockServer(): MockHttpServer | null {
  * Legacy function for backward compatibility
  * @deprecated Use setUpSolidActionsTestServer() instead
  */
-export async function setUpSolidActionsTestSysDb(config: SolidActionsConfig): Promise<void> {
+export async function setUpSolidActionsTestSysDb(_config: SolidActionsConfig): Promise<void> {
   // For HTTP-based tests, just ensure server is running
   await setUpSolidActionsTestServer();
 }
@@ -204,15 +240,17 @@ export async function reexecuteWorkflowById(
 /**
  * @deprecated PostgreSQL-specific function removed in HTTP SDK
  */
-export async function dropDatabase(_connectionString: string, _database?: string): Promise<void> {
+export function dropDatabase(_connectionString: string, _database?: string): Promise<void> {
   // No-op for HTTP-based tests
   console.warn('dropDatabase() is deprecated in HTTP SDK - no database to drop');
+  return Promise.resolve();
 }
 
 /**
  * @deprecated PostgreSQL-specific function removed in HTTP SDK
  */
-export async function causeChaos(_db: string): Promise<void> {
+export function causeChaos(_db: string): Promise<void> {
   // No-op for HTTP-based tests
   console.warn('causeChaos() is deprecated in HTTP SDK');
+  return Promise.resolve();
 }
