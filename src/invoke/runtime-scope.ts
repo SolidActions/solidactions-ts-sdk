@@ -32,6 +32,8 @@ export interface RuntimeParams {
   readonly workflowID: string;
   /** Executor identity for this invocation. */
   readonly executorID: string;
+  /** Application id for this invocation (from ctx.app.appId — never a global). */
+  readonly appId: string;
   /** Application version string for this invocation. */
   readonly appVersion: string;
   /**

@@ -6,7 +6,7 @@ import { SolidActionsExecutor } from './solidactions-executor';
 import { GlobalLogger } from './telemetry/logs';
 import * as net from 'net';
 import { performance } from 'perf_hooks';
-import { globalParams } from './utils';
+import { bootParams } from './utils';
 import { globalTimeout } from './workflow_management';
 import * as protocol from './conductor/protocol';
 
@@ -281,7 +281,7 @@ export class SolidActionsAdminServer {
       handler: async (req, res) => {
         if (!SolidActionsAdminServer.isDeactivated) {
           solidActionsExec.logger.info(
-            `Deactivating SolidActions executor ${globalParams.executorID} with version ${globalParams.appVersion}. This executor will complete existing workflows but will not create new workflows.`,
+            `Deactivating SolidActions executor ${bootParams.executorID} with version ${bootParams.appVersion}. This executor will complete existing workflows but will not create new workflows.`,
           );
           SolidActionsAdminServer.isDeactivated = true;
         }

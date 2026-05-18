@@ -16,7 +16,7 @@ import {
   type WorkflowHandle,
   type WorkflowStatus,
 } from './workflow';
-import { sleepms, globalParams } from './utils';
+import { sleepms, bootParams } from './utils';
 import { SolidActionsJSON, SolidActionsSerializer } from './serialization';
 import { forkWorkflow, getWorkflow, listWorkflows, listWorkflowSteps, toWorkflowStatus } from './workflow_management';
 import { SolidActionsExecutor } from './solidactions-executor';
@@ -91,8 +91,8 @@ export class SolidActionsClient {
 
     const systemDatabase = new HttpSystemDatabase(
       config,
-      globalParams.executorID,
-      globalParams.appVersion,
+      bootParams.executorID,
+      bootParams.appVersion,
       logger,
       effectiveSerializer,
     );
@@ -132,7 +132,7 @@ export class SolidActionsClient {
       authenticatedRoles: [],
       request: {},
       executorId: '',
-      applicationID: globalParams.appID,
+      applicationID: bootParams.appID,
       createdAt: Date.now(),
       input: this.serializer.stringify([destinationID, message, topic]),
       deduplicationID: undefined,

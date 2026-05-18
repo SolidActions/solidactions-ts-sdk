@@ -140,6 +140,10 @@ export async function invoke<I, O>(
     const httpConfig: SolidActionsHttpConfig = {
       apiUrl: ctx.api.url,
       apiKey: ctx.api.key,
+      // Thread the worker session id explicitly from ctx so the
+      // X-Worker-Session-ID header never depends on a process.env read on the
+      // invoke path (HttpClient's env fallback is legacy boot-only).
+      workerSessionId: ctx.run.workerSessionId,
     };
     const logger = new GlobalLogger();
     engine = new InvokeSystemDatabase(
@@ -156,10 +160,13 @@ export async function invoke<I, O>(
   }
 
   // --- Phase: run --------------------------------------------------------
-  // runtimeParams identity fields are placeholders for Task 2.4 ALS convergence; only functionIDCounter is read in 1.3 (via nextFunctionID).
+  // Per-invoke runtime identity — sourced strictly from ctx (Task 2.4a: this is
+  // now THE identity for the workflow path; there is no globalParams to fall
+  // back to). Carried in the ALS scope so concurrent invokes never share it.
   const runtimeParams: RuntimeParams = {
     workflowID,
     executorID: String(ctx.run.triggerId),
+    appId: ctx.app.appId,
     appVersion: ctx.app.appVersion,
     functionIDCounter: 0,
   };

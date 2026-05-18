@@ -19,6 +19,10 @@ export interface HttpClientConfig {
   maxRetries?: number; // Default: 3
   retryDelay?: number; // Default: 1000ms (base for exponential)
   maxRetryDelay?: number; // Optional cap for exponential backoff (e.g., 60000ms)
+  // Worker session id for the X-Worker-Session-ID header. The invoke() path
+  // threads this explicitly from ctx.run.workerSessionId; when unset, the
+  // legacy boot path falls back to the SOLIDACTIONS_WORKER_SESSION_ID env var.
+  workerSessionId?: string;
 }
 
 export interface HttpRequestOptions {
@@ -42,6 +46,7 @@ export class HttpClient {
   private readonly maxRetries: number;
   private readonly retryDelay: number;
   private readonly maxRetryDelay?: number;
+  private readonly workerSessionId?: string;
   private logger?: GlobalLogger;
 
   constructor(config: HttpClientConfig, logger?: GlobalLogger) {
@@ -51,6 +56,10 @@ export class HttpClient {
     this.maxRetries = config.maxRetries ?? 3;
     this.retryDelay = config.retryDelay ?? 1000;
     this.maxRetryDelay = config.maxRetryDelay;
+    // Resolve once at construction: explicit (ctx-threaded, invoke path) wins;
+    // the SOLIDACTIONS_WORKER_SESSION_ID env var is the legacy boot fallback.
+    /* boot-only */ // legacy worker-session transport; invoke() threads ctx.run.workerSessionId via config
+    this.workerSessionId = config.workerSessionId ?? process.env.SOLIDACTIONS_WORKER_SESSION_ID;
     this.logger = logger;
   }
 
@@ -198,10 +207,11 @@ export class HttpClient {
         ...options?.headers,
       };
 
-      // Add worker session ID header if available (for linking operations to workers)
-      const workerSessionId = process.env.SOLIDACTIONS_WORKER_SESSION_ID;
-      if (workerSessionId) {
-        headers['X-Worker-Session-ID'] = workerSessionId;
+      // Add worker session ID header if available (for linking operations to
+      // workers). Resolved once at construction (ctx-threaded on the invoke
+      // path; legacy env fallback otherwise) — never a per-request env read.
+      if (this.workerSessionId) {
+        headers['X-Worker-Session-ID'] = this.workerSessionId;
       }
 
       const fetchOptions: RequestInit = {

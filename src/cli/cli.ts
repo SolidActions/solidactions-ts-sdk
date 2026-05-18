@@ -9,11 +9,11 @@
 import { Command } from 'commander';
 import { SolidActionsClient, GetWorkflowsInput, StatusString } from '..';
 import { exit } from 'node:process';
-import { globalParams } from '../utils';
+import { bootParams } from '../utils';
 
 const program = new Command();
 
-program.version(globalParams.solidActionsVersion);
+program.version(bootParams.solidActionsVersion);
 
 /////////////////////////
 /* WORKFLOW MANAGEMENT */

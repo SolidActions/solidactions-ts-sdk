@@ -61,7 +61,7 @@ import {
   runWithTopContext,
 } from './context';
 import { deserializeError, serializeError } from 'serialize-error';
-import { globalParams, sleepms } from './utils';
+import { bootParams, sleepms } from './utils';
 import { SolidActionsSerializer, serializeFunctionInputOutput } from './serialization';
 import { SolidActions, GetWorkflowsInput } from '.';
 
@@ -203,7 +203,8 @@ export class SolidActionsExecutor {
   readonly tracer: Tracer;
   readonly serializer: SolidActionsSerializer;
 
-  readonly executorID: string = globalParams.executorID;
+  /* boot-only */ // legacy executor identity: resolved by the launch() boot path, never the invoke() workflow path
+  readonly executorID: string = bootParams.executorID;
 
   static globalInstance: SolidActionsExecutor | undefined = undefined;
 
@@ -239,7 +240,7 @@ export class SolidActionsExecutor {
       this.systemDatabase = new HttpSystemDatabase(
         config.api,
         this.executorID,
-        globalParams.appVersion,
+        bootParams.appVersion,
         this.logger,
         this.serializer,
       );
@@ -282,9 +283,9 @@ export class SolidActionsExecutor {
     // Only execute init code if under non-debug mode
     if (!this.#debugMode) {
       // Compute the application version if not provided
-      if (globalParams.appVersion === '') {
-        globalParams.appVersion = this.computeAppVersion();
-        globalParams.wasComputed = true;
+      if (bootParams.appVersion === '') {
+        bootParams.appVersion = this.computeAppVersion();
+        bootParams.wasComputed = true;
       }
 
       // Any initialization hooks
@@ -297,10 +298,10 @@ export class SolidActionsExecutor {
         }
       }
 
-      this.logger.info(`Initializing SolidActions (v${globalParams.solidActionsVersion})`);
+      this.logger.info(`Initializing SolidActions (v${bootParams.solidActionsVersion})`);
       this.logger.info(`HTTP API: ${this.config.api.apiUrl}`);
       this.logger.info(`Executor ID: ${this.executorID}`);
-      this.logger.info(`Application version: ${globalParams.appVersion}`);
+      this.logger.info(`Application version: ${bootParams.appVersion}`);
 
       await this.recoverPendingWorkflows([this.executorID]);
     }
@@ -416,9 +417,9 @@ export class SolidActionsExecutor {
       assumedRole: pctx?.assumedRole || '',
       authenticatedRoles: pctx?.authenticatedRoles || [],
       request: pctx?.request || {},
-      executorId: globalParams.executorID,
-      applicationVersion: globalParams.appVersion,
-      applicationID: globalParams.appID,
+      executorId: bootParams.executorID,
+      applicationVersion: bootParams.appVersion,
+      applicationID: bootParams.appID,
       createdAt: Date.now(), // Remember the start time of this workflow,
       timeoutMS: timeoutMS,
       deadlineEpochMS: deadlineEpochMS,
@@ -941,13 +942,13 @@ export class SolidActionsExecutor {
     const handlerArray: WorkflowHandle<unknown>[] = [];
     for (const execID of executorIDs) {
       this.logger.debug(`Recovering workflows assigned to executor: ${execID}`);
-      const pendingWorkflows = await this.systemDatabase.getPendingWorkflows(execID, globalParams.appVersion);
+      const pendingWorkflows = await this.systemDatabase.getPendingWorkflows(execID, bootParams.appVersion);
       if (pendingWorkflows.length > 0) {
         this.logger.info(
-          `Recovering ${pendingWorkflows.length} workflows from application version ${globalParams.appVersion}`,
+          `Recovering ${pendingWorkflows.length} workflows from application version ${bootParams.appVersion}`,
         );
       } else {
-        this.logger.info(`No workflows to recover from application version ${globalParams.appVersion}`);
+        this.logger.info(`No workflows to recover from application version ${bootParams.appVersion}`);
       }
       for (const pendingWorkflow of pendingWorkflows) {
         this.logger.debug(`Recovering workflow: ${pendingWorkflow.workflowUUID}`);
@@ -1141,7 +1142,7 @@ export class SolidActionsExecutor {
       .map((i) => i.origFunction.toString())
       .sort();
     // Different SolidActions versions should produce different hashes.
-    sortedWorkflowSource.push(globalParams.solidActionsVersion);
+    sortedWorkflowSource.push(bootParams.solidActionsVersion);
     for (const sourceCode of sortedWorkflowSource) {
       hasher.update(sourceCode);
     }

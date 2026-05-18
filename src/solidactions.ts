@@ -84,7 +84,7 @@ import {
   finalizeClassRegistrations,
   getClassRegistration,
 } from './decorators';
-import { defaultEnableOTLP, globalParams, sleepms } from './utils';
+import { defaultEnableOTLP, bootParams, sleepms } from './utils';
 import { JSONValue, registerSerializationRecipe, SerializationRecipe } from './serialization';
 import { SolidActionsAdminServer } from './adminserver';
 import { Server } from 'http';
@@ -251,7 +251,7 @@ export class SolidActions {
       [internalConfig, runtimeConfig] = overwriteConfigForCloud(internalConfig, runtimeConfig, configFile);
     }
 
-    globalParams.enableOTLP = SolidActions.#solidActionsConfig?.enableOTLP ?? defaultEnableOTLP();
+    bootParams.enableOTLP = SolidActions.#solidActionsConfig?.enableOTLP ?? defaultEnableOTLP();
 
     if (!isTraceContextWorking()) installTraceContextManager(internalConfig.name);
 
@@ -267,17 +267,17 @@ export class SolidActions {
     // In SolidActions Cloud, instead use the value supplied through environment variables.
     if (process.env.SOLIDACTIONS__CLOUD !== 'true') {
       if (SolidActions.#solidActionsConfig?.applicationVersion) {
-        globalParams.appVersion = SolidActions.#solidActionsConfig.applicationVersion;
+        bootParams.appVersion = SolidActions.#solidActionsConfig.applicationVersion;
       } else if (SolidActions.#solidActionsConfig?.enablePatching) {
-        globalParams.appVersion = 'PATCHING_ENABLED';
+        bootParams.appVersion = 'PATCHING_ENABLED';
       }
       if (SolidActions.#solidActionsConfig?.executorID) {
-        globalParams.executorID = SolidActions.#solidActionsConfig.executorID;
+        bootParams.executorID = SolidActions.#solidActionsConfig.executorID;
       }
     }
     if (options?.conductorKey) {
       // Always use a generated executor ID in Conductor.
-      globalParams.executorID = randomUUID();
+      bootParams.executorID = randomUUID();
     }
 
     SolidActionsExecutor.globalInstance = new SolidActionsExecutor(internalConfig, { debugMode });
@@ -377,10 +377,10 @@ export class SolidActions {
     }
 
     // Reset the global app version and executor ID
-    globalParams.appVersion = process.env.SOLIDACTIONS__APPVERSION || '';
-    globalParams.wasComputed = false;
-    globalParams.appID = process.env.SOLIDACTIONS__APPID || '';
-    globalParams.executorID = process.env.SOLIDACTIONS_RUN_ID || 'local';
+    bootParams.appVersion = process.env.SOLIDACTIONS__APPVERSION || '';
+    bootParams.wasComputed = false;
+    bootParams.appID = process.env.SOLIDACTIONS__APPID || '';
+    bootParams.executorID = process.env.SOLIDACTIONS_RUN_ID || 'local';
 
     recordSolidActionsShutdown();
   }
@@ -395,6 +395,7 @@ export class SolidActions {
    * @returns Parsed input or empty object if not set
    */
   static getInput<T = Record<string, unknown>>(): T {
+    /* boot-only */ // legacy runner transport (WORKFLOW_INPUT env); invoke() takes input from ctx.input
     const raw = process.env.WORKFLOW_INPUT;
     if (!raw) {
       return {} as T;
@@ -421,6 +422,7 @@ export class SolidActions {
    * @returns Parsed input or empty object if not available
    */
   static async getInputAsync<T = Record<string, unknown>>(): Promise<T> {
+    /* boot-only */ // legacy runner transport (WORKFLOW_INPUT / WORKFLOW_INPUT_URL env); invoke() takes input from ctx.input
     // Try WORKFLOW_INPUT first (same as getInput)
     const raw = process.env.WORKFLOW_INPUT;
     if (raw) {
@@ -470,10 +472,13 @@ export class SolidActions {
    *     →  reproduce the legacy completion POST from the InvokeResult
    *     →  process.exit(oneShotRuntimeAdapter.exitCodeFor(result))
    *
-   * invoke() is already globalParams/SolidActionsExecutor-free (it runs on
-   * InvokeSystemDatabase under an ALS scope), so the workflow EXECUTION path is
-   * fully explicit here. The legacy launch/shutdown globals are NOT deleted by
-   * this task — that convergence is Task 2.4; see the `// Task 2.4:` seams.
+   * invoke() is fully global-free (it runs on InvokeSystemDatabase under an ALS
+   * scope; identity comes strictly from `ctx`), so the workflow EXECUTION path
+   * is fully explicit here. Task 2.4a deleted `globalParams`; the legacy
+   * launch/shutdown `bootParams` identity remains for the legacy executor only
+   * (boot-only, never the workflow path). The run-row / registerWorkflow
+   * lifecycle seams are retired separately in Task 2.4c; see the
+   * `// Task 2.4c:` seams.
    *
    * `workflow` may be either a {@link WorkflowDescriptor} (`{ run }`), the
    * callable wrapper returned by the (now deprecated) `registerWorkflow` shim,
@@ -550,7 +555,7 @@ export class SolidActions {
     // row to update on the one-shot path. The faithful, row-independent
     // completion signal is reportWorkflowComplete; we reproduce exactly that
     // POST here from the InvokeResult. Recreating the legacy status-row
-    // lifecycle is Task 2.4 convergence work, not 2.3.
+    // lifecycle is Task 2.4b convergence work, not 2.3/2.4a.
     await SolidActions.#reportOneShotCompletion(ctx.api, ctx.run.runUuid, result);
 
     process.exit(oneShotRuntimeAdapter.exitCodeFor(result));
@@ -563,7 +568,7 @@ export class SolidActions {
    * - legacy `registerWorkflow` wrapper → its registration's `origFunction`
    *   (the user-provided function) is recovered and wrapped so the durable
    *   primitives flow through invoke()'s ALS scope rather than the legacy
-   *   executor. Task 2.4: once the legacy wrapper is retired this recovery
+   *   executor. Task 2.4c: once the legacy wrapper is retired this recovery
    *   collapses to a plain descriptor.
    * - bare function → wrapped directly.
    *
@@ -584,7 +589,7 @@ export class SolidActions {
     }
 
     // Recover the user function from a legacy registerWorkflow wrapper, if any.
-    // Task 2.4: legacy wrapper/registration coupling — converges when the
+    // Task 2.4c: legacy wrapper/registration coupling — converges when the
     // legacy executor path is deleted.
     const fn = workflow as (input: T) => R | Promise<R>;
     const reg = getFunctionRegistration(fn);
@@ -650,8 +655,8 @@ export class SolidActions {
     reject: string;
     custom: (action: string) => string;
   } {
+    /* boot-only */ // legacy runner transport (SOLIDACTIONS_API_URL / APP_URL env); the invoke() path derives URLs from ctx.api
     const baseApiUrl =
-      process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') ||
       process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') ||
       process.env.APP_URL ||
       'http://localhost:8000';
@@ -738,7 +743,7 @@ export class SolidActions {
 
   /** Get the current application version */
   static get applicationVersion(): string {
-    return globalParams.appVersion;
+    return bootParams.appVersion;
   }
 
   /** Get the current workflow ID */
@@ -1577,7 +1582,7 @@ export class SolidActions {
    * routes execution through invoke(). This shim is retained so existing
    * `registerWorkflow(...)` call sites keep working (the returned value is still
    * the legacy callable wrapper, and `run()` recovers the underlying function
-   * from it) — but it is on the Task 2.4 convergence path and will be removed.
+   * from it) — but it is on the Task 2.4c convergence path and will be removed.
    *
    * @param func - The function to register as a workflow
    * @param config - Configuration information for the registered workflow
@@ -1594,7 +1599,7 @@ export class SolidActions {
           'SolidActions.run(). registerWorkflow() will be removed in a future release.',
       );
     }
-    // Task 2.4: still returns the legacy callable wrapper + registration so the
+    // Task 2.4c: still returns the legacy callable wrapper + registration so the
     // legacy executor path and existing call sites keep working; run() recovers
     // origFunction from this registration. Collapses when the legacy path goes.
     // Anonymous functions (e.g. `registerWorkflow(async () => ...)`) all have
@@ -1604,7 +1609,7 @@ export class SolidActions {
     // so the name is no longer load-bearing here — give anonymous workflows a
     // unique fallback name in this deprecated shim. Explicit `config.name` and
     // named functions are unchanged (so decorator/legacy call sites are
-    // unaffected). Task 2.4: removed with the legacy registration coupling.
+    // unaffected). Task 2.4c: removed with the legacy registration coupling.
     const explicitName = config?.name ?? (func.name || undefined);
     const wfName = explicitName ?? `__anon_workflow_${++SolidActions.#anonWorkflowSeq}`;
     const registration = wrapSolidActionsFunctionAndRegisterByUniqueName(

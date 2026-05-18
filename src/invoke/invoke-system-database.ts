@@ -82,6 +82,7 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
         maxRetries: 10,
         retryDelay: 1000,
         maxRetryDelay: 60000, // Cap at 60 seconds between retries
+        workerSessionId: config.workerSessionId,
       },
       logger,
     );
