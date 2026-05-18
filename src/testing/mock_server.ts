@@ -556,6 +556,16 @@ export class MockHttpServer {
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
     }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.updateStatus —
+    // a CANCELLED run is terminal; the recovery-loop status setter must NOT
+    // silently move it out of CANCELLED. An idempotent CANCELLED → CANCELLED
+    // write is allowed (the one sanctioned idempotent path).
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
+    }
     workflow.status = data.status;
     if (data.resetRecoveryAttempts) {
       workflow.recoveryAttempts = 0;

@@ -258,6 +258,69 @@ describe('SolidActions.run() — one-shot CANCELLED terminal state', () => {
     expect(srv.store.workflows.get(RUN_ID)!.status).toBe(StatusString.CANCELLED);
   });
 
+  it('backend-guard parity (mock): a setWorkflowStatus PUT to ENQUEUED/PENDING arriving AFTER a CANCELLED row returns 409 and does not overwrite CANCELLED', async () => {
+    // Task 2.8 residual: mock setWorkflowStatus (PUT /runs/status/<id>/status)
+    // unconditionally overwrote the workflow status even when the run was already
+    // CANCELLED. The real RunStatusController.updateStatus rejects
+    // CANCELLED→non-CANCELLED with 409 { message: 'Run already cancelled',
+    // type: 'run_already_cancelled' }. This test proves mock parity for that guard.
+    // CANCELLED→CANCELLED (idempotent) must still succeed (200).
+    srv.store.workflows.set(RUN_ID, {
+      workflowUUID: RUN_ID,
+      status: StatusString.CANCELLED,
+      workflowName: '',
+      workflowClassName: '',
+      workflowConfigName: '',
+      authenticatedUser: '',
+      assumedRole: '',
+      authenticatedRoles: [],
+      request: {},
+      executorId: 'test-trigger',
+      applicationVersion: '',
+      applicationID: '',
+      input: null,
+      output: null,
+      error: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      recoveryAttempts: 0,
+      priority: 0,
+    });
+
+    // CANCELLED → ENQUEUED must be rejected (the recovery-loop status setter
+    // must not bypass the cancel).
+    const resEnqueued = await fetch(`${srv.baseUrl}/runs/status/${RUN_ID}/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: StatusString.ENQUEUED, resetRecoveryAttempts: false }),
+    });
+    expect(resEnqueued.status).toBe(409);
+    const bodyEnqueued = await resEnqueued.json() as { message: string; type: string };
+    expect(bodyEnqueued.message).toBe('Run already cancelled');
+    expect(bodyEnqueued.type).toBe('run_already_cancelled');
+    expect(srv.store.workflows.get(RUN_ID)!.status).toBe(StatusString.CANCELLED);
+
+    // CANCELLED → PENDING must also be rejected.
+    const resPending = await fetch(`${srv.baseUrl}/runs/status/${RUN_ID}/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: StatusString.PENDING, resetRecoveryAttempts: true }),
+    });
+    expect(resPending.status).toBe(409);
+    const bodyPending = await resPending.json() as { message: string; type: string };
+    expect(bodyPending.type).toBe('run_already_cancelled');
+    expect(srv.store.workflows.get(RUN_ID)!.status).toBe(StatusString.CANCELLED);
+
+    // CANCELLED → CANCELLED (idempotent) must succeed with 200.
+    const resCancelled = await fetch(`${srv.baseUrl}/runs/status/${RUN_ID}/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: StatusString.CANCELLED, resetRecoveryAttempts: false }),
+    });
+    expect(resCancelled.status).toBe(200);
+    expect(srv.store.workflows.get(RUN_ID)!.status).toBe(StatusString.CANCELLED);
+  });
+
   it('backend-guard parity (mock): a SUCCESS output PUT arriving AFTER a CANCELLED row does not overwrite CANCELLED', async () => {
     // The real RunStatusController guard: recordOutput/recordError must not
     // overwrite an already-CANCELLED row with SUCCESS/ERROR (a late output/error
