@@ -17,9 +17,19 @@
  *                 process.exit(), and its promise RESOLVES; a SUBSEQUENT run()
  *                 whose name matches the env DOES invoke (import-then-entrypoint
  *                 sequence works in one process).
- *  3. absent    → no WORKFLOW_SLUG → behavior identical to today (invokes).
+ *  3. absent    → no WORKFLOW_SLUG → behavior identical to today (invokes) AND
+ *                 the diagnostic Set is NOT mutated (Defect B — strict legacy
+ *                 parity: the absent/empty path does ZERO extra work).
  *  4. fail-loud → the pure __shouldFailLoudOnExit decision is exhaustively
- *                 tested (the process.on('exit') handler is wired to it).
+ *                 tested (the process.on('exit') handler is wired to it), and
+ *                 __failLoudExitCode never clobbers an existing non-zero exit
+ *                 code (Defect C).
+ *  5. fail-safe → an UNIDENTIFIABLE defineWorkflow({ run }) entrypoint (no
+ *                 registration name, no fn .name) with a non-empty
+ *                 WORKFLOW_SLUG STILL invokes its body — it is never silently
+ *                 no-opped (Defect A — the catastrophic over-block).
+ *  6. transparent match → the match path with WORKFLOW_SLUG present writes the
+ *                 full status/output flow undisturbed (Codex #7).
  *
  * Mock wiring mirrors run-statusrow.test.ts / run-compat.test.ts.
  */
@@ -30,7 +40,13 @@
 import { expectProcessExit } from './helpers-exit';
 import { setUpSolidActionsTestServer } from '../helpers';
 import { SolidActions } from '../../src';
-import { __shouldFailLoudOnExit, __normalizeSlug } from '../../src/solidactions';
+import {
+  __shouldFailLoudOnExit,
+  __normalizeSlug,
+  __failLoudExitCode,
+  __runWorkflowNamesSeenSize,
+} from '../../src/solidactions';
+import { defineWorkflow } from '../../src/invoke/define-workflow';
 import { MockHttpServer } from '../../src/testing/mock_server';
 import { SolidActionsJSON } from '../../src/serialization';
 
@@ -181,11 +197,48 @@ it('mismatch → run(wf) is an inert no-op (no invoke, no status row, no process
   }
 });
 
-it('absent key → no WORKFLOW_SLUG in env → behavior identical to today (run() invokes the body unguarded)', async () => {
+it('Defect A fail-safe → an UNIDENTIFIABLE defineWorkflow({ run }) entrypoint with a non-empty WORKFLOW_SLUG STILL invokes its body (never silently no-opped)', async () => {
+  // setup: a `defineWorkflow({ run })` descriptor carries NO registration name
+  // and no function `.name` — its identity is UNKNOWN. This is the shape of a
+  // legitimate single-workflow ENTRYPOINT under the one-shot contract. With a
+  // non-empty WORKFLOW_SLUG set, the OLD guard computed `wfName === ''`,
+  // `norm('') !== norm(slug)` → treated the entrypoint's OWN workflow as a
+  // mismatch and no-opped it → the dispatched run never ran → hang until
+  // timeout. The fail-safe fix must run it anyway (favor running the
+  // entrypoint over silently hanging it).
+  let bodyRan = false;
+  const wf = defineWorkflow<{ n: number }, number>({
+    run: async (ctx) => {
+      bodyRan = true;
+      return ctx.input.n * 3;
+    },
+  });
+
+  // action: WORKFLOW_SLUG is a non-empty, definitely-non-matching slug. The
+  // pre-fix guard would no-op (bodyRan stays false, no output PUT, hang).
+  const code = await expectProcessExit(
+    () => SolidActions.run(wf, { input: { n: 7 } }),
+    mockEnv({ WORKFLOW_SLUG: 'some-deployed-slug', WORKFLOW_INPUT: JSON.stringify({ n: 7 }) }),
+  );
+
+  // assert: the body fully executed (NOT no-opped) — exit 0, body ran, the
+  // durable output PUT happened with 7 * 3 = 21, run row completed.
+  expect(code).toBe(0);
+  expect(bodyRan).toBe(true);
+  const outputPut = srv.lastOutputPut();
+  expect(outputPut).toBeTruthy();
+  expect(SolidActionsJSON.parse(outputPut!.body.output as string)).toEqual(21);
+  expect(srv.lastWorkflowComplete()!.status).toBe('completed');
+});
+
+it('absent key → no WORKFLOW_SLUG in env → behavior identical to today (run() invokes the body unguarded) AND the diagnostic Set is NOT mutated', async () => {
   // setup: no WORKFLOW_SLUG at all — the legacy path must be byte-identical.
+  // Defect B: the absent/empty path must do ZERO extra work — no diagnostic
+  // Set mutation, no flags, no handler. Snapshot the Set size before the run.
   const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n - 1, {
     name: 'legacy-workflow',
   });
+  const seenSizeBefore = __runWorkflowNamesSeenSize();
 
   // action
   const code = await expectProcessExit(
@@ -198,6 +251,42 @@ it('absent key → no WORKFLOW_SLUG in env → behavior identical to today (run(
   const outputPut = srv.lastOutputPut();
   expect(outputPut).toBeTruthy();
   expect(SolidActionsJSON.parse(outputPut!.body.output as string)).toEqual(9);
+  expect(srv.lastWorkflowComplete()!.status).toBe('completed');
+
+  // assert (Defect B): the absent-key path mutated NOTHING in the guard's
+  // diagnostic Set — strict legacy parity, the guard block never executed.
+  expect(__runWorkflowNamesSeenSize()).toBe(seenSizeBefore);
+});
+
+it('Codex #7 transparent match → WORKFLOW_SLUG present + matching name → the full status-row + output flow runs undisturbed', async () => {
+  // setup: the normal match path with WORKFLOW_SLUG set. This proves the
+  // guard's match branch is transparent to the invoke/one-shot flow that
+  // Phase-2's child-wait / cancellation depend on — the body runs, the
+  // run-row CREATE is issued, and the durable output PUT lands, all in order.
+  const wf = SolidActions.registerWorkflow(
+    async (input: { n: number }) => ({ doubled: input.n * 2, ok: true }),
+    { name: 'transparent-match-wf' },
+  );
+
+  // action
+  const code = await expectProcessExit(
+    () => SolidActions.run(wf),
+    mockEnv({ WORKFLOW_SLUG: 'transparent-match-wf', WORKFLOW_INPUT: JSON.stringify({ n: 9 }) }),
+  );
+
+  // assert: full flow undisturbed by the guard — exit 0, run-row CREATE issued
+  // BEFORE the output PUT, output PUT carries the SUCCESS result, run row
+  // reports completed.
+  expect(code).toBe(0);
+  const createIdx = srv.lastRunStatusCreate();
+  const outputPut = srv.lastOutputPut();
+  expect(createIdx).toBeTruthy();
+  expect(outputPut).toBeTruthy();
+  // Ordering: the run-row CREATE precedes the durable output PUT.
+  expect(createIdx!.index).toBeLessThan(outputPut!.index);
+  expect(outputPut!.workflowID).toBe(RUN_ID);
+  expect(outputPut!.body.status).toBe('SUCCESS');
+  expect(SolidActionsJSON.parse(outputPut!.body.output as string)).toEqual({ doubled: 18, ok: true });
   expect(srv.lastWorkflowComplete()!.status).toBe('completed');
 });
 
@@ -234,5 +323,33 @@ describe('__shouldFailLoudOnExit — pure decision for the process.on(exit) hand
 
   it('stays silent when nothing was skipped (normal single-workflow run, no imports)', () => {
     expect(__shouldFailLoudOnExit('child-task', false, false)).toBe(false);
+  });
+});
+
+describe('__failLoudExitCode — Defect C: never clobber an existing non-zero exit code', () => {
+  it('returns 1 when the current exit code is unset (undefined) — the handler owns the failure signal', () => {
+    expect(__failLoudExitCode(undefined)).toBe(1);
+  });
+
+  it('returns 1 when the current exit code is null (treated as unset)', () => {
+    expect(__failLoudExitCode(null)).toBe(1);
+  });
+
+  it('returns 1 when the current exit code is 0 (success — safe to overwrite with the misconfig signal)', () => {
+    expect(__failLoudExitCode(0)).toBe(1);
+  });
+
+  it("returns 1 when the current exit code is the string '0' (success, safe to overwrite)", () => {
+    expect(__failLoudExitCode('0')).toBe(1);
+  });
+
+  it('returns undefined (leaves the code untouched) when a prior non-zero numeric code is already set — does NOT downgrade it', () => {
+    expect(__failLoudExitCode(2)).toBeUndefined();
+    expect(__failLoudExitCode(1)).toBeUndefined();
+    expect(__failLoudExitCode(137)).toBeUndefined();
+  });
+
+  it('returns undefined when a prior non-zero STRING code is already set (Node coerces process.exitCode strings)', () => {
+    expect(__failLoudExitCode('3')).toBeUndefined();
   });
 });

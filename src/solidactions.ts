@@ -219,6 +219,16 @@ let __failLoudExitHandlerInstalled = false;
 const __runWorkflowNamesSeen = new Set<string>();
 
 /**
+ * Test-only snapshot of the diagnostic Set's size. Used by the WORKFLOW_SLUG
+ * guard suite to prove the absent/empty-key path mutates NOTHING (strict
+ * legacy parity, Defect B). NOT part of the public API and intentionally NOT
+ * re-exported from `src/index.ts`.
+ */
+export function __runWorkflowNamesSeenSize(): number {
+  return __runWorkflowNamesSeen.size;
+}
+
+/**
  * Pure decision for the fail-loud `process.on('exit')` handler.
  *
  * Returns true ONLY when WORKFLOW_SLUG is a non-empty string, NO `run()` ever
@@ -241,6 +251,37 @@ export function __shouldFailLoudOnExit(
   return (
     typeof envSlug === 'string' && envSlug.length > 0 && !matched && skipped
   );
+}
+
+/**
+ * Pure decision for the exit code the fail-loud handler should set.
+ *
+ * The fail-loud handler signals a deploy/entrypoint misconfig with a non-zero
+ * exit code. It must NEVER downgrade or clobber an existing non-zero
+ * `process.exitCode` — if the process already failed for some OTHER reason
+ * (a thrown error, an explicit `process.exit(2)`, etc.) that code is the
+ * truthful failure signal and must survive. So:
+ *
+ *   - current code is unset (undefined) or 0 → return 1 (we own the failure
+ *     signal: the only reason this process is exiting is the misconfig).
+ *   - current code is already non-zero → return undefined (DO NOT touch it;
+ *     the existing code is more specific / already-true).
+ *
+ * Factored out as a pure function so the "never clobber a non-zero code"
+ * invariant is unit-testable without driving the real exit handler.
+ *
+ * @param currentCode - the value of `process.exitCode` at exit time.
+ * @returns 1 when the handler should set the code, or undefined to leave it.
+ */
+export function __failLoudExitCode(
+  currentCode: number | string | undefined | null,
+): number | undefined {
+  // Treat undefined / null / 0 (and the string '0') as "unset/success" — only
+  // those are safe to overwrite with our misconfig signal.
+  if (currentCode === undefined || currentCode === null || currentCode === 0 || currentCode === '0') {
+    return 1;
+  }
+  return undefined;
 }
 
 /**
@@ -278,7 +319,13 @@ function __installFailLoudExitHandler(): void {
       );
       // Signal failure without forcing exit from within an exit handler
       // (process.exit() inside 'exit' is a no-op / unsafe — set the code).
-      process.exitCode = 1;
+      // NEVER clobber an existing non-zero exitCode: if the process already
+      // failed for another reason, that code is the truthful signal. Only set
+      // 1 when the current code is unset/0 (see __failLoudExitCode).
+      const failCode = __failLoudExitCode(process.exitCode);
+      if (failCode !== undefined) {
+        process.exitCode = failCode;
+      }
     }
   });
 }
@@ -611,44 +658,61 @@ export class SolidActions {
     // Both sides are normalized with the runner's exact slugify
     // (configSync.ts:191-193) so a future non-kebab `config.name` still compares
     // slug-correctly (no-op for today's kebab names).
-    {
+    //
+    // DEFECT B PARITY: read expectedSlug FIRST and gate the ENTIRE guard
+    // (registration lookup, normalization, the diagnostic Set, the match/skip
+    // flags, AND the process.on('exit') handler install) behind a non-empty
+    // WORKFLOW_SLUG. When the key is absent/empty the guard does ZERO extra work
+    // — no Set mutation, no flags, no handler — and falls straight through to
+    // the original unchanged body, byte-identical to pre-0aa91bc behavior
+    // (legacy / mock / local / older deploys).
+    const expectedSlug = process.env.WORKFLOW_SLUG;
+    if (typeof expectedSlug === 'string' && expectedSlug.length > 0) {
       const reg = getFunctionRegistration(workflow as object);
       const wfName = reg?.name || (workflow as { name?: string }).name || '';
-      // Read env DIRECTLY here: the guard must be synchronous and pre-ctx. The
-      // ctx.workflowSlug field (context-adapter) is for downstream use, not this
-      // gate (ctx is built later, after the first await).
-      const expectedSlug = process.env.WORKFLOW_SLUG;
 
       if (wfName) {
         __runWorkflowNamesSeen.add(__normalizeSlug(wfName));
       }
 
-      if (
-        typeof expectedSlug === 'string' &&
-        expectedSlug.length > 0 &&
-        __normalizeSlug(wfName) !== __normalizeSlug(expectedSlug)
-      ) {
-        // Mismatch: this is an imported module's top-level run() for a DIFFERENT
-        // workflow than the one this entrypoint process was dispatched for.
-        // Record the skip and return immediately — NO invoke(), NO status-row
-        // writes, NO process.exit(). Resolving the async fn cleanly discards
-        // the unawaited promise without an unhandledRejection. Also arm the
-        // fail-loud exit handler so a true entrypoint/deploy misconfig (nothing
-        // ever matches) becomes a loud non-zero exit instead of a silent hang.
+      // DEFECT A FAIL-SAFE: only no-op on a POSITIVE identifiable mismatch.
+      // `defineWorkflow({ run })` descriptors carry NO registration name and no
+      // function `.name`, so `wfName` is '' — the workflow's identity is
+      // UNKNOWN, not "different from the slug". Silently no-opping an
+      // unidentifiable workflow would skip a LEGITIMATE single-workflow
+      // `defineWorkflow` ENTRYPOINT (its own dispatched run never executes →
+      // the run hangs until timeout) — the catastrophic over-block failure.
+      // So when `wfName` is empty we DO NOT skip: fall through and run normally
+      // (legacy path). Favoring "run the entrypoint" over "silently hang it" is
+      // the correct trade — an unidentifiable IMPORTED child is a rare edge the
+      // broader 2.4c / codemod work addresses, whereas hanging every
+      // `defineWorkflow` entrypoint is catastrophic. We therefore require
+      // wfName to be a NON-EMPTY string before a mismatch can no-op.
+      if (wfName && __normalizeSlug(wfName) !== __normalizeSlug(expectedSlug)) {
+        // Positive mismatch: an identifiable workflow whose slug differs from
+        // the one this entrypoint process was dispatched for — an imported
+        // child module's top-level run() for a DIFFERENT workflow. Record the
+        // skip and return immediately — NO invoke(), NO status-row writes, NO
+        // process.exit(). Resolving the async fn cleanly discards the unawaited
+        // promise without an unhandledRejection. Arm the fail-loud exit handler
+        // so a true entrypoint/deploy misconfig (nothing ever matches) becomes
+        // a loud non-zero exit instead of a silent hang.
         __anyRunSkippedForSlug = true;
         __installFailLoudExitHandler();
         return;
       }
 
-      // Match (or absent/empty WORKFLOW_SLUG → legacy: behavior byte-identical
-      // to before this guard existed). Record the match and arm the handler so
-      // the ZERO-matched misconfig case is still detectable; on a match the
-      // handler stays silent (matched === true).
-      if (typeof expectedSlug === 'string' && expectedSlug.length > 0) {
-        __anyRunMatched = true;
-        __installFailLoudExitHandler();
-      }
+      // Match, OR an unidentifiable workflow under a non-empty slug (fail-safe
+      // run-anyway above). Record the match and arm the handler so the
+      // ZERO-matched misconfig case is still detectable; on a match the handler
+      // stays silent (matched === true). Treating the unidentifiable
+      // run-anyway as a "match" here is deliberate: it ran, so the fail-loud
+      // handler must NOT fire for it.
+      __anyRunMatched = true;
+      __installFailLoudExitHandler();
     }
+    // When expectedSlug is absent/empty we fall through here having done
+    // nothing — the guard block above did not execute at all.
     // --- end WORKFLOW_SLUG dispatch guard ------------------------------------
 
     // SOLIDACTIONS_DEBUG_WORKFLOW_ID replay stays on the legacy lifecycle — that
