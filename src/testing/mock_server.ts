@@ -522,23 +522,14 @@ export class MockHttpServer {
     this.store.workflows.set(workflowUUID, workflow);
     this.store.operations.set(workflowUUID, []);
 
-    // Task 2.7 (FIX 3): the real backend (RunStatusController::store →
-    // ensureChildTrigger) marks the PARENT trigger `waiting` when it first
-    // creates the child (the parent is, by construction, awaiting it). Model
-    // that here so the parent trigger status starts faithful — same active-
-    // state gate as the real ensureChildTrigger. Replay re-POSTs the same
-    // child uuid and short-circuits above (existing), so this fires once, just
-    // like the idempotent real backend.
-    if (workflow.parentWorkflowID) {
-      const parent = this.store.workflows.get(workflow.parentWorkflowID);
-      if (parent) {
-        const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
-        const current = parent.triggerStatus ?? 'started';
-        if (active.includes(current)) {
-          parent.triggerStatus = 'waiting';
-        }
-      }
-    }
+    // Task 2.7 (Codex fix#3): child creation does NOT mark the parent trigger
+    // `waiting`. The real backend (RunStatusController::ensureChildTrigger) no
+    // longer pre-marks the parent at child-create — the parent is not yet
+    // blocked there (the SDK permits arbitrary parent work between
+    // startWorkflow() and getResult()). The ONLY transition of the parent to
+    // `waiting` is the atomic /child-wait CAS, modeled by the mock's
+    // /child-wait handler. Mirror the corrected backend field-for-field: no
+    // pre-mark here.
 
     return {
       status: 201,
