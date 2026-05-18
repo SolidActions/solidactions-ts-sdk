@@ -25,7 +25,7 @@ process.env.C = 'c';
   (process as NodeJS.Process).exit = ((code?: number): never => {
     if ((globalThis as Record<string, unknown>).__processExitArmed) {
       const exitCode = code ?? 0;
-      const err: NodeJS.ErrnoException = new Error(`process.exit called with code ${exitCode}`);
+      const err: Error = new Error(`process.exit called with code ${exitCode}`);
       err.name = 'ProcessExitSignal';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (err as any).code = exitCode;
