@@ -277,6 +277,186 @@ it('child failure propagates to the parent — getResult rethrows (risk 6)', asy
   expect(srv.lastWorkflowComplete()!.status).toBe('failed');
 });
 
+// ===========================================================================
+// FIX 1/3 — lost-wakeup-safe convergence proven against the FAITHFUL mock
+// (parent TRIGGER status lifecycle + /child-wait + real re-pend rule +
+// infra-fallback failure). The mock now models the EXACT real backend:
+//   · child-create marks the parent trigger `waiting` (ensureChildTrigger)
+//   · getResult() POSTs /child-wait before suspending (server-side waiting
+//     marking, mirroring recv's /wait) — on EVERY suspend incl. replay
+//   · completeChild/failChildFromInfra re-pend per the EXACT
+//     notifyParentOfChildCompletion `$terminalOrInFlight` gate
+//   · infra-fallback failure writes a NON-NULL serialized error envelope
+// No field/condition here diverges from the app backend (the matching app
+// Feature tests prove the backend produces these exact shapes).
+// ===========================================================================
+
+it('FIX1: getResult POSTs /child-wait (marks parent waiting) before suspending — every suspend incl. replay', async () => {
+  const child = SolidActions.registerWorkflow(async (input: { v: number }) => ({ doubled: input.v * 2 }), {
+    name: uniq('child-task'),
+  });
+  const parent = SolidActions.registerWorkflow(
+    async () => {
+      const h = await SolidActions.startWorkflow(child)({ v: 21 });
+      const r = (await h.getResult()) as { doubled: number };
+      return { final: r.doubled };
+    },
+    { name: uniq('parent-child') },
+  );
+
+  // Run 1: enqueue + suspend. /child-wait must be POSTed; parent trigger must
+  // be `waiting` (child-create marked it; child-wait keeps it waiting).
+  const code1 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code1).toBe(0);
+  const cw1 = srv.lastChildWait();
+  expect(cw1).toBeTruthy();
+  expect(cw1!.runID).toBe(PARENT_RUN_ID);
+  expect(typeof cw1!.functionID).toBe('number');
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('waiting');
+
+  // Replay WITHOUT completing the child: getResult must STILL POST /child-wait
+  // (the lost-wakeup fix: re-mark waiting on every suspend, not just create).
+  srv.requestLog.length = 0;
+  const code2 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code2).toBe(0);
+  expect(srv.lastChildWait()).toBeTruthy(); // re-posted on the replay suspend
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('waiting');
+});
+
+it('FIX1: completeChild re-pends the parent trigger waiting→pending (no lost wakeup)', async () => {
+  const child = SolidActions.registerWorkflow(async (input: { v: number }) => ({ doubled: input.v * 2 }), {
+    name: uniq('child-task'),
+  });
+  const parent = SolidActions.registerWorkflow(
+    async () => {
+      const h = await SolidActions.startWorkflow(child)({ v: 21 });
+      const r = (await h.getResult()) as { doubled: number };
+      return { final: r.doubled };
+    },
+    { name: uniq('parent-child') },
+  );
+
+  await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('waiting');
+
+  // Child completes → real backend re-pends the parent (waiting → pending).
+  srv.completeChild(`${PARENT_RUN_ID}-child-0`, { output: JSON.stringify({ doubled: 42 }) });
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('pending'); // re-pended, not lost
+
+  const code2 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code2).toBe(0);
+  expect(srv.lastWorkflowComplete()!.output).toEqual({ final: 42 });
+});
+
+it('FIX1: second-awaited child completing FIRST converges — parent never stalls (faithful trigger lifecycle)', async () => {
+  const child = SolidActions.registerWorkflow(async (input: { n: number }) => ({ sq: input.n * input.n }), {
+    name: uniq('child-task'),
+  });
+  const parent = SolidActions.registerWorkflow(
+    async () => {
+      const a = await SolidActions.startWorkflow(child)({ n: 3 });
+      const b = await SolidActions.startWorkflow(child)({ n: 4 });
+      const ra = (await a.getResult()) as { sq: number };
+      const rb = (await b.getResult()) as { sq: number };
+      return { sum: ra.sq + rb.sq };
+    },
+    { name: uniq('parent-two-children') },
+  );
+
+  const childA = `${PARENT_RUN_ID}-child-0`;
+  const childB = `${PARENT_RUN_ID}-child-2`;
+
+  // Run 1: both enqueued; parent suspends on A → trigger `waiting`.
+  await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('waiting');
+
+  // The SECOND-awaited (B) completes FIRST while the parent is `waiting`.
+  // Real re-pend rule fires: waiting → pending (NOT lost just because A is
+  // still pending).
+  srv.completeChild(childB, { output: JSON.stringify({ sq: 16 }) });
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('pending');
+
+  // Replay: A still unresolved → parent re-suspends (child-wait → waiting).
+  const code2 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code2).toBe(0);
+  expect(srv.lastWorkflowComplete()).toBeUndefined(); // still suspended on A
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('waiting'); // re-marked, not stuck
+
+  // A completes → re-pend again → replay resolves both → converges once.
+  srv.completeChild(childA, { output: JSON.stringify({ sq: 9 }) });
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('pending');
+  const code3 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code3).toBe(0);
+  expect(srv.lastWorkflowComplete()!.status).toBe('completed');
+  expect(srv.lastWorkflowComplete()!.output).toEqual({ sum: 25 });
+});
+
+it('FIX1: a child completing while the parent is mid-replay (started) is re-pended, not lost', async () => {
+  const child = SolidActions.registerWorkflow(async (input: { v: number }) => ({ doubled: input.v * 2 }), {
+    name: uniq('child-task'),
+  });
+  const parent = SolidActions.registerWorkflow(
+    async () => {
+      const h = await SolidActions.startWorkflow(child)({ v: 5 });
+      const r = (await h.getResult()) as { doubled: number };
+      return { final: r.doubled };
+    },
+    { name: uniq('parent-child') },
+  );
+
+  await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+
+  // Simulate the race: the parent is mid-replay (trigger back to `started` —
+  // the scheduler re-dispatched it and it is re-executing) when the child
+  // completes. The broadened re-pend gate must STILL re-pend a `started`
+  // parent (the old narrow waiting-only gate lost this wakeup).
+  srv.store.workflows.get(PARENT_RUN_ID)!.triggerStatus = 'started';
+  srv.completeChild(`${PARENT_RUN_ID}-child-0`, { output: JSON.stringify({ doubled: 10 }) });
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('pending'); // re-pended despite `started`
+
+  const code2 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code2).toBe(0);
+  expect(srv.lastWorkflowComplete()!.output).toEqual({ final: 10 });
+});
+
+it('FIX1: infra-fallback child failure → getResult rethrows, parent fails fast (no null/stall)', async () => {
+  const child = SolidActions.registerWorkflow(async (_input: Record<string, never>) => ({ never: true }), {
+    name: uniq('child-task'),
+  });
+  const parent = SolidActions.registerWorkflow(
+    async () => {
+      const h = await SolidActions.startWorkflow(child)({});
+      await h.getResult();
+      return { unreached: true };
+    },
+    { name: uniq('parent-child') },
+  );
+
+  const code1 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  expect(code1).toBe(0);
+  const childId = `${PARENT_RUN_ID}-child-0`;
+
+  // Infra fallback (RunnerController::failTrigger): the child SDK NEVER wrote a
+  // structured error; the backend wraps the plain infra reason into a non-null
+  // serialized envelope on the parent-keyed op + re-pends the parent.
+  srv.failChildFromInfra(childId, 'snapshot reactivation failed');
+  expect(srv.triggerStatusOf(PARENT_RUN_ID)).toBe('pending'); // re-pended (not stalled)
+  // The PARENT-KEYED result op (keyed by the child's childResultFunctionID,
+  // distinct from the enqueue op which shares childWorkflowId) carries a
+  // non-null JSON-parseable error envelope — the FIX-1 invariant.
+  const resultFnId = srv.store.workflows.get(childId)!.childResultFunctionID!;
+  const op = srv.store.operations.get(PARENT_RUN_ID)!.find((o) => o.functionId === resultFnId)!;
+  expect(op).toBeTruthy();
+  expect(op.error).not.toBeNull();
+  expect(op.output).toBeNull();
+  expect(JSON.parse(op.error as string)).toMatchObject({ message: 'snapshot reactivation failed' });
+
+  const code2 = await expectProcessExit(() => SolidActions.run(parent), mockEnv({ WORKFLOW_INPUT: '{}' }));
+  // Parent observes the failure (rethrow) → terminal failed, NOT a silent stall.
+  expect(code2).toBe(1);
+  expect(srv.lastWorkflowComplete()!.status).toBe('failed');
+});
+
 it('nested children: completion targets only the DIRECT parent (risk 5)', async () => {
   // Model directly at the bridge level: a "middle" run spawns a "leaf"; the
   // backend completeChild writes the op keyed to MIDDLE, never the root.

@@ -81,13 +81,25 @@ export class InvokeChildHandle<R> implements WorkflowHandle<R> {
       if (recorded.error) {
         // Child failed: rethrow with serialize-error so custom Error props
         // (code, statusCode, …) survive the suspend+replay round-trip — the
-        // parent observes the failure, never a silent stall (risk 6).
+        // parent observes the failure, never a silent stall (risk 6). The
+        // backend GUARANTEES recorded.error is a non-null serialized error on
+        // failure even on the infra-fallback path (TriggerCompletionService::
+        // notifyParentOfChildCompletion), so this branch always rethrows and
+        // the parent fails fast instead of stalling.
         throw deserializeError(SolidActionsJSON.parse(recorded.error));
       }
       return SolidActionsJSON.parse(recorded.output ?? 'null') as R;
     }
 
-    // Child not finished — suspend the parent. SAME machinery as recv/sleep.
+    // Child not finished — suspend the parent. FIX 1 (lost-wakeup): mark the
+    // parent `waiting` server-side FIRST (the child-suspend analogue of recv's
+    // POST /wait), on EVERY suspension including replay, so the backend's
+    // completion-hook re-pend always wakes a reliably-`waiting` parent. Without
+    // this, a parent that re-suspended on an unresolved sibling child stayed in
+    // a non-`waiting` state and the later completion never re-pended it →
+    // permanent stall for parallel children. SAME SuspensionRequired throw /
+    // exit-0 / re-pend machinery as recv/sleep — not a new mechanism.
+    await this.engine.markWaitingOnChild(this.parentWorkflowID, funcId);
     throw new SuspensionRequired('child');
   }
 }

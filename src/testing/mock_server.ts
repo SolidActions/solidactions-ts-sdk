@@ -47,6 +47,17 @@ interface MockWorkflow {
   parentWorkflowID?: string;
   queuePartitionKey?: string;
   forkedFrom?: string;
+  // Task 2.7 (FIX 1/3): the REAL backend tracks a parent RunTrigger.status
+  // ALONGSIDE the RunStatus.status (run_triggers.status vs run_status.status —
+  // distinct columns). The lost-wakeup convergence + re-pend rule operate on
+  // the TRIGGER status, not the run status, so the mock must model it field-
+  // for-field to prove the FIX-1 behavior (and not fiction). It starts unset;
+  // the child-wait endpoint moves an ACTIVE parent → 'waiting' (mirrors
+  // MessageController::childWait), and completeChild re-pends per the EXACT
+  // TriggerCompletionService::notifyParentOfChildCompletion rule. Values are
+  // the real run_triggers.status literals
+  // ('started'|'waiting'|'pending'|'queued'|'cancelled'|'completed'|'failed').
+  triggerStatus?: string;
 }
 
 interface MockOperation {
@@ -299,6 +310,30 @@ export class MockHttpServer {
       return { status: 200, body: {} };
     }
 
+    // Task 2.7 (FIX 1/3) — child-wait: the parent marks itself `waiting` on a
+    // child before suspending. Faithfully models MessageController::childWait:
+    // ONLY an active (non-terminal, non-already-waiting) parent transitions to
+    // 'waiting'; it does NOT write the child-result op. The SDK posts this on
+    // EVERY getResult() that is about to suspend (including replay) so the
+    // parent is always in the re-pendable `waiting` state the backend's
+    // unconditional completion-hook re-pend can wake.
+    const childWaitMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/child-wait$/);
+    if (childWaitMatch && method === 'POST') {
+      const parentId = decodeURIComponent(childWaitMatch[1]);
+      const parent = this.store.workflows.get(parentId);
+      if (!parent) {
+        return { status: 404, body: { message: 'Run not found', type: 'run_not_found' } };
+      }
+      // Real backend active-state gate (MessageController::childWait):
+      // started|running|dispatched|queued|pending → waiting; otherwise no-op.
+      const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
+      const current = parent.triggerStatus ?? 'started';
+      if (active.includes(current)) {
+        parent.triggerStatus = 'waiting';
+      }
+      return { status: 200, body: { status: parent.triggerStatus ?? current } };
+    }
+
     // Events
     const eventMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/events\/([^/]+)$/);
     if (eventMatch && method === 'PUT') {
@@ -463,6 +498,24 @@ export class MockHttpServer {
 
     this.store.workflows.set(workflowUUID, workflow);
     this.store.operations.set(workflowUUID, []);
+
+    // Task 2.7 (FIX 3): the real backend (RunStatusController::store →
+    // ensureChildTrigger) marks the PARENT trigger `waiting` when it first
+    // creates the child (the parent is, by construction, awaiting it). Model
+    // that here so the parent trigger status starts faithful — same active-
+    // state gate as the real ensureChildTrigger. Replay re-POSTs the same
+    // child uuid and short-circuits above (existing), so this fires once, just
+    // like the idempotent real backend.
+    if (workflow.parentWorkflowID) {
+      const parent = this.store.workflows.get(workflow.parentWorkflowID);
+      if (parent) {
+        const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
+        const current = parent.triggerStatus ?? 'started';
+        if (active.includes(current)) {
+          parent.triggerStatus = 'waiting';
+        }
+      }
+    }
 
     return {
       status: 201,
@@ -1024,15 +1077,32 @@ export class MockHttpServer {
   /**
    * Task 2.7 test-driver — simulate the BACKEND completion hook for a child
    * workflow EXACTLY as TriggerCompletionService::notifyParentOfChildCompletion
-   * does it field-for-field:
-   *   1. mark the child run terminal (SUCCESS/ERROR), and
+   * does it, field-for-field, INCLUDING the FIX-1 lost-wakeup-safe re-pend:
+   *   1. mark the child run terminal (SUCCESS/ERROR);
    *   2. write the PARENT-keyed durable op (parent run uuid, child's
-   *      childResultFunctionID) carrying child_workflow_id + output|error.
-   * Step 2 is the row the SDK's getResult reads via
-   * getOperationResultAndThrowIfCancelled. (The backend additionally re-pends
-   * the parent RunTrigger; the harness models the resulting re-invoke by the
-   * test simply invoking the parent again — same as it models sleep/recv
-   * scheduler resume.) NO field here is absent from the real backend.
+   *      childResultFunctionID) carrying child_workflow_id + output|error —
+   *      the row the SDK's getResult reads via
+   *      getOperationResultAndThrowIfCancelled; AND
+   *   3. apply the REAL re-pend rule to the parent's TRIGGER status: the
+   *      backend re-pends (triggerStatus → 'pending') for ANY parent that is
+   *      NOT terminal/cancelled and NOT already pending/queued — the exact
+   *      `$terminalOrInFlight` gate in notifyParentOfChildCompletion. This is
+   *      what makes the lost-wakeup convergence true: a parent that is
+   *      `started` (mid-replay) or `waiting` is re-pended; a finished or
+   *      in-flight parent is not double-dispatched.
+   *
+   * The harness models the resulting scheduler re-invoke by the test invoking
+   * the parent again (same as it models sleep/recv resume). triggerStatus is
+   * left at 'pending' after a re-pend so a test can assert the parent WAS
+   * re-pended (no lost wakeup) vs. NOT (terminal/in-flight).
+   *
+   * FIX 1 failure invariant: on `error`, the parent-keyed op error is NEVER
+   * null and is ALWAYS a JSON-parseable serialized envelope — the exact
+   * guarantee TriggerCompletionService::notifyParentOfChildCompletion now
+   * makes (it wraps a plain/absent child error into `{name,message}` so the
+   * SDK's deserializeError(SolidActionsJSON.parse(error)) rethrows and the
+   * parent fails fast instead of stalling). NO field here is absent from /
+   * divergent from the real backend.
    */
   completeChild(childWorkflowID: string, result: { output?: string; error?: string }): void {
     const child = this.store.workflows.get(childWorkflowID);
@@ -1066,6 +1136,107 @@ export class MockHttpServer {
     } else {
       parentOps.push(row);
     }
+
+    // Step 3: the FIX-1 re-pend rule on the parent TRIGGER status. Mirror the
+    // exact `$terminalOrInFlight` gate in notifyParentOfChildCompletion.
+    this.rependParentTrigger(child.parentWorkflowID);
+  }
+
+  /**
+   * Task 2.7 (FIX 1/3) test-driver — simulate the INFRA-FALLBACK child failure
+   * path (RunnerController::failTrigger / container-exit / reaper) where the
+   * child completes WITHOUT its SDK ever writing a structured RunStatus.error.
+   * Models TriggerCompletionService::notifyParentOfChildCompletion's failure
+   * invariant FAITHFULLY: the parent-keyed op error is a NON-NULL JSON
+   * envelope `{name:'Error',message:<infraError>}` (the backend wraps the
+   * plain infra error string into the serialize-error shape), output is null,
+   * and the parent is re-pended per the SAME rule as completeChild. This is
+   * the exact row the real failTrigger path now produces — no fiction; the
+   * matching app Feature test proves the backend writes this shape.
+   */
+  failChildFromInfra(childWorkflowID: string, infraError: string): void {
+    const child = this.store.workflows.get(childWorkflowID);
+    if (!child || child.childResultFunctionID === undefined || !child.parentWorkflowID) {
+      throw new Error(`failChildFromInfra: ${childWorkflowID} is not a tracked child run`);
+    }
+    // Infra fallback marks the child run ERROR (status-only — the SDK never
+    // wrote a structured error itself).
+    child.status = StatusString.ERROR;
+    child.output = null;
+    child.error = null;
+    child.updatedAt = Date.now();
+
+    const parentOps = this.store.operations.get(child.parentWorkflowID);
+    if (!parentOps) {
+      throw new Error(`failChildFromInfra: parent ${child.parentWorkflowID} has no operation store`);
+    }
+    // Backend invariant: serialized, non-null, JSON-parseable error envelope.
+    const serialized = JSON.stringify({ name: 'Error', message: infraError });
+    const fnId = child.childResultFunctionID;
+    const existing = parentOps.find((o) => o.functionId === fnId);
+    const errorRow: MockOperation = {
+      workflowUUID: child.parentWorkflowID,
+      functionId: fnId,
+      functionName: 'SolidActions.startWorkflow',
+      output: null,
+      error: serialized,
+      childWorkflowId: childWorkflowID,
+      startedAtEpochMs: Date.now(),
+      completedAtEpochMs: Date.now(),
+    };
+    if (existing) {
+      Object.assign(existing, errorRow);
+    } else {
+      parentOps.push(errorRow);
+    }
+    this.rependParentTrigger(child.parentWorkflowID);
+  }
+
+  /**
+   * The REAL `notifyParentOfChildCompletion` re-pend gate, shared by
+   * completeChild + failChildFromInfra. Re-pend (triggerStatus → 'pending')
+   * UNLESS the parent is terminal/cancelled/dispatch_failed or already
+   * pending/queued — i.e. the exact `$terminalOrInFlight` list. Idempotent /
+   * no double-dispatch: an already pending/queued or finished parent is left
+   * untouched.
+   */
+  private rependParentTrigger(parentWorkflowID: string): void {
+    const parent = this.store.workflows.get(parentWorkflowID);
+    if (!parent) {
+      return;
+    }
+    const terminalOrInFlight = ['completed', 'failed', 'cancelled', 'dispatch_failed', 'pending', 'queued'];
+    const current = parent.triggerStatus ?? 'started';
+    if (!terminalOrInFlight.includes(current)) {
+      parent.triggerStatus = 'pending';
+    }
+  }
+
+  /**
+   * Task 2.7 (FIX 1/3, READ-ONLY): the most recent child-wait POST body
+   * (`POST /runs/status/<id>/child-wait`), or undefined. This is the
+   * server-side waiting-state marking the SDK's getResult() does BEFORE
+   * throwing SuspensionRequired('child') — the lost-wakeup fix. Inspects
+   * requestLog only; never mutates store or affects routing.
+   */
+  lastChildWait(): { runID: string; functionID: number } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/child-wait$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'POST' && m) {
+        return {
+          runID: decodeURIComponent(m[1]),
+          functionID: (entry.body as { functionID: number }).functionID,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /** Task 2.7 (FIX 3, READ-ONLY): a parent run's modeled TRIGGER status. */
+  triggerStatusOf(workflowUUID: string): string | undefined {
+    return this.store.workflows.get(workflowUUID)?.triggerStatus;
   }
 
   lastSleepSchedule(): { functionID: number; duration: number; wakeupTime: number } | undefined {

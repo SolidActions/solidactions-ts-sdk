@@ -198,6 +198,36 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
    *                           application_id or the backend rejects the child
    *                           create with 403 (risk 2).
    */
+  /**
+   * Task 2.7 (FIX 1) — mark the PARENT trigger as waiting on a child before the
+   * caller throws SuspensionRequired('child').
+   *
+   * This is the child-suspend analogue of recv's `POST /wait`: recv marks the
+   * trigger `waiting` server-side BEFORE throwing SuspensionRequired('recv') so
+   * the backend always re-pends a reliably-`waiting` trigger when the signal
+   * arrives. The child path previously had NO server-side marking on the
+   * SUSPEND (only at child-CREATE time, skipped on every parent replay), so a
+   * parent that re-suspended on an unresolved child stayed in a non-`waiting`
+   * state and the completion hook's re-pend never woke it → permanent stall for
+   * parallel children (Codex lost-wakeup defect).
+   *
+   * Called by InvokeChildHandle.getResult() on EVERY suspension (including
+   * replay) so the parent is always in the `waiting` re-pendable state the
+   * backend's unconditional completion-hook re-pend can wake. It does NOT write
+   * the child-result op (that is the backend completion hook's job) — it only
+   * transitions the parent trigger. Same SuspensionRequired throw / exit-0 /
+   * re-pend machinery as recv; NOT a new suspension mechanism.
+   *
+   * @param parentWorkflowID  the parent run uuid (the suspending workflow)
+   * @param functionID        the parent's durable result funcID awaiting the
+   *                          child (the same id keyed to the parent-result op)
+   */
+  async markWaitingOnChild(parentWorkflowID: string, functionID: number): Promise<void> {
+    await this.invokeClient.post(`/runs/status/${encodeURIComponent(parentWorkflowID)}/child-wait`, {
+      functionID,
+    });
+  }
+
   async enqueueChildWorkflow(
     childWorkflowID: string,
     childWorkflowName: string,
