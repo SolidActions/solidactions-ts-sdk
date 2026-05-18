@@ -37,10 +37,19 @@ import { SolidActionsJSON } from '../../src/serialization';
 let srv: MockHttpServer;
 
 beforeAll(async () => {
+  // NOTE: the mock server has no `POST .../workflow-complete` route, so each
+  // `completed` run logs an expected `console.warn "Failed to report one-shot
+  // workflow completion"` — this is the established behaviour across the
+  // run-compat/run-statusrow suites (the POST is observed via requestLog, not
+  // routed), NOT a regression.
   srv = await setUpSolidActionsTestServer();
 });
 
-/** The run id the one-shot ContextAdapter maps to ctx.run.runUuid. */
+/**
+ * The run id the one-shot ContextAdapter maps to `ctx.run.runUuid`. MUST match
+ * the value the test env's `SOLIDACTIONS_RUN_ID` resolves to (same constant as
+ * the sibling run-compat/run-statusrow suites); changing it desyncs mock routing.
+ */
 const RUN_ID = '00000000-0000-4000-8000-0000000002a6';
 
 beforeEach(() => {
