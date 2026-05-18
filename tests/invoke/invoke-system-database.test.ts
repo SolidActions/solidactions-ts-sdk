@@ -61,6 +61,12 @@ describe('InvokeSystemDatabase', () => {
     const err = await db.recv('wf-recv-2', 1, 0).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SuspensionRequired);
     expect((err as SuspensionRequired).reason).toBe('recv');
+
+    // A wait POST must have hit the mock server for wf-recv-1
+    const waitPost = srv.requestLog.find(
+      (r) => r.method === 'POST' && r.path.includes('wf-recv-1') && r.path.endsWith('/wait'),
+    );
+    expect(waitPost).toBeDefined();
   });
 
   it('SuspensionRequired is an Error subclass with the expected reason field', () => {
