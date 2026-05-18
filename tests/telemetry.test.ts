@@ -14,7 +14,7 @@ import Router from '@koa/router';
 import { context, trace, SpanStatusCode } from '@opentelemetry/api';
 import { isTraceContextWorking } from '../src/telemetry/traces';
 import { AddressInfo } from 'net';
-import { globalParams } from '../src/utils';
+import { bootParams } from '../src/utils';
 
 async function tracedStep() {
   return Promise.resolve();
@@ -25,7 +25,7 @@ async function doSomethingTraced_internal() {
   if (span) {
     span.setAttribute('my-lib.didSomething', true);
   }
-  if (globalParams.enableOTLP) {
+  if (bootParams.enableOTLP) {
     expect(SolidActions.span).toBe(trace.getSpan(context.active()));
   }
   await SolidActions.runStep(tracedStep, { name: 'tracedStep' });

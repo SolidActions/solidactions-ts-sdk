@@ -12,6 +12,12 @@
  *     what this task deletes. A `/* boot-only *​/` marker anywhere in the file is
  *     the explicit escape hatch for a legacy boot/CLI survivor; guarded
  *     `src/invoke/*` files must never need it.
+ *     WHOLE-FILE escape: a single `/* boot-only *​/` marker disables this guard for every line in that
+ *     file — NEVER add the marker to a `src/invoke/*` file. DETECTION is column-0 only: an indented
+ *     module-scope read (IIFE / top-level block / multi-line initializer) is NOT caught. This guard
+ *     is a tripwire, not a proof; tightening (per-line marker association / AST scope analysis) is
+ *     deferred — if a future task must add a boot-only marker to a guarded file, tighten this guard
+ *     in the SAME task.
  *
  *  2. globalParams must be gone from src/utils.ts (not defined, not importable).
  *

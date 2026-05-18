@@ -657,7 +657,7 @@ export class SolidActions {
   } {
     /* boot-only */ // legacy runner transport (SOLIDACTIONS_API_URL / APP_URL env); the invoke() path derives URLs from ctx.api
     const baseApiUrl =
-      process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') ||
+      process.env.SOLIDACTIONS_API_URL?.replace('/api/internal', '') || // (also collapsed a pre-existing duplicated SOLIDACTIONS_API_URL operand here — X||X||Y ≡ X||Y, behavior-neutral)
       process.env.APP_URL ||
       'http://localhost:8000';
 
