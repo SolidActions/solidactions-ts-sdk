@@ -32,9 +32,13 @@ import { HttpClient } from '../http_client';
  * maps it to { status: 'suspended', reason }.
  */
 export class SuspensionRequired extends Error {
-  readonly reason: 'sleep' | 'recv';
+  readonly reason: 'sleep' | 'recv' | 'child';
 
-  constructor(reason: 'sleep' | 'recv') {
+  // Task 2.7: 'child' reuses the EXACT sleep/recv suspend machinery (throw →
+  // invoke() maps to { status: 'suspended' } → one-shot exits 0 → backend
+  // re-pends the parent → re-invoked → replays). It is a new reason literal,
+  // NOT a new suspension mechanism or a new endpoint.
+  constructor(reason: 'sleep' | 'recv' | 'child') {
     super(`Workflow suspended: ${reason}`);
     this.name = 'SuspensionRequired';
     this.reason = reason;
@@ -141,7 +145,9 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
     await this.checkIfCanceled(workflowID);
 
     const params = new URLSearchParams();
-    if (topic) { params.set('topic', topic); }
+    if (topic) {
+      params.set('topic', topic);
+    }
     params.set('functionID', functionID.toString());
     params.set('timeoutFunctionID', timeoutFunctionID.toString());
 
@@ -163,5 +169,58 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
 
     // Signal suspension — never exit the process
     throw new SuspensionRequired('recv');
+  }
+
+  /**
+   * Task 2.7 — enqueue a child workflow as its own backend run.
+   *
+   * Reuses the EXISTING `POST /runs/status` endpoint the SDK already calls for
+   * a child via initWorkflowStatus (the legacy in-process model only created a
+   * RunStatus here). The one-shot backend's child branch additionally creates a
+   * pending child RunTrigger so RunTriggerObserver dispatches a child container.
+   * The only protocol addition is `childResultFunctionID`: the PARENT's durable
+   * function id that awaits this child's result, which the backend completion
+   * hook keys the parent's durable child-result op to.
+   *
+   * The child run UUID is deterministic (`${parentWorkflowID}-child-${funcId}`),
+   * so a parent replay POSTs the same UUID and the backend is idempotent on it
+   * (mirrors createWorkflow's existing-UUID short-circuit + the durable enqueue
+   * op recorded by the caller — see solidactions.ts startWorkflow).
+   *
+   * @param childWorkflowID    deterministic child run uuid
+   * @param childWorkflowName  the child's registered workflow name (resolved to
+   *                           a Workflow by slug within the parent's project)
+   * @param input              serialized child input args
+   * @param childResultFunctionID  the parent's durable funcID awaiting this child
+   * @param identity           parent run identity (executorID = parent trigger
+   *                           id; appId = parent ctx.app.appId; appVersion).
+   *                           applicationID MUST equal the parent run's
+   *                           application_id or the backend rejects the child
+   *                           create with 403 (risk 2).
+   */
+  async enqueueChildWorkflow(
+    childWorkflowID: string,
+    childWorkflowName: string,
+    input: string,
+    childResultFunctionID: number,
+    identity: { executorID: string; appId: string; appVersion: string },
+  ): Promise<void> {
+    await this.invokeClient.post(`/runs/status`, {
+      workflowUUID: childWorkflowID,
+      status: 'PENDING',
+      workflowName: childWorkflowName,
+      // executorId/applicationID/applicationVersion mirror initWorkflowStatus;
+      // the backend additionally re-derives the parent/child auth LINK from the
+      // authenticated bearer trigger (it does NOT trust these for that link —
+      // see RunStatusController::ensureChildTrigger), but applicationID must
+      // still match the parent run (risk 2).
+      executorId: identity.executorID,
+      applicationID: identity.appId,
+      applicationVersion: identity.appVersion,
+      input,
+      createdAt: Date.now(),
+      priority: 0,
+      childResultFunctionID,
+    });
   }
 }

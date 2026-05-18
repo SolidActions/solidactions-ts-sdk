@@ -117,6 +117,7 @@ import { StepConfig } from './step';
 // dependency is made type-only / the shared HttpClient base is extracted) —
 // NOT merely when the legacy executor or globalParams is deleted.
 import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
+import { invokeStartChildWorkflow } from './invoke/child-workflow';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
 import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
@@ -556,10 +557,7 @@ export class SolidActions {
     // RunStatusController::store() validates `workflowName => required|string`
     // and Laravel's `required` rejects an empty string.
     const workflowReg = getFunctionRegistration(workflow as object);
-    const workflowName =
-      workflowReg?.name ||
-      (workflow as { name?: string }).name ||
-      'workflow';
+    const workflowName = workflowReg?.name || (workflow as { name?: string }).name || 'workflow';
 
     // Reproduce the legacy backend status-row lifecycle. Legacy run() persisted
     // it via the executor's THREE-step sequence (src/solidactions-executor.ts
@@ -700,18 +698,12 @@ export class SolidActions {
    * issue the identical POST shape directly — see the Task 1.2 precedent
    * (InvokeSystemDatabase replicating the POST it could not reach).
    */
-  static async #initOneShotStatusRow(
-    ctx: InvokeCtx,
-    workflowName: string,
-  ): Promise<void> {
+  static async #initOneShotStatusRow(ctx: InvokeCtx, workflowName: string): Promise<void> {
     // Lazy require() (see import-block comment): http_client is pulled by the
     // invoke chain; a static import here would re-enter the module-load cycle.
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
     const { HttpClient } = require('./http_client') as typeof import('./http_client');
-    const client = new HttpClient(
-      { baseUrl: ctx.api.url, apiKey: ctx.api.key },
-      SolidActions.logger as GlobalLogger,
-    );
+    const client = new HttpClient({ baseUrl: ctx.api.url, apiKey: ctx.api.key }, SolidActions.logger as GlobalLogger);
     const workflowID = ctx.run.runUuid;
 
     // Step 0: run-row CREATE (initWorkflowStatus shape, verbatim). Mirrors the
@@ -756,9 +748,7 @@ export class SolidActions {
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      (SolidActions.logger as GlobalLogger).warn(
-        `Failed to create one-shot status row for ${workflowID}: ${errMsg}`,
-      );
+      (SolidActions.logger as GlobalLogger).warn(`Failed to create one-shot status row for ${workflowID}: ${errMsg}`);
     }
   }
 
@@ -830,10 +820,7 @@ export class SolidActions {
    * reached on the cancelled-self path). Exit code is 1 (the legacy re-throw
    * propagated to run()'s generic catch → process.exit(1)).
    */
-  static async #reportOneShotTerminalState(
-    ctx: InvokeCtx,
-    result: InvokeResult,
-  ): Promise<void> {
+  static async #reportOneShotTerminalState(ctx: InvokeCtx, result: InvokeResult): Promise<void> {
     if (result.status === 'suspended') {
       return;
     }
@@ -841,10 +828,7 @@ export class SolidActions {
     // invoke chain; a static import here would re-enter the module-load cycle.
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
     const { HttpClient } = require('./http_client') as typeof import('./http_client');
-    const client = new HttpClient(
-      { baseUrl: ctx.api.url, apiKey: ctx.api.key },
-      SolidActions.logger as GlobalLogger,
-    );
+    const client = new HttpClient({ baseUrl: ctx.api.url, apiKey: ctx.api.key }, SolidActions.logger as GlobalLogger);
     const workflowID = ctx.run.runUuid;
     const encodedID = encodeURIComponent(workflowID);
 
@@ -1521,6 +1505,30 @@ export class SolidActions {
     target: UntypedAsyncFunction | ConfiguredInstance | object,
     params?: StartWorkflowParams,
   ): unknown {
+    // Task 2.7: invoke-scope bridge (same getCurrentScope() pattern as Task 2.6
+    // send/recv/setEvent). Under one-shot invoke() the legacy
+    // ensureSolidActionsIsLaunched + SolidActionsExecutor.globalInstance path
+    // does not exist (and would throw "SolidActions.launch() must be called
+    // before running workflows"); a child is dispatched via the durable
+    // enqueue+suspend bridge instead. The scope check MUST precede
+    // ensureSolidActionsIsLaunched. Non-invoke path is byte-unchanged legacy
+    // below.
+    if (getCurrentScope()) {
+      return invokeStartChildWorkflow((t, p) => {
+        const regOp =
+          p === undefined
+            ? getFunctionRegistration(t)
+            : (getFunctionRegistration(Reflect.get(t as object, p)) ??
+              getRegisteredOperations(target).find((op) => op.name === p));
+        if (!regOp) {
+          const name =
+            p === undefined ? (typeof t === 'function' ? (t as { name: string }).name : String(t)) : String(p);
+          throw new SolidActionsNotRegisteredError(name, `${name} is not a registered SolidActions workflow function`);
+        }
+        return regOp.name;
+      }, target as object);
+    }
+
     ensureSolidActionsIsLaunched('workflows');
     const instance = typeof target === 'function' ? null : (target as ConfiguredInstance);
     if (instance && typeof instance !== 'function' && !(instance instanceof ConfiguredInstance)) {

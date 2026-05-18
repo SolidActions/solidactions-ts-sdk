@@ -10,7 +10,11 @@ export interface InvokeCtxApp {
   tenantId: string;
 }
 /** A connection var: opaque key + run-shared proxy (proxyToken is a bearer — treat as secret). */
-export interface ConnectionVar { readonly key: string; readonly proxyUrl: string; readonly proxyToken: string; }
+export interface ConnectionVar {
+  readonly key: string;
+  readonly proxyUrl: string;
+  readonly proxyToken: string;
+}
 export type VarValue = string | ConnectionVar;
 export interface InvokeCtx<I = unknown> {
   input: I;
@@ -24,7 +28,10 @@ export interface InvokeCtx<I = unknown> {
 }
 export type InvokeResult<O = unknown> =
   | { status: 'completed'; output: O }
-  | { status: 'suspended'; reason: 'sleep' | 'recv' }
+  // Task 2.7: 'child' joins sleep/recv — the SAME suspend→exit-0→re-invoke
+  // machinery, signalled when a parent awaits an as-yet-unresolved child
+  // workflow. No new mechanism, only a new reason literal.
+  | { status: 'suspended'; reason: 'sleep' | 'recv' | 'child' }
   // Task 2.8: a SolidActionsWorkflowCancelledError surfaced from the workflow
   // body (e.g. the sleep/recv resume path detecting the run row CANCELLED).
   // Distinct from 'failed' so the one-shot path writes StatusString.CANCELLED

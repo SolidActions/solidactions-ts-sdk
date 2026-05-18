@@ -37,6 +37,14 @@ interface MockWorkflow {
   deadlineEpochMS?: number;
   deduplicationID?: string;
   priority: number;
+  // Task 2.7: present only on a child-workflow run created via the one-shot
+  // child branch of POST /runs/status. childResultFunctionID is the PARENT's
+  // durable funcID awaiting this child; parentWorkflowID is derived from the
+  // deterministic child uuid (`${parent}-child-<funcId>`) the SDK sends — the
+  // real backend re-derives it from the authenticated bearer trigger, the mock
+  // models the resulting linkage so completeChild() can target the parent op.
+  childResultFunctionID?: number;
+  parentWorkflowID?: string;
   queuePartitionKey?: string;
   forkedFrom?: string;
 }
@@ -444,6 +452,13 @@ export class MockHttpServer {
       priority: data.priority ?? 0,
       queuePartitionKey: data.queuePartitionKey,
       forkedFrom: data.forkedFrom,
+      childResultFunctionID: data.childResultFunctionID,
+      // Task 2.7: derive the parent from the deterministic child uuid
+      // (`${parent}-child-<funcId>`). The real backend instead re-derives the
+      // parent from the authenticated bearer trigger; the mock models the same
+      // resulting parent→child link so completeChild() can write the
+      // parent-keyed durable op the SDK's getResult reads.
+      parentWorkflowID: data.childResultFunctionID !== undefined ? workflowUUID.replace(/-child-\d+$/, '') : undefined,
     };
 
     this.store.workflows.set(workflowUUID, workflow);
@@ -950,9 +965,7 @@ export class MockHttpServer {
    * faithful place to observe it is the recorded requestLog. This accessor
    * inspects requestLog only; it never mutates store or affects routing.
    */
-  lastWorkflowComplete():
-    | { status: 'completed' | 'failed'; output?: unknown; error?: unknown }
-    | undefined {
+  lastWorkflowComplete(): { status: 'completed' | 'failed'; output?: unknown; error?: unknown } | undefined {
     const re = /\/(?:runs\/status|workflows)\/[^/]+\/workflow-complete$/;
     for (let i = this.requestLog.length - 1; i >= 0; i--) {
       const entry = this.requestLog[i];
@@ -975,9 +988,87 @@ export class MockHttpServer {
    * `POST /runs/status/<id>/sleep` (the sleep route returns `{}` and stores
    * nothing). Inspects requestLog only; never mutates store or affects routing.
    */
-  lastSleepSchedule():
-    | { functionID: number; duration: number; wakeupTime: number }
+  /**
+   * Task 2.7 (READ-ONLY): the body of the most recent child-create POST
+   * (`POST /runs/status` carrying `childResultFunctionID`), or undefined.
+   * Mirrors the real backend's child branch trigger: this is the exact call
+   * the SDK already makes for a child via initWorkflowStatus, plus the one
+   * protocol addition. Inspects requestLog only.
+   */
+  lastChildCreate():
+    | {
+        workflowUUID: string;
+        workflowName: string;
+        childResultFunctionID: number;
+        applicationID: string;
+        input: string | null;
+      }
     | undefined {
+    const re = /\/(?:runs\/status|workflows)$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const b = entry.body as { childResultFunctionID?: number } | undefined;
+      if (entry.method === 'POST' && re.test(entry.path) && b?.childResultFunctionID !== undefined) {
+        return entry.body as {
+          workflowUUID: string;
+          workflowName: string;
+          childResultFunctionID: number;
+          applicationID: string;
+          input: string | null;
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.7 test-driver — simulate the BACKEND completion hook for a child
+   * workflow EXACTLY as TriggerCompletionService::notifyParentOfChildCompletion
+   * does it field-for-field:
+   *   1. mark the child run terminal (SUCCESS/ERROR), and
+   *   2. write the PARENT-keyed durable op (parent run uuid, child's
+   *      childResultFunctionID) carrying child_workflow_id + output|error.
+   * Step 2 is the row the SDK's getResult reads via
+   * getOperationResultAndThrowIfCancelled. (The backend additionally re-pends
+   * the parent RunTrigger; the harness models the resulting re-invoke by the
+   * test simply invoking the parent again — same as it models sleep/recv
+   * scheduler resume.) NO field here is absent from the real backend.
+   */
+  completeChild(childWorkflowID: string, result: { output?: string; error?: string }): void {
+    const child = this.store.workflows.get(childWorkflowID);
+    if (!child || child.childResultFunctionID === undefined || !child.parentWorkflowID) {
+      throw new Error(`completeChild: ${childWorkflowID} is not a tracked child run`);
+    }
+
+    child.status = result.error ? StatusString.ERROR : StatusString.SUCCESS;
+    child.output = result.output ?? null;
+    child.error = result.error ?? null;
+    child.updatedAt = Date.now();
+
+    const parentOps = this.store.operations.get(child.parentWorkflowID);
+    if (!parentOps) {
+      throw new Error(`completeChild: parent ${child.parentWorkflowID} has no operation store`);
+    }
+    const fnId = child.childResultFunctionID;
+    const existing = parentOps.find((o) => o.functionId === fnId);
+    const row: MockOperation = {
+      workflowUUID: child.parentWorkflowID,
+      functionId: fnId,
+      functionName: 'SolidActions.startWorkflow',
+      output: result.output ?? null,
+      error: result.error ?? null,
+      childWorkflowId: childWorkflowID,
+      startedAtEpochMs: Date.now(),
+      completedAtEpochMs: Date.now(),
+    };
+    if (existing) {
+      Object.assign(existing, row);
+    } else {
+      parentOps.push(row);
+    }
+  }
+
+  lastSleepSchedule(): { functionID: number; duration: number; wakeupTime: number } | undefined {
     const re = /\/(?:runs\/status|workflows)\/[^/]+\/sleep$/;
     for (let i = this.requestLog.length - 1; i >= 0; i--) {
       const entry = this.requestLog[i];
@@ -999,9 +1090,7 @@ export class MockHttpServer {
    * (recordOutput); this accessor still reads requestLog only — it never mutates
    * store or affects routing.
    */
-  lastOutputPut():
-    | { index: number; workflowID: string; body: { output?: unknown; status?: unknown } }
-    | undefined {
+  lastOutputPut(): { index: number; workflowID: string; body: { output?: unknown; status?: unknown } } | undefined {
     const re = /\/(?:runs\/status|workflows)\/([^/]+)\/output$/;
     for (let i = this.requestLog.length - 1; i >= 0; i--) {
       const entry = this.requestLog[i];
@@ -1023,9 +1112,7 @@ export class MockHttpServer {
    * write — HttpSystemDatabase.recordWorkflowError), or undefined if none.
    * Same shape/contract as {@link lastOutputPut}.
    */
-  lastErrorPut():
-    | { index: number; workflowID: string; body: { error?: unknown; status?: unknown } }
-    | undefined {
+  lastErrorPut(): { index: number; workflowID: string; body: { error?: unknown; status?: unknown } } | undefined {
     const re = /\/(?:runs\/status|workflows)\/([^/]+)\/error$/;
     for (let i = this.requestLog.length - 1; i >= 0; i--) {
       const entry = this.requestLog[i];
@@ -1055,9 +1142,7 @@ export class MockHttpServer {
    * or affects routing. The path match is exact (no trailing segment) so it
    * never collides with `/runs/status/<id>/...` sub-routes.
    */
-  lastRunStatusCreate():
-    | { index: number; body: Record<string, unknown> }
-    | undefined {
+  lastRunStatusCreate(): { index: number; body: Record<string, unknown> } | undefined {
     const re = /^\/(?:runs\/status|workflows)$/;
     for (let i = this.requestLog.length - 1; i >= 0; i--) {
       const entry = this.requestLog[i];
