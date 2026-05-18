@@ -57,11 +57,10 @@ import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } f
  * - send: minimal delegation straight to the engine's send(). Not exercised by
  *   Task 1.3 tests; safe for the same reason.
  */
-function attachPrimitives<I>(
-  ctx: InvokeCtx<I>,
+function buildPrimitives(
   engine: InvokeSystemDatabase,
   workflowID: string,
-): InvokeCtx<I> & DurablePrimitives {
+): DurablePrimitives {
   const primitives: DurablePrimitives = {
     // MINIMAL 1.3: sleep delegates directly to engine.durableSleepms; no retry/deadline policy yet.
     sleep: (ms: number): Promise<void> => engine.durableSleepms(workflowID, nextFunctionID(), ms),
@@ -113,7 +112,7 @@ function attachPrimitives<I>(
     },
   };
 
-  return Object.assign(ctx, primitives);
+  return primitives;
 }
 
 /**
@@ -164,10 +163,14 @@ export async function invoke<I, O>(
     appVersion: ctx.app.appVersion,
     functionIDCounter: 0,
   };
-  const scope: RuntimeScope = { executor: engine, runtimeParams };
+  // Build the durable primitives once; attach to ctx (for descriptor bodies that
+  // take ctx) AND to the scope (Task 2.3: so legacy SolidActions.runStep/sleepms
+  // free-functions delegate to these EXACT closures — single source of truth).
+  const primitives = buildPrimitives(engine, workflowID);
+  const scope: RuntimeScope = { executor: engine, runtimeParams, primitives };
 
   try {
-    const ctxWithPrimitives = attachPrimitives(ctx, engine, workflowID);
+    const ctxWithPrimitives = Object.assign(ctx, primitives);
     const output = await runInScope(scope, () => workflow.run(ctxWithPrimitives));
     return { status: 'completed', output };
   } catch (error) {

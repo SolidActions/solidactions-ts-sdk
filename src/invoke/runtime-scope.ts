@@ -15,7 +15,13 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
-import { InvokeSystemDatabase } from './invoke-system-database';
+// Type-only: importing the value would create a runtime import cycle
+// (runtime-scope -> invoke-system-database -> http_system_database -> workflow
+// -> solidactions -> runtime-scope). InvokeSystemDatabase is used only in type
+// position here, so `import type` (erased at runtime) keeps this module
+// cycle-free.
+import type { InvokeSystemDatabase } from './invoke-system-database';
+import type { DurablePrimitives } from './types';
 
 /**
  * Per-invoke durable runtime parameters. Identity is injected from the caller's
@@ -44,6 +50,15 @@ export interface RuntimeParams {
 export interface RuntimeScope {
   readonly executor: InvokeSystemDatabase;
   readonly runtimeParams: RuntimeParams;
+  /**
+   * Task 2.3: the durable primitives invoke() built for this run. Exposed on
+   * the scope so the legacy `SolidActions.runStep` / `SolidActions.sleepms`
+   * free-functions can delegate to the EXACT same closures (single source of
+   * truth) when a legacy-registered workflow body runs under the one-shot
+   * run() path. Optional: invoke() sets it; callers that build a scope without
+   * primitives (none today) simply won't have the bridge available.
+   */
+  readonly primitives?: DurablePrimitives;
 }
 
 const invokeScope = new AsyncLocalStorage<RuntimeScope>();
@@ -80,6 +95,16 @@ export function getCurrentExecutor(): InvokeSystemDatabase {
 /** The durable runtime params for the active invoke scope. Throws if none. */
 export function getCurrentRuntimeParams(): RuntimeParams {
   return requireScope('getCurrentRuntimeParams').runtimeParams;
+}
+
+/**
+ * The durable primitives for the active invoke scope (Task 2.3 compat bridge),
+ * or undefined when not inside invoke() OR when the scope carries no primitives.
+ * Used by SolidActions.runStep/sleepms to delegate legacy free-function calls
+ * onto invoke()'s primitives without duplicating record-or-replay logic.
+ */
+export function getCurrentPrimitives(): DurablePrimitives | undefined {
+  return invokeScope.getStore()?.primitives;
 }
 
 /**

@@ -886,6 +886,60 @@ export class MockHttpServer {
 
     return true;
   }
+
+  // ==========================================
+  // One-shot compat-layer observation accessors (read-only)
+  // ==========================================
+
+  /**
+   * Task 2.3 (READ-ONLY): the body of the most recent workflow-completion POST,
+   * or undefined if none was observed.
+   *
+   * The SDK's completion path (legacy executor AND the new one-shot run() compat
+   * layer) reports terminal status via `POST /runs/status/<id>/workflow-complete`
+   * with body `{ status: 'completed' | 'failed', output?, error? }`
+   * (HttpSystemDatabase.reportWorkflowComplete). This route has no store handler
+   * — it is intentionally a fire-and-forget infrastructure signal — so the only
+   * faithful place to observe it is the recorded requestLog. This accessor
+   * inspects requestLog only; it never mutates store or affects routing.
+   */
+  lastWorkflowComplete():
+    | { status: 'completed' | 'failed'; output?: unknown; error?: unknown }
+    | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/workflow-complete$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return entry.body as {
+          status: 'completed' | 'failed';
+          output?: unknown;
+          error?: unknown;
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.3 (READ-ONLY): the body of the most recent durable-sleep schedule
+   * POST, or undefined if none was observed.
+   *
+   * Durable sleep posts `{ functionID, duration, wakeupTime }` to
+   * `POST /runs/status/<id>/sleep` (the sleep route returns `{}` and stores
+   * nothing). Inspects requestLog only; never mutates store or affects routing.
+   */
+  lastSleepSchedule():
+    | { functionID: number; duration: number; wakeupTime: number }
+    | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/sleep$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return entry.body as { functionID: number; duration: number; wakeupTime: number };
+      }
+    }
+    return undefined;
+  }
 }
 
 /**

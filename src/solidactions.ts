@@ -92,6 +92,20 @@ import { Server } from 'http';
 import { randomUUID } from 'node:crypto';
 
 import { StepConfig } from './step';
+// Task 2.3: the one-shot compat path — run() = ContextAdapter -> invoke() -> RuntimeAdapter.
+//
+// invoke()/contextAdapter/runtimeAdapter/HttpClient are required LAZILY inside
+// run()/#reportOneShotCompletion (call-time require()) to avoid a module-load
+// cycle: http_system_database -> workflow -> solidactions -> invoke ->
+// invoke-system-database -> (extends) http_system_database. A STATIC import of
+// the invoke chain here re-enters http_system_database before its
+// HttpSystemDatabase class is defined ("Class extends value undefined", which
+// breaks tests/http_client.test.ts at load instead of its documented baseline).
+// The lazy-require idiom matches existing usage (src/telemetry/exporters.ts,
+// traces.ts, utils.ts). runtime-scope is safe to import statically: it only
+// type-imports the heavy classes, so it pulls no runtime cycle.
+import { getCurrentPrimitives } from './invoke/runtime-scope';
+import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
 import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
 import { registerAuthChecker } from './authdecorators';
@@ -442,47 +456,182 @@ export class SolidActions {
   }
 
   /**
-   * Run a workflow with minimal boilerplate.
-   * Handles launch(), startWorkflow(), getResult(), and shutdown().
+   * Run a workflow as a one-shot process.
    *
-   * @param workflow - The workflow function to run
-   * @param options - Optional settings for input and workflow ID
-   * @returns Promise that resolves when workflow completes (or rejects on error)
+   * Task 2.3 — this is now the one-shot compat layer. It no longer drives the
+   * legacy launch()/startWorkflow()/getResult()/shutdown() lifecycle; instead it
+   * is the literal composition the architecture intends:
+   *
+   *   oneShotContextAdapter(process.env)  →  invoke(descriptor, ctx)
+   *     →  reproduce the legacy completion POST from the InvokeResult
+   *     →  process.exit(oneShotRuntimeAdapter.exitCodeFor(result))
+   *
+   * invoke() is already globalParams/SolidActionsExecutor-free (it runs on
+   * InvokeSystemDatabase under an ALS scope), so the workflow EXECUTION path is
+   * fully explicit here. The legacy launch/shutdown globals are NOT deleted by
+   * this task — that convergence is Task 2.4; see the `// Task 2.4:` seams.
+   *
+   * `workflow` may be either a {@link WorkflowDescriptor} (`{ run }`), the
+   * callable wrapper returned by the (now deprecated) `registerWorkflow` shim,
+   * or a bare `(input) => Promise<output>` function. All three are normalized to
+   * a descriptor whose `run(ctx)` invokes the user function with `ctx.input`.
+   *
+   * The `SOLIDACTIONS_DEBUG_WORKFLOW_ID` debug-launch flow stays legacy-only:
+   * when that env var is set we defer to the legacy launch() path (which owns
+   * debug replay) instead of the one-shot path.
    *
    * @example
    * ```typescript
-   * async function myWorkflow(input: MyInput): Promise<MyOutput> {
-   *   // workflow logic
-   * }
-   *
-   * const wf = SolidActions.registerWorkflow(myWorkflow, { name: 'my-workflow' });
+   * const wf = SolidActions.registerWorkflow(myWorkflow);
    * await SolidActions.run(wf);
    * ```
    */
   static async run<T, R>(
-    workflow: (input: T) => Promise<R>,
+    workflow: WorkflowDescriptor<T, R> | ((input: T) => R | Promise<R>),
     options?: {
       input?: T; // Pre-parsed input (overrides WORKFLOW_INPUT)
-      workflowID?: string; // Custom workflow ID
+      workflowID?: string; // Custom workflow ID (reserved; one-shot id comes from SOLIDACTIONS_RUN_ID)
     },
   ): Promise<void> {
-    try {
-      await SolidActions.launch();
-      const input = options?.input ?? (await SolidActions.getInputAsync<T>());
-      const handle = await SolidActions.startWorkflow(workflow, {
-        workflowID: options?.workflowID,
-      })(input);
-      await handle.getResult();
-      await SolidActions.shutdown();
-      process.exit(0);
-    } catch (error) {
-      console.error('Workflow failed:', error);
+    // SOLIDACTIONS_DEBUG_WORKFLOW_ID replay stays on the legacy lifecycle — that
+    // path owns recorded-result comparison and is not part of one-shot run().
+    if (process.env.SOLIDACTIONS_DEBUG_WORKFLOW_ID) {
       try {
+        await SolidActions.launch(); // legacy launch() handles the debug replay + process.exit(0)
         await SolidActions.shutdown();
-      } catch {
-        // Ignore shutdown errors
+        process.exit(0);
+      } catch (error) {
+        console.error('Workflow failed:', error);
+        try {
+          await SolidActions.shutdown();
+        } catch {
+          // Ignore shutdown errors
+        }
+        process.exit(1);
       }
-      process.exit(1);
+      return;
+    }
+
+    // --- one-shot path: ContextAdapter -> invoke() -> RuntimeAdapter ---------
+    // Lazy require(): see the import-block comment — a STATIC import of the
+    // invoke chain creates a module-load cycle through http_system_database
+    // ("Class extends value undefined"). Deferring to call-time breaks the
+    // cycle. require() (not dynamic import()) matches the codebase's existing
+    // lazy-load idiom (src/telemetry/exporters.ts, traces.ts, utils.ts) and
+    // resolves correctly under ts-jest's extensionless resolution.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require to break the module-load cycle (see import-block comment)
+    const { invoke } = require('./invoke/invoke') as typeof import('./invoke/invoke');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see above)
+    const { oneShotContextAdapter } = require('./invoke/context-adapter') as typeof import('./invoke/context-adapter');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see above)
+    const { oneShotRuntimeAdapter } = require('./invoke/runtime-adapter') as typeof import('./invoke/runtime-adapter');
+
+    const descriptor = SolidActions.#toWorkflowDescriptor<T, R>(workflow, options?.input);
+    const ctx = oneShotContextAdapter(process.env as Record<string, string>);
+
+    const result = await invoke<T, R>(descriptor, ctx as unknown as InvokeCtx<T>);
+
+    // Reproduce the legacy backend completion signal from the InvokeResult.
+    //
+    // Legacy run() POSTed completion indirectly: the executor called
+    // systemDatabase.recordWorkflowOutput/Error (PUT .../output|/error, which
+    // mutates a status row the executor had already created) AND
+    // systemDatabase.reportWorkflowComplete (POST .../workflow-complete — a
+    // fire-and-forget infra signal whose errors are swallowed).
+    //
+    // The invoke() engine (InvokeSystemDatabase) deliberately does NOT create
+    // that status row (see invoke.ts header), so the row-mutating PUTs have no
+    // row to update on the one-shot path. The faithful, row-independent
+    // completion signal is reportWorkflowComplete; we reproduce exactly that
+    // POST here from the InvokeResult. Recreating the legacy status-row
+    // lifecycle is Task 2.4 convergence work, not 2.3.
+    await SolidActions.#reportOneShotCompletion(ctx.api, ctx.run.runUuid, result);
+
+    process.exit(oneShotRuntimeAdapter.exitCodeFor(result));
+  }
+
+  /**
+   * Normalize the accepted `run()` workflow argument into a WorkflowDescriptor.
+   *
+   * - `{ run }` descriptor → used directly.
+   * - legacy `registerWorkflow` wrapper → its registration's `origFunction`
+   *   (the user-provided function) is recovered and wrapped so the durable
+   *   primitives flow through invoke()'s ALS scope rather than the legacy
+   *   executor. Task 2.4: once the legacy wrapper is retired this recovery
+   *   collapses to a plain descriptor.
+   * - bare function → wrapped directly.
+   *
+   * The `presetInput` (run()'s options.input) overrides ctx.input when given.
+   */
+  static #toWorkflowDescriptor<T, R>(
+    workflow: WorkflowDescriptor<T, R> | ((input: T) => R | Promise<R>),
+    presetInput?: T,
+  ): WorkflowDescriptor<T, R> {
+    if (workflow && typeof (workflow as WorkflowDescriptor<T, R>).run === 'function') {
+      const inner = workflow as WorkflowDescriptor<T, R>;
+      if (presetInput === undefined) {
+        return inner;
+      }
+      return {
+        run: (ctx) => inner.run({ ...ctx, input: presetInput } as typeof ctx),
+      };
+    }
+
+    // Recover the user function from a legacy registerWorkflow wrapper, if any.
+    // Task 2.4: legacy wrapper/registration coupling — converges when the
+    // legacy executor path is deleted.
+    const fn = workflow as (input: T) => R | Promise<R>;
+    const reg = getFunctionRegistration(fn);
+    const userFn = (reg?.origFunction as ((input: T) => R | Promise<R>) | undefined) ?? fn;
+
+    return {
+      run: (ctx) => Promise.resolve(userFn(presetInput !== undefined ? presetInput : ctx.input)),
+    };
+  }
+
+  /**
+   * Reproduce the legacy `reportWorkflowComplete` POST from an InvokeResult.
+   *
+   * Mirrors HttpSystemDatabase.reportWorkflowComplete:
+   *   POST /runs/status/<id>/workflow-complete { status, output?, error? }
+   * with `status: 'completed' | 'failed'` and errors swallowed (the infra
+   * webhook/reaper is the fallback). Suspension is terminal-neutral for the
+   * one-shot process (exit 0) and posts nothing here — the sleep/recv schedule
+   * was already POSTed by InvokeSystemDatabase before it threw.
+   */
+  static async #reportOneShotCompletion(
+    api: { url: string; key: string },
+    workflowID: string,
+    result: InvokeResult,
+  ): Promise<void> {
+    if (result.status === 'suspended') {
+      return;
+    }
+    // Lazy require() (see import-block comment): http_client is pulled by the
+    // invoke chain; a static import here would re-enter the module-load cycle.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require (see import-block comment)
+    const { HttpClient } = require('./http_client') as typeof import('./http_client');
+    const client = new HttpClient({ baseUrl: api.url, apiKey: api.key }, SolidActions.logger as GlobalLogger);
+    try {
+      if (result.status === 'completed') {
+        await client.post(`/runs/status/${encodeURIComponent(workflowID)}/workflow-complete`, {
+          status: 'completed',
+          output: result.output,
+        });
+      } else {
+        const err = result.error;
+        const message = err instanceof Error ? err.message : String(err);
+        await client.post(`/runs/status/${encodeURIComponent(workflowID)}/workflow-complete`, {
+          status: 'failed',
+          error: message,
+        });
+      }
+    } catch (err) {
+      // Non-fatal: matches legacy reportWorkflowComplete (infra signal fallback).
+      const errMsg = err instanceof Error ? err.message : String(err);
+      (SolidActions.logger as GlobalLogger).warn(
+        `Failed to report one-shot workflow completion for ${workflowID} (${result.status}): ${errMsg}`,
+      );
     }
   }
 
@@ -860,6 +1009,18 @@ export class SolidActions {
    * @param durationMS - Length of sleep, in milliseconds.
    */
   static async sleepms(durationMS: number): Promise<void> {
+    // Task 2.3: when a legacy-registered workflow body runs under the one-shot
+    // run() path it executes inside invoke()'s ALS scope (not the legacy
+    // executor). Delegate the durable sleep to invoke()'s OWN sleep primitive
+    // (single source of truth) — it posts the sleep schedule and throws
+    // SuspensionRequired (→ run() maps to exit 0 + a scheduled sleep).
+    const invokePrimitives = getCurrentPrimitives();
+    if (invokePrimitives) {
+      if (durationMS <= 0) {
+        return;
+      }
+      return await invokePrimitives.sleep(durationMS);
+    }
     if (SolidActions.isWithinWorkflow() && !SolidActions.isInStep()) {
       if (SolidActions.isInTransaction()) {
         throw new SolidActionsInvalidWorkflowTransitionError(
@@ -1398,28 +1559,60 @@ export class SolidActions {
     return decorator;
   }
 
+  /** One-time guard for the registerWorkflow deprecation notice. */
+  static #registerWorkflowDeprecationWarned = false;
+
   /**
    * Create a SolidActions workflow function from a provided function.
-   *   Similar to the SolidActions.workflow, but without requiring a decorator
-   *   Durable execution will be applied to calls to the function returned by registerWorkflow
-   *   This also registers the function so that it is available during recovery
+   *
+   * @deprecated Task 2.3 — the one-shot model no longer needs an explicit
+   * registration step: pass your workflow (a `defineWorkflow({ run })`
+   * descriptor or a plain function) straight to `SolidActions.run()`, which now
+   * routes execution through invoke(). This shim is retained so existing
+   * `registerWorkflow(...)` call sites keep working (the returned value is still
+   * the legacy callable wrapper, and `run()` recovers the underlying function
+   * from it) — but it is on the Task 2.4 convergence path and will be removed.
+   *
    * @param func - The function to register as a workflow
-   * @param name - The name of the registered workflow
-   * @param options - Configuration information for the registered workflow
+   * @param config - Configuration information for the registered workflow
    */
   static registerWorkflow<This, Args extends unknown[], Return>(
     func: (this: This, ...args: Args) => Promise<Return>,
     config?: FunctionName & WorkflowConfig,
   ): (this: This, ...args: Args) => Promise<Return> {
+    if (!SolidActions.#registerWorkflowDeprecationWarned) {
+      SolidActions.#registerWorkflowDeprecationWarned = true;
+      console.warn(
+        '[SolidActions] SolidActions.registerWorkflow() is deprecated: pass your workflow ' +
+          '(a defineWorkflow({ run }) descriptor or a plain function) directly to ' +
+          'SolidActions.run(). registerWorkflow() will be removed in a future release.',
+      );
+    }
+    // Task 2.4: still returns the legacy callable wrapper + registration so the
+    // legacy executor path and existing call sites keep working; run() recovers
+    // origFunction from this registration. Collapses when the legacy path goes.
+    // Anonymous functions (e.g. `registerWorkflow(async () => ...)`) all have
+    // an empty `.name`, so two of them would collide in the by-unique-name
+    // registry and throw SolidActionsConflictingRegistrationError. The one-shot
+    // run() path recovers the user fn via origFunction, not by registry name,
+    // so the name is no longer load-bearing here — give anonymous workflows a
+    // unique fallback name in this deprecated shim. Explicit `config.name` and
+    // named functions are unchanged (so decorator/legacy call sites are
+    // unaffected). Task 2.4: removed with the legacy registration coupling.
+    const explicitName = config?.name ?? (func.name || undefined);
+    const wfName = explicitName ?? `__anon_workflow_${++SolidActions.#anonWorkflowSeq}`;
     const registration = wrapSolidActionsFunctionAndRegisterByUniqueName(
       config?.ctorOrProto,
       config?.className,
-      config?.name ?? func.name,
-      config?.name ?? func.name,
+      wfName,
+      wfName,
       func,
     );
     return SolidActions.#getWorkflowInvoker(registration, config);
   }
+
+  /** Monotonic counter for anonymous-workflow fallback names (Task 2.3 shim). */
+  static #anonWorkflowSeq = 0;
 
   static async #invokeWorkflow<This, Args extends unknown[], Return>(
     $this: This,
@@ -1670,17 +1863,34 @@ export class SolidActions {
    * @param config.name - The name of the step; if not provided, the function name will be used
    * @returns - result (either obtained from invoking function, or retrieved if run before)
    */
-  static runStep<Return>(func: () => Promise<Return>, config: StepConfig & { name?: string } = {}): Promise<Return> {
+  static runStep<Return>(
+    func: () => Return | Promise<Return>,
+    config: StepConfig & { name?: string } = {},
+  ): Promise<Return> {
+    const name = config.name ?? func.name;
+
+    // Task 2.3: when a legacy-registered workflow body runs under the one-shot
+    // run() path it executes inside invoke()'s ALS scope. Delegate to invoke()'s
+    // OWN step primitive (single source of truth: record-or-replay against the
+    // per-request InvokeSystemDatabase). ensureSolidActionsIsLaunched() is a
+    // legacy-launch guard that does not apply to the invoke() path, so it is
+    // intentionally skipped here.
+    const invokePrimitives = getCurrentPrimitives();
+    if (invokePrimitives) {
+      return invokePrimitives.step<Return>(func, { name });
+    }
+
     ensureSolidActionsIsLaunched('steps');
 
-    const name = config.name ?? func.name;
     if (SolidActions.isWithinWorkflow()) {
       if (SolidActions.isInTransaction()) {
         throw new SolidActionsInvalidWorkflowTransitionError('Invalid call to a runStep from within a `transaction`');
       }
       if (SolidActions.isInStep()) {
         // There should probably be checks here about the compatibility of the StepConfig...
-        return func();
+        // Promise.resolve normalizes the now-sync-or-async func() to Promise<Return>
+        // (no behavior change: an already-Promise is returned as-is).
+        return Promise.resolve(func());
       }
       return SolidActionsExecutor.globalInstance!.callStepFunction<[], Return>(
         func as unknown as TypedAsyncFunction<[], Return>,
@@ -1696,7 +1906,7 @@ export class SolidActions {
       );
     }
 
-    return func();
+    return Promise.resolve(func());
   }
 
   /**

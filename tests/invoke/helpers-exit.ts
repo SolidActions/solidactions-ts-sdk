@@ -31,22 +31,42 @@ export class ProcessExitSignal extends Error {
  * The arm flag is always restored in a `finally`, so nested or sequenced calls
  * are safe.
  *
- * Forward-compat note: an optional second argument (e.g. `env?: Record<string, string>`)
- * can be added later to snapshot/restore process.env entries around the call without
- * changing the signature of existing callers.
+ * Optional `env` argument (the planned 0.1a extension point): if given, each key
+ * is set on `process.env` before running `fn` and restored afterwards in the
+ * `finally` (keys that were absent before are deleted; keys that had a value are
+ * restored to it). Backward compatible — callers that pass no `env` are
+ * unaffected.
  *
- * @param fn - Function under test that must call process.exit(). If it completes
- *             without calling process.exit(), expectProcessExit throws.
- * @returns   The numeric exit code passed to process.exit().
+ * @param fn  - Function under test that must call process.exit(). If it completes
+ *              without calling process.exit(), expectProcessExit throws.
+ * @param env - Optional env keys to set for the duration of the call, restored
+ *              to their prior values (or deleted) afterwards.
+ * @returns     The numeric exit code passed to process.exit().
  */
-export async function expectProcessExit(fn: () => unknown | Promise<unknown>): Promise<number> {
+export async function expectProcessExit(
+  fn: () => unknown,
+  env?: Record<string, string>,
+): Promise<number> {
   const g = globalThis as Record<string, unknown>;
   const prior = g.__processExitArmed;
   g.__processExitArmed = true;
 
+  // Snapshot prior env values so they can be restored (or deleted) afterwards.
+  const priorEnv: Record<string, string | undefined> = {};
+  if (env) {
+    for (const key of Object.keys(env)) {
+      priorEnv[key] = process.env[key];
+      process.env[key] = env[key];
+    }
+  }
+
   try {
     const result = fn();
-    if (result != null && typeof (result as Promise<unknown>).then === 'function') {
+    if (
+      result !== null &&
+      result !== undefined &&
+      typeof (result as Promise<unknown>).then === 'function'
+    ) {
       await (result as Promise<unknown>);
     }
   } catch (err: unknown) {
@@ -54,18 +74,24 @@ export async function expectProcessExit(fn: () => unknown | Promise<unknown>): P
     // `code` property (to avoid the circular-import problem of referencing this
     // module from jest.setup.ts). We re-wrap it as a proper ProcessExitSignal so
     // callers get a typed value.
-    if (
-      err instanceof Error &&
-      err.name === 'ProcessExitSignal' &&
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      typeof (err as any).code === 'number'
-    ) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (err as any).code as number;
+    if (err instanceof Error && err.name === 'ProcessExitSignal') {
+      const code = (err as Error & { code?: unknown }).code;
+      if (typeof code === 'number') {
+        return code;
+      }
     }
     throw err;
   } finally {
     g.__processExitArmed = prior;
+    if (env) {
+      for (const key of Object.keys(env)) {
+        if (priorEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = priorEnv[key];
+        }
+      }
+    }
   }
 
   throw new Error(
