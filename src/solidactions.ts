@@ -755,6 +755,12 @@ export class SolidActions {
         request: {},
         executorId: String(ctx.run.triggerId),
         applicationVersion: ctx.app.appVersion,
+        // Task 2.5 HAZARD: applicationID/createdAt rely on the runner injecting a non-empty
+        // SOLIDACTIONS app id into ctx (oneShotContextAdapter defaults appId to '' if unset).
+        // Empty applicationID → real RunStatusController::store() 422s → the output/error PUT
+        // then 404s and is swallowed → silent persistence loss. Intentionally NOT defaulted
+        // (unlike workflowName): appId MUST come from the runner, never be faked. The Task 2.5
+        // e2e parity gate must assert the row-create returns 2xx (not 422) on real Daytona.
         applicationID: ctx.app.appId,
         createdAt: Date.now(),
         priority: 0,
