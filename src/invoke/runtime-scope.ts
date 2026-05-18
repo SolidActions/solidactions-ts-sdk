@@ -71,6 +71,7 @@ function requireScope(caller: string): RuntimeScope {
   return scope;
 }
 
+// Consumed by Task 2.4 (route legacy identity via ALS); intentionally unused on the invoke() path in Phase 1.
 /** The per-request execution engine for the active invoke scope. Throws if none. */
 export function getCurrentExecutor(): InvokeSystemDatabase {
   return requireScope('getCurrentExecutor').executor;

@@ -35,6 +35,7 @@
  *   tests — see notes on each).
  */
 
+import { deserializeError, serializeError } from 'serialize-error';
 import { GlobalLogger } from '../telemetry/logs';
 import { SolidActionsJSON } from '../serialization';
 import { SolidActionsHttpConfig } from '../config';
@@ -62,9 +63,11 @@ function attachPrimitives<I>(
   workflowID: string,
 ): InvokeCtx<I> & DurablePrimitives {
   const primitives: DurablePrimitives = {
+    // MINIMAL 1.3: sleep delegates directly to engine.durableSleepms; no retry/deadline policy yet.
     sleep: (ms: number): Promise<void> => engine.durableSleepms(workflowID, nextFunctionID(), ms),
 
     recv: async <T = unknown>(topic?: string): Promise<T> => {
+      // MINIMAL 1.3: recv delegates to engine.recv; no timeout/cancellation handling beyond what the engine provides.
       const functionID = nextFunctionID();
       const timeoutFunctionID = nextFunctionID();
       const raw = await engine.recv(workflowID, functionID, timeoutFunctionID, topic);
@@ -73,19 +76,22 @@ function attachPrimitives<I>(
 
     send: (topic: string, payload: unknown): Promise<void> => {
       const functionID = nextFunctionID();
+      // MINIMAL 1.3: destinationID == workflowID (self-send only). Task 2.x: thread real cross-workflow target from cfg.
       return engine.send(workflowID, functionID, workflowID, SolidActionsJSON.stringify(payload), topic);
     },
 
     step: async <T>(fn: () => T | Promise<T>, cfg?: { name?: string }): Promise<T> => {
       const functionID = nextFunctionID();
-      const stepName = cfg?.name ?? fn.name ?? '<step>';
+      // MINIMAL 1.3: step is minimal record-or-replay; full retry/timeout policy comes in Task 2.x.
+      const stepName = cfg?.name || fn.name || '<step>';
 
       // Replay: if this step already recorded a result, return it instead of
       // re-running the function (idempotency across re-invocation).
       const recorded = await engine.getOperationResultAndThrowIfCancelled(workflowID, functionID);
       if (recorded) {
         if (recorded.error) {
-          throw SolidActionsJSON.parse(recorded.error);
+          // Deserialize using serialize-error so custom Error props (e.g. code, statusCode) survive replay.
+          throw deserializeError(SolidActionsJSON.parse(recorded.error));
         }
         return SolidActionsJSON.parse(recorded.output ?? null) as T;
       }
@@ -98,8 +104,9 @@ function attachPrimitives<I>(
         });
         return output;
       } catch (err) {
+        // Serialize with serialize-error so custom Error props survive suspend+replay.
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
-          error: SolidActionsJSON.stringify(err),
+          error: SolidActionsJSON.stringify(serializeError(err)),
         });
         throw err;
       }
@@ -150,6 +157,7 @@ export async function invoke<I, O>(
   }
 
   // --- Phase: run --------------------------------------------------------
+  // runtimeParams identity fields are placeholders for Task 2.4 ALS convergence; only functionIDCounter is read in 1.3 (via nextFunctionID).
   const runtimeParams: RuntimeParams = {
     workflowID,
     executorID: String(ctx.run.triggerId),
