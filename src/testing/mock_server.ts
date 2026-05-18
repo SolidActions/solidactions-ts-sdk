@@ -310,13 +310,24 @@ export class MockHttpServer {
       return { status: 200, body: {} };
     }
 
-    // Task 2.7 (FIX 1/3) — child-wait: the parent marks itself `waiting` on a
-    // child before suspending. Faithfully models MessageController::childWait:
-    // ONLY an active (non-terminal, non-already-waiting) parent transitions to
-    // 'waiting'; it does NOT write the child-result op. The SDK posts this on
-    // EVERY getResult() that is about to suspend (including replay) so the
-    // parent is always in the re-pendable `waiting` state the backend's
-    // unconditional completion-hook re-pend can wake.
+    // Task 2.7 — atomic child-wait compare-and-set (Codex fix#2, DEFECT 1b).
+    // FAITHFUL model of the revised MessageController::childWait: a SINGLE
+    // atomic step that (a) checks whether the SPECIFIC awaited child op
+    // (parent run_uuid + the SDK-supplied result functionID) is ALREADY
+    // resolved — output OR error present — and (b) only if NOT resolved
+    // transitions an active parent → `waiting`. It returns the `ready` signal:
+    //   · ready:true  → child already complete (happened-before the suspend);
+    //                   the trigger is NOT marked waiting; the SDK re-reads &
+    //                   resolves instead of suspending (closes the
+    //                   op-read↔child-wait lost-wakeup window).
+    //   · ready:false → op unresolved; active parent moved to `waiting`; a
+    //                   later completion sees `waiting` and re-pends.
+    // The real backend does this under DB::transaction + lockForUpdate; the
+    // single-threaded mock route() IS already atomic per request, so this is
+    // field-for-field faithful WITHOUT asserting anything the real backend
+    // does not do. (The worker-session/job-skip lifecycle that creates the
+    // REAL race is NOT modellable here — that is validated by the real-Daytona
+    // e2e gate, not this mock; see the design doc.)
     const childWaitMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/child-wait$/);
     if (childWaitMatch && method === 'POST') {
       const parentId = decodeURIComponent(childWaitMatch[1]);
@@ -324,14 +335,26 @@ export class MockHttpServer {
       if (!parent) {
         return { status: 404, body: { message: 'Run not found', type: 'run_not_found' } };
       }
-      // Real backend active-state gate (MessageController::childWait):
-      // started|running|dispatched|queued|pending → waiting; otherwise no-op.
-      const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
+      const fnId = (body as { functionID?: number } | undefined)?.functionID;
+      const parentOps = this.store.operations.get(parentId) ?? [];
+      const op = parentOps.find((o) => (o.functionId ?? o.functionID) === fnId);
+      const resolved = !!op && ((op.output ?? null) !== null || (op.error ?? null) !== null);
+
       const current = parent.triggerStatus ?? 'started';
+      if (resolved) {
+        // Happened-before: do NOT mark waiting (that would strand an in-flight
+        // parent). Tell the SDK to re-read & resolve.
+        return { status: 200, body: { ready: true, status: current } };
+      }
+
+      // Unresolved → suspend. Real backend active-state gate
+      // (MessageController::childWait): started|running|dispatched|queued|
+      // pending → waiting; terminal/already-waiting → no-op (never resurrect).
+      const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
       if (active.includes(current)) {
         parent.triggerStatus = 'waiting';
       }
-      return { status: 200, body: { status: parent.triggerStatus ?? current } };
+      return { status: 200, body: { ready: false, status: parent.triggerStatus ?? current } };
     }
 
     // Events
@@ -1193,21 +1216,25 @@ export class MockHttpServer {
   }
 
   /**
-   * The REAL `notifyParentOfChildCompletion` re-pend gate, shared by
-   * completeChild + failChildFromInfra. Re-pend (triggerStatus → 'pending')
-   * UNLESS the parent is terminal/cancelled/dispatch_failed or already
-   * pending/queued — i.e. the exact `$terminalOrInFlight` list. Idempotent /
-   * no double-dispatch: an already pending/queued or finished parent is left
-   * untouched.
+   * The REAL corrected `notifyParentOfChildCompletion` re-pend gate
+   * (Codex fix#2, DEFECT 1a), shared by completeChild + failChildFromInfra.
+   * Re-pend (triggerStatus → 'pending') ONLY when the parent is genuinely
+   * blocked-waiting on the child (`waiting`). An IN-FLIGHT parent
+   * (started/running/dispatched/queued/pending) is NOT re-pended — the live
+   * parent reads the op itself / its /child-wait CAS returns ready; re-pending
+   * a running session would double-dispatch and reopen the lost-wakeup window.
+   * TERMINAL (completed/failed/cancelled/dispatch_failed) is never re-pended
+   * (no resurrection — DEFECT 5). This is field-for-field the app backend's
+   * gate; the op is ALWAYS written first (in completeChild/failChildFromInfra)
+   * as the single source of truth regardless of the parent's state.
    */
   private rependParentTrigger(parentWorkflowID: string): void {
     const parent = this.store.workflows.get(parentWorkflowID);
     if (!parent) {
       return;
     }
-    const terminalOrInFlight = ['completed', 'failed', 'cancelled', 'dispatch_failed', 'pending', 'queued'];
     const current = parent.triggerStatus ?? 'started';
-    if (!terminalOrInFlight.includes(current)) {
+    if (current === 'waiting') {
       parent.triggerStatus = 'pending';
     }
   }

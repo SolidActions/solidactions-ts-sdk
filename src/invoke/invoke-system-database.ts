@@ -199,33 +199,49 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
    *                           create with 403 (risk 2).
    */
   /**
-   * Task 2.7 (FIX 1) — mark the PARENT trigger as waiting on a child before the
-   * caller throws SuspensionRequired('child').
+   * Task 2.7 — atomic child-wait compare-and-set (Codex fix#2, DEFECT 1b).
    *
-   * This is the child-suspend analogue of recv's `POST /wait`: recv marks the
-   * trigger `waiting` server-side BEFORE throwing SuspensionRequired('recv') so
-   * the backend always re-pends a reliably-`waiting` trigger when the signal
-   * arrives. The child path previously had NO server-side marking on the
-   * SUSPEND (only at child-CREATE time, skipped on every parent replay), so a
-   * parent that re-suspended on an unresolved child stayed in a non-`waiting`
-   * state and the completion hook's re-pend never woke it → permanent stall for
-   * parallel children (Codex lost-wakeup defect).
+   * The child-suspend analogue of recv's `POST /wait`, but it closes a
+   * lost-wakeup window recv does not have. The parent's getResult() reads the
+   * child-result op; if absent it would suspend. But the child can complete in
+   * the window BETWEEN that op-read and this /child-wait POST: the completion
+   * writes the op and tries to re-pend, but the parent's one-shot process is
+   * still running (trigger `started`, a running WorkerSession exists), so
+   * DispatchTriggerToDaytona skips a duplicate dispatch — and a naive "always
+   * mark waiting" here would then overwrite `started`→`waiting` with no
+   * remaining re-dispatch → permanent stall.
    *
-   * Called by InvokeChildHandle.getResult() on EVERY suspension (including
-   * replay) so the parent is always in the `waiting` re-pendable state the
-   * backend's unconditional completion-hook re-pend can wake. It does NOT write
-   * the child-result op (that is the backend completion hook's job) — it only
-   * transitions the parent trigger. Same SuspensionRequired throw / exit-0 /
-   * re-pend machinery as recv; NOT a new suspension mechanism.
+   * The backend now makes the op-resolved check and the →waiting transition
+   * ONE atomic step (DB::transaction + lockForUpdate on the parent trigger),
+   * keyed by the awaited child's RESULT functionID (passed here):
+   *
+   *   · `{ ready: true }`  — the child op is ALREADY resolved (happened-before
+   *                          the suspend). The trigger was NOT marked
+   *                          `waiting`. The caller MUST NOT suspend; it re-
+   *                          reads the op and resolves/rethrows.
+   *   · `{ ready: false }` — op unresolved; the trigger was transitioned to
+   *                          `waiting` (only from a valid in-flight state). The
+   *                          caller suspends; a completion that lands AFTER
+   *                          this commit sees `waiting` and re-pends. No lost
+   *                          window in either ordering.
+   *
+   * Same SuspensionRequired throw / exit-0 / re-pend machinery as recv; the
+   * only addition is the atomic check + the `ready` signal.
    *
    * @param parentWorkflowID  the parent run uuid (the suspending workflow)
    * @param functionID        the parent's durable result funcID awaiting the
-   *                          child (the same id keyed to the parent-result op)
+   *                          child (the exact id keyed to the parent-result op)
+   * @returns `{ ready }` — `true` ⇒ child already complete, do NOT suspend.
    */
-  async markWaitingOnChild(parentWorkflowID: string, functionID: number): Promise<void> {
-    await this.invokeClient.post(`/runs/status/${encodeURIComponent(parentWorkflowID)}/child-wait`, {
-      functionID,
-    });
+  async markWaitingOnChild(parentWorkflowID: string, functionID: number): Promise<{ ready: boolean }> {
+    const resp = await this.invokeClient.post<{ ready?: boolean; status?: string }>(
+      `/runs/status/${encodeURIComponent(parentWorkflowID)}/child-wait`,
+      { functionID },
+    );
+    // Default to ready:false (suspend) if the field is absent — a missing
+    // signal must fall back to the safe "suspend + wait for re-pend" path, not
+    // a spurious "don't suspend" that could spin.
+    return { ready: resp?.ready === true };
   }
 
   async enqueueChildWorkflow(

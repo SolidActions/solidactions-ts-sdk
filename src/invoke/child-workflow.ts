@@ -75,31 +75,52 @@ export class InvokeChildHandle<R> implements WorkflowHandle<R> {
    */
   async getResult(resultFuncId?: number): Promise<R> {
     const funcId = resultFuncId ?? nextFunctionID();
-    const recorded = await this.engine.getOperationResultAndThrowIfCancelled(this.parentWorkflowID, funcId);
 
-    if (recorded) {
+    const resolve = (recorded: { output?: string | null; error?: string | null }): R => {
       if (recorded.error) {
         // Child failed: rethrow with serialize-error so custom Error props
         // (code, statusCode, …) survive the suspend+replay round-trip — the
         // parent observes the failure, never a silent stall (risk 6). The
         // backend GUARANTEES recorded.error is a non-null serialized error on
         // failure even on the infra-fallback path (TriggerCompletionService::
-        // notifyParentOfChildCompletion), so this branch always rethrows and
-        // the parent fails fast instead of stalling.
+        // notifyParentOfChildCompletion), so this always rethrows and the
+        // parent fails fast instead of stalling.
         throw deserializeError(SolidActionsJSON.parse(recorded.error));
       }
       return SolidActionsJSON.parse(recorded.output ?? 'null') as R;
+    };
+
+    const recorded = await this.engine.getOperationResultAndThrowIfCancelled(this.parentWorkflowID, funcId);
+    if (recorded) {
+      // Replay path: the child-result op is already durable — resolve/rethrow.
+      return resolve(recorded);
     }
 
-    // Child not finished — suspend the parent. FIX 1 (lost-wakeup): mark the
-    // parent `waiting` server-side FIRST (the child-suspend analogue of recv's
-    // POST /wait), on EVERY suspension including replay, so the backend's
-    // completion-hook re-pend always wakes a reliably-`waiting` parent. Without
-    // this, a parent that re-suspended on an unresolved sibling child stayed in
-    // a non-`waiting` state and the later completion never re-pended it →
-    // permanent stall for parallel children. SAME SuspensionRequired throw /
-    // exit-0 / re-pend machinery as recv/sleep — not a new mechanism.
-    await this.engine.markWaitingOnChild(this.parentWorkflowID, funcId);
+    // Child-result op ABSENT on this read. Before suspending, do the atomic
+    // child-wait compare-and-set (Codex fix#2, DEFECT 1b). It either marks the
+    // parent `waiting` (op still unresolved → safe to suspend; a later
+    // completion sees `waiting` and re-pends) OR tells us the child ALREADY
+    // completed in the op-read↔child-wait window (`ready:true`) — in which
+    // case suspending would strand an in-flight parent with no remaining
+    // re-dispatch (the lost-wakeup permanent stall).
+    const { ready } = await this.engine.markWaitingOnChild(this.parentWorkflowID, funcId);
+
+    if (ready) {
+      // The CAS guarantees the op was committed-resolved BEFORE it returned
+      // ready:true. Re-read ONCE (bounded — no loop): resolve/rethrow instead
+      // of suspending. If, defensively, the op is still not visible (it must
+      // be, per the CAS invariant), fall through to the safe suspend path so
+      // the next re-pend/replay converges — never an infinite re-read.
+      const afterReady = await this.engine.getOperationResultAndThrowIfCancelled(this.parentWorkflowID, funcId);
+      if (afterReady) {
+        return resolve(afterReady);
+      }
+    }
+
+    // Genuinely unresolved (ready:false) — the parent is now `waiting`
+    // server-side; suspend via the SAME throw / exit-0 / re-pend machinery as
+    // recv/sleep (not a new mechanism). The completion-hook re-pend wakes the
+    // reliably-`waiting` parent; replay re-reads the op and resolves.
     throw new SuspensionRequired('child');
   }
 }
