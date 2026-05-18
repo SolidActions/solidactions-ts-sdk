@@ -132,8 +132,8 @@ export function oneShotContextAdapter(transport: Record<string, string>): Invoke
     if (hasProxy && isConnectionValue(value)) {
       const connVar: ConnectionVar = {
         key: value,
-        proxyUrl: proxyUrl,
-        proxyToken: proxyToken,
+        proxyUrl,
+        proxyToken,
       };
       vars[key] = connVar;
     } else {
