@@ -491,6 +491,16 @@ export class MockHttpServer {
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
     }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.recordOutput —
+    // a row already in CANCELLED must NOT be clobbered to SUCCESS/ERROR by a
+    // late output PUT racing the cancel. A CANCELLED → CANCELLED write (the
+    // one-shot cancelled terminal-state write) is the no-op idempotent case.
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
+    }
     workflow.output = data.output;
     workflow.status = data.status;
     workflow.updatedAt = Date.now();
@@ -504,6 +514,15 @@ export class MockHttpServer {
     const workflow = this.store.workflows.get(workflowUUID);
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
+    }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.recordError —
+    // a row already in CANCELLED must NOT be clobbered to ERROR by a late
+    // error PUT racing the cancel.
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
     }
     workflow.error = data.error;
     workflow.status = data.status;

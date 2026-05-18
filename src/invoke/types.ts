@@ -25,6 +25,13 @@ export interface InvokeCtx<I = unknown> {
 export type InvokeResult<O = unknown> =
   | { status: 'completed'; output: O }
   | { status: 'suspended'; reason: 'sleep' | 'recv' }
+  // Task 2.8: a SolidActionsWorkflowCancelledError surfaced from the workflow
+  // body (e.g. the sleep/recv resume path detecting the run row CANCELLED).
+  // Distinct from 'failed' so the one-shot path writes StatusString.CANCELLED
+  // (mirroring legacy solidactions-executor.ts:606-611). No error/output
+  // payload: the legacy cancelled-self branch only set
+  // internalStatus.status = CANCELLED and re-threw — it carried none.
+  | { status: 'cancelled' }
   | { status: 'failed'; error: unknown; phase?: 'init' | 'run' };
 export interface WorkflowDescriptor<I = unknown, O = unknown> {
   run: (ctx: InvokeCtx<I> & DurablePrimitives) => Promise<O>;

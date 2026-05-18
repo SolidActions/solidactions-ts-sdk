@@ -815,6 +815,20 @@ export class SolidActions {
    * status-row output/error write and no completion POST — the sleep/recv
    * schedule was already POSTed by InvokeSystemDatabase before it threw, and
    * the row was already created by #initOneShotStatusRow before invoke().
+   *
+   * Task 2.8 — cancelled: mirrors the legacy executor's cancelled-self branch
+   * (src/solidactions-executor.ts:606-611) byte-for-byte. That branch set
+   * `internalStatus.status = StatusString.CANCELLED` and re-threw the
+   * SolidActionsWorkflowCancelledError WITHOUT calling recordWorkflowError or
+   * reportWorkflowComplete — the backend row reached CANCELLED via the cancel
+   * itself (sysdb.cancelWorkflow / the admin cancel endpoint). The faithful
+   * one-shot reproduction is therefore: a single durable status-row write —
+   * `PUT /runs/status/<id>/output { output: null, status: CANCELLED }` (the
+   * recordWorkflowOutput endpoint, carrying NO output/error payload, just the
+   * CANCELLED status) — and NO workflow-complete POST (legacy
+   * reportWorkflowComplete only accepts 'completed'|'failed' and was never
+   * reached on the cancelled-self path). Exit code is 1 (the legacy re-throw
+   * propagated to run()'s generic catch → process.exit(1)).
    */
   static async #reportOneShotTerminalState(
     ctx: InvokeCtx,
@@ -833,6 +847,35 @@ export class SolidActions {
     );
     const workflowID = ctx.run.runUuid;
     const encodedID = encodeURIComponent(workflowID);
+
+    // Task 2.8 — cancelled: a single durable status-row write carrying the
+    // CANCELLED status and NO output/error payload, then NO workflow-complete
+    // POST. This is the faithful one-shot reproduction of the legacy executor's
+    // cancelled-self branch (src/solidactions-executor.ts:606-611), which set
+    // `internalStatus.status = StatusString.CANCELLED` and re-threw WITHOUT
+    // calling recordWorkflowError or reportWorkflowComplete. Uses the
+    // recordWorkflowOutput endpoint (`PUT .../output`) — the same durable
+    // status-row write the completed path uses — with `output: null` because
+    // the legacy cancelled branch carried no payload (it never touched
+    // internalStatus.output). The backend guard (RunStatusController) refuses
+    // to clobber an already-CANCELLED row, so this PUT is idempotent against a
+    // racing cancel. Best-effort swallow, symmetric with the other branches.
+    if (result.status === 'cancelled') {
+      try {
+        await client.put(`/runs/status/${encodedID}/output`, {
+          output: null,
+          status: StatusString.CANCELLED,
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        (SolidActions.logger as GlobalLogger).warn(
+          `Failed to persist one-shot status-row CANCELLED for ${workflowID}: ${errMsg}`,
+        );
+      }
+      // NO workflow-complete POST: legacy reportWorkflowComplete only takes
+      // 'completed'|'failed' and was never reached on the cancelled-self path.
+      return;
+    }
 
     // Step 1: durable status-row write (recordWorkflowOutput/recordWorkflowError
     // shape, verbatim). The value mirrors what the legacy executor put on

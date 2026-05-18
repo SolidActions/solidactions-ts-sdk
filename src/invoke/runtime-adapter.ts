@@ -27,6 +27,13 @@ export const oneShotRuntimeAdapter: OneShotRuntimeAdapter = {
         return 0;
       case 'failed':
         return 1;
+      // Task 2.8: legacy parity — the executor re-threw
+      // SolidActionsWorkflowCancelledError (solidactions-executor.ts:611),
+      // which propagated to the legacy one-shot run()'s generic catch →
+      // console.error + process.exit(1). Cancelled was NOT a special exit-0
+      // path; match the legacy exit code 1.
+      case 'cancelled':
+        return 1;
       case 'suspended':
         return 0;
       default: {

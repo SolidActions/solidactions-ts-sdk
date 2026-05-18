@@ -36,6 +36,7 @@
  */
 
 import { deserializeError, serializeError } from 'serialize-error';
+import { SolidActionsWorkflowCancelledError } from '../error';
 import { GlobalLogger } from '../telemetry/logs';
 import { SolidActionsJSON } from '../serialization';
 import { SolidActionsHttpConfig } from '../config';
@@ -121,6 +122,7 @@ function buildPrimitives(
  * Mapping:
  *   - normal return ............................ { status: 'completed', output }
  *   - SuspensionRequired (ctx.sleep/ctx.recv) .. { status: 'suspended', reason }
+ *   - SolidActionsWorkflowCancelledError ....... { status: 'cancelled' }
  *   - failure during engine init/health ........ { status: 'failed', phase: 'init' }
  *   - any other error from the body ............ { status: 'failed', phase: 'run' }
  *
@@ -187,6 +189,16 @@ export async function invoke<I, O>(
   } catch (error) {
     if (error instanceof SuspensionRequired) {
       return { status: 'suspended', reason: error.reason };
+    }
+    // Task 2.8: a cancelled workflow surfaces SolidActionsWorkflowCancelledError
+    // (thrown by getOperationResultAndThrowIfCancelled when the run row is
+    // CANCELLED — including the sleep/recv resume path: durableSleepms calls it
+    // before scheduling). Detect it BEFORE the generic failed mapping so the
+    // one-shot path can write StatusString.CANCELLED, mirroring the legacy
+    // executor's explicit cancelled-self branch (solidactions-executor.ts:606-611).
+    // Must precede the failed mapping — a CancelledError is NOT a failure.
+    if (error instanceof SolidActionsWorkflowCancelledError) {
+      return { status: 'cancelled' };
     }
     return { status: 'failed', error, phase: 'run' };
   }
