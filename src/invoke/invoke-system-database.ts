@@ -70,15 +70,18 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
   ) {
     super(config, identity.executorID, identity.appVersion, logger, serializer);
 
-    // Own client: same config but minimal retries — suspension posts are one-shot.
+    // Own client: same retry policy as the base — the suspension POST must survive
+    // transient backend outages, matching base policy, because a dropped POST
+    // silently stalls the workflow (backend never records the sleep/wait, scheduler
+    // never wakes it). Extended retries protect against that outcome.
     this.invokeClient = new HttpClient(
       {
         baseUrl: config.apiUrl,
         apiKey: config.apiKey,
         timeout: config.timeout,
-        maxRetries: config.maxRetries ?? 3,
+        maxRetries: 10,
         retryDelay: 1000,
-        maxRetryDelay: 30000,
+        maxRetryDelay: 60000, // Cap at 60 seconds between retries
       },
       logger,
     );
@@ -101,7 +104,7 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
         // Wakeup time passed — continue without suspending (resume path)
         return;
       }
-      // Still need to sleep; fall through to throw so the caller can reschedule.
+      // Already recorded but wakeup not yet reached — do not re-POST; suspend again.
     } else {
       // New sleep: record it with the backend
       await this.invokeClient.post(`/runs/status/${encodeURIComponent(workflowID)}/sleep`, {

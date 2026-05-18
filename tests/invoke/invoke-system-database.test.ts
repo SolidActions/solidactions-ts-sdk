@@ -11,10 +11,13 @@ import { setUpSolidActionsTestServer, clearMockServerState } from '../helpers';
 import { SolidActionsJSON } from '../../src/serialization';
 import { GlobalLogger } from '../../src/telemetry/logs';
 import { expectProcessExit, ProcessExitSignal } from './helpers-exit';
+import { MockHttpServer } from '../../src/testing/mock_server';
 
 describe('InvokeSystemDatabase', () => {
+  let srv: MockHttpServer;
+
   beforeAll(async () => {
-    await setUpSolidActionsTestServer();
+    srv = await setUpSolidActionsTestServer();
   });
 
   beforeEach(() => {
@@ -22,7 +25,6 @@ describe('InvokeSystemDatabase', () => {
   });
 
   it('durableSleepms posts the sleep schedule then throws SuspensionRequired (no process.exit)', async () => {
-    const srv = await setUpSolidActionsTestServer();
     const logger = new GlobalLogger();
     const db = new InvokeSystemDatabase(
       { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
@@ -47,7 +49,6 @@ describe('InvokeSystemDatabase', () => {
   });
 
   it('recv posts wait then throws SuspensionRequired (no process.exit)', async () => {
-    const srv = await setUpSolidActionsTestServer();
     const logger = new GlobalLogger();
     const db = new InvokeSystemDatabase(
       { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
@@ -81,7 +82,6 @@ describe('InvokeSystemDatabase', () => {
   });
 
   it('durableSleepms does NOT call process.exit — rejects with SuspensionRequired, not ProcessExitSignal', async () => {
-    const srv = await setUpSolidActionsTestServer();
     const logger = new GlobalLogger();
     const db = new InvokeSystemDatabase(
       { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
@@ -113,7 +113,6 @@ describe('InvokeSystemDatabase', () => {
   });
 
   it('recv does NOT call process.exit — rejects with SuspensionRequired, not ProcessExitSignal', async () => {
-    const srv = await setUpSolidActionsTestServer();
     const logger = new GlobalLogger();
     const db = new InvokeSystemDatabase(
       { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
@@ -131,5 +130,71 @@ describe('InvokeSystemDatabase', () => {
 
     expect(caughtError).toBeInstanceOf(SuspensionRequired);
     expect(caughtError).not.toBeInstanceOf(ProcessExitSignal);
+  });
+
+  it('recv resolves with the message and does NOT POST to /wait when message is already available', async () => {
+    // Pre-seed a message for wf-recv-found so the GET /messages response returns found: true.
+    // If the fast-path (if response.found) branch were ever moved below the POST, this test
+    // would fail because a /wait POST would appear in requestLog and recv would throw instead
+    // of resolving.
+    srv.store.messages.push({
+      destinationUUID: 'wf-recv-found',
+      topic: null,
+      message: '"hello"',
+      consumed: false,
+    });
+
+    const logger = new GlobalLogger();
+    const db = new InvokeSystemDatabase(
+      { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
+      { executorID: 'r1', appVersion: 'v0' },
+      logger,
+      SolidActionsJSON,
+    );
+
+    // Should resolve with the message (not throw SuspensionRequired)
+    const result = await db.recv('wf-recv-found', 1, 0, undefined, undefined);
+    expect(result).toBe('"hello"');
+
+    // No /wait POST should have been issued for this workflow
+    const waitPost = srv.requestLog.find(
+      (r) => r.method === 'POST' && r.path.includes('wf-recv-found') && r.path.endsWith('/wait'),
+    );
+    expect(waitPost).toBeUndefined();
+  });
+
+  it('durableSleepms resolves without throwing and does NOT re-POST /sleep when wakeupTime has already elapsed', async () => {
+    // Pre-seed an operation whose wakeupTime is 5 seconds in the past, simulating a workflow
+    // that was suspended for sleep and has now been woken by the scheduler. If the resume path
+    // (remainingMs <= 0 → return) were ever removed or the POST were moved before the check,
+    // this test would fail because durableSleepms would either throw SuspensionRequired or
+    // emit a redundant /sleep POST.
+    const pastWakeupTime = Date.now() - 5000;
+    srv.store.operations.set('wf-sleep-woken', [
+      {
+        workflowUUID: 'wf-sleep-woken',
+        functionId: 1,
+        functionName: 'sleep',
+        output: JSON.stringify({ wakeupTime: pastWakeupTime }),
+        error: null,
+      },
+    ]);
+
+    const logger = new GlobalLogger();
+    const db = new InvokeSystemDatabase(
+      { apiUrl: srv.baseUrl, apiKey: 'test-api-key', timeout: 5000, maxRetries: 1 },
+      { executorID: 'r1', appVersion: 'v0' },
+      logger,
+      SolidActionsJSON,
+    );
+
+    // Should return without throwing
+    await expect(db.durableSleepms('wf-sleep-woken', 1, 5000)).resolves.toBeUndefined();
+
+    // No /sleep POST should have been issued — the operation was already recorded
+    const sleepPost = srv.requestLog.find(
+      (r) => r.method === 'POST' && r.path.includes('wf-sleep-woken') && r.path.endsWith('/sleep'),
+    );
+    expect(sleepPost).toBeUndefined();
   });
 });
