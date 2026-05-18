@@ -105,7 +105,12 @@ export class MockHttpServer {
   private server: Server | null = null;
   private port: number;
   public store: MockStore;
-  public requestLog: Array<{ method: string; path: string; body?: unknown }> = [];
+  public requestLog: Array<{
+    method: string;
+    path: string;
+    body?: unknown;
+    headers: Record<string, string | string[] | undefined>;
+  }> = [];
 
   constructor(port: number = 0) {
     this.port = port;
@@ -156,11 +161,12 @@ export class MockHttpServer {
       body = await this.readBody(req);
     }
 
-    // Log request
-    this.requestLog.push({ method, path, body });
+    // Log request (headers captured read-only for identity-isolation assertions;
+    // this only records — it does not alter routing or responses below)
+    this.requestLog.push({ method, path, body, headers: { ...req.headers } });
 
     try {
-      const result = await this.route(method, path, query, body);
+      const result = this.route(method, path, query, body);
       res.writeHead(result.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result.body));
     } catch (error) {
@@ -184,12 +190,12 @@ export class MockHttpServer {
     });
   }
 
-  private async route(
+  private route(
     method: string,
     path: string,
     query: URLSearchParams,
     body: unknown,
-  ): Promise<{ status: number; body: unknown }> {
+  ): { status: number; body: unknown } {
     // Health check
     if (path === '/health' && method === 'GET') {
       return { status: 200, body: { status: 'ok' } };
@@ -793,6 +799,92 @@ export class MockHttpServer {
     const dispatchKey = `${d.service_name}:${d.workflow_fn_name}:${d.key}`;
     this.store.eventDispatch.set(dispatchKey, data);
     return { status: 200, body: data };
+  }
+
+  // ==========================================
+  // Identity-isolation assertion (read-only)
+  // ==========================================
+
+  /**
+   * Concurrency proof helper (Task 1.4). READ-ONLY: inspects the recorded
+   * requestLog only — never mutates store or affects routing/responses.
+   *
+   * Correlates each backend request to its issuing run via TWO independent
+   * on-the-wire identity dimensions and asserts they agree:
+   *
+   *   A) the workflowID embedded in the request path — every workflow-scoped
+   *      route is `/runs/status/<workflowID>/...` (the SDK's natural run key,
+   *      = ctx.run.runUuid), and
+   *   B) the `Authorization: Bearer <apiKey>` header — sourced from ctx.api.key
+   *      via a SEPARATE per-request HttpClient instance, NOT derived from the
+   *      path.
+   *
+   * For every workflow-scoped request, the bearer MUST equal the apiKey the
+   * run identified by the path was constructed with (passed in
+   * `expectedKeyByRun`, keyed by runUuid). If any request for run-i carries a
+   * different run's bearer (e.g. run-j's apiKey leaking through shared/global
+   * state), A and B disagree and this throws with a precise message naming the
+   * offending request. Returns `true` only when every workflow-scoped request
+   * is internally identity-consistent.
+   *
+   * This is genuinely falsifiable, not a tautology: A (path) and B (bearer)
+   * are produced by independent machinery, so a cross-request identity leak
+   * would surface as a path/bearer mismatch and fail this check.
+   *
+   * @param expectedKeyByRun map of runUuid -> the apiKey that run was built
+   *   with. Runs not present in the map are ignored (non-workflow / health
+   *   requests carry no run key and are skipped automatically).
+   */
+  assertNoIdentityCrossContamination(expectedKeyByRun: Record<string, string>): boolean {
+    // Matches `/runs/status/<workflowID>/...` (raw path is logged BEFORE the
+    // route() normalization, so this is the on-the-wire path).
+    const runPathRe = /^\/runs\/status\/([^/?]+)/;
+
+    for (let i = 0; i < this.requestLog.length; i++) {
+      const entry = this.requestLog[i];
+      const match = runPathRe.exec(entry.path);
+      if (!match) {
+        // Not a workflow-scoped request (e.g. /health) — no run key on the
+        // wire to correlate; skip.
+        continue;
+      }
+
+      const runUuid = decodeURIComponent(match[1]);
+      const expectedKey = expectedKeyByRun[runUuid];
+      if (expectedKey === undefined) {
+        // This run was not part of the asserted set — skip.
+        continue;
+      }
+
+      // Dimension B: the bearer that actually rode on this request.
+      const rawAuth = entry.headers['authorization'] ?? entry.headers['Authorization'];
+      const authHeader = Array.isArray(rawAuth) ? rawAuth[0] : rawAuth;
+      const prefix = 'Bearer ';
+      if (typeof authHeader !== 'string' || !authHeader.startsWith(prefix)) {
+        throw new Error(
+          `Identity cross-contamination check: request #${i} ${entry.method} ${entry.path} ` +
+            `(run "${runUuid}") carried no usable Authorization bearer (got: ${JSON.stringify(rawAuth)}). ` +
+            `Cannot prove identity isolation without an on-the-wire bearer.`,
+        );
+      }
+      const actualKey = authHeader.slice(prefix.length);
+
+      // The proof: path-derived run identity (A) MUST agree with the
+      // independently-sourced bearer identity (B).
+      if (actualKey !== expectedKey) {
+        const leakedRun =
+          Object.keys(expectedKeyByRun).find((r) => expectedKeyByRun[r] === actualKey) ?? '<unknown run>';
+        throw new Error(
+          `IDENTITY CROSS-CONTAMINATION DETECTED: request #${i} ${entry.method} ${entry.path} ` +
+            `is path-scoped to run "${runUuid}" (expected bearer "${expectedKey}") but its ` +
+            `Authorization header carried bearer "${actualKey}", which belongs to run ` +
+            `"${leakedRun}". A concurrent invoke leaked another run's api.key onto this ` +
+            `request — per-request identity isolation is broken.`,
+        );
+      }
+    }
+
+    return true;
   }
 }
 
