@@ -17,6 +17,7 @@
 
 import { invoke } from '../../src/invoke/invoke';
 import { defineWorkflow } from '../../src/invoke/define-workflow';
+import { __clearRegistry } from '../../src/invoke/registry';
 import { setUpSolidActionsTestServer, makeCtx, clearMockServerState } from '../helpers';
 import { expectProcessExit, ProcessExitSignal } from './helpers-exit';
 import { MockHttpServer, createMockServer } from '../../src/testing/mock_server';
@@ -30,6 +31,9 @@ describe('invoke', () => {
 
   beforeEach(() => {
     clearMockServerState();
+    // T1: defineWorkflow now populates a process-global registry — clear it
+    // between cases so workflows with auto-inferred names don't collide.
+    __clearRegistry();
   });
 
   it('completed: normal return maps to { status: completed, output }', async () => {

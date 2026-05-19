@@ -119,6 +119,7 @@ import { StepConfig } from './step';
 import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
 import { invokeStartChildWorkflow } from './invoke/child-workflow';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
+import { registerWorkflowDescriptor } from './invoke/registry';
 import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
 import { registerAuthChecker } from './authdecorators';
@@ -2257,9 +2258,6 @@ export class SolidActions {
     return decorator;
   }
 
-  /** One-time guard for the registerWorkflow deprecation notice. */
-  static #registerWorkflowDeprecationWarned = false;
-
   /**
    * Create a SolidActions workflow function from a provided function.
    *
@@ -2278,14 +2276,12 @@ export class SolidActions {
     func: (this: This, ...args: Args) => Promise<Return>,
     config?: FunctionName & WorkflowConfig,
   ): (this: This, ...args: Args) => Promise<Return> {
-    if (!SolidActions.#registerWorkflowDeprecationWarned) {
-      SolidActions.#registerWorkflowDeprecationWarned = true;
-      console.warn(
-        '[SolidActions] SolidActions.registerWorkflow() is deprecated: pass your workflow ' +
-          '(a defineWorkflow({ run }) descriptor or a plain function) directly to ' +
-          'SolidActions.run(). registerWorkflow() will be removed in a future release.',
-      );
-    }
+    // T1 launcher rework: the legacy deprecation warning was logged at
+    // registration time, which fires on import — this violates the "import
+    // is side-effect-free" invariant. Suppress on import; the codemod
+    // (T6.2) removes legacy usage. If a deprecation surface is desired
+    // later it belongs at SolidActions.run() / runIfEntrypoint() call
+    // time, NOT at registration.
     // Task 2.4c: still returns the legacy callable wrapper + registration so the
     // legacy executor path and existing call sites keep working; run() recovers
     // origFunction from this registration. Collapses when the legacy path goes.
@@ -2306,6 +2302,22 @@ export class SolidActions {
       wfName,
       func,
     );
+    // T1: additionally populate the new invoke registry so T2's
+    // startWorkflow child-dispatch can resolve legacy registrations by name.
+    // Resolved-name precedence mirrors the legacy `wfName` above: explicit
+    // `config.name` > `func.name` > the anonymous `__anon_workflow_${seq}`
+    // fallback. The synthetic descriptor wraps the user function exactly as
+    // #toWorkflowDescriptor does for legacy wrappers passed to run() —
+    // invoking it routes through the per-request invoke()/ALS scope, not
+    // the legacy executor.
+    const descriptor: WorkflowDescriptor<unknown, unknown> = {
+      run: (ctx) =>
+        Promise.resolve(
+          (func as unknown as (input: unknown) => Promise<unknown>)(ctx.input),
+        ),
+      name: wfName,
+    };
+    registerWorkflowDescriptor(descriptor, wfName);
     return SolidActions.#getWorkflowInvoker(registration, config);
   }
 

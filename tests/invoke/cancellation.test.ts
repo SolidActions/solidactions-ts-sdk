@@ -31,6 +31,7 @@
  */
 import { invoke } from '../../src/invoke/invoke';
 import { defineWorkflow } from '../../src/invoke/define-workflow';
+import { __clearRegistry } from '../../src/invoke/registry';
 import { oneShotRuntimeAdapter } from '../../src/invoke/runtime-adapter';
 import { SolidActionsWorkflowCancelledError } from '../../src/error';
 import { StatusString } from '../../src/workflow';
@@ -48,6 +49,9 @@ beforeAll(async () => {
 describe('invoke() — cancellation mapping', () => {
   beforeEach(() => {
     clearMockServerState();
+    // T1: defineWorkflow now populates a process-global registry — clear it
+    // between cases so workflows with auto-inferred names don't collide.
+    __clearRegistry();
   });
 
   it('cancelled: a SolidActionsWorkflowCancelledError thrown from the body maps to { status: cancelled } (NOT failed)', async () => {

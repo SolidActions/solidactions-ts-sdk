@@ -47,6 +47,15 @@ export type InvokeResult<O = unknown> =
   | { status: 'failed'; error: unknown; phase?: 'init' | 'run' };
 export interface WorkflowDescriptor<I = unknown, O = unknown> {
   run: (ctx: InvokeCtx<I> & DurablePrimitives) => Promise<O>;
+  /**
+   * Resolved registration name. T1 launcher rework: `defineWorkflow` (and the
+   * legacy `SolidActions.registerWorkflow` shim) annotate the returned
+   * descriptor with the name it was registered under, so callers (T2's
+   * `startWorkflow` child-dispatch path) can read it directly off the
+   * descriptor without consulting the registry. Optional on input — callers
+   * may supply an explicit `name`, or rely on the `run` function's `.name`.
+   */
+  name?: string;
 }
 export interface DurablePrimitives {
   step: <T>(fn: () => T | Promise<T>, cfg?: { name?: string }) => Promise<T>;

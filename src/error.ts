@@ -299,3 +299,19 @@ export class SolidActionsNetworkError extends SolidActionsError {
     super(message, NetworkErrorCode);
   }
 }
+
+const WorkflowAlreadyRegisteredErrorCode = 37;
+
+/**
+ * Thrown when two distinct workflow descriptors are registered under the same
+ * name in the same process (T1 of the launcher rework). Re-registering the
+ * SAME descriptor under the same name is idempotent and does NOT throw.
+ */
+export class WorkflowAlreadyRegisteredError extends SolidActionsError {
+  constructor(readonly workflowName: string) {
+    super(
+      `Workflow '${workflowName}' is already registered with a different descriptor in this process`,
+      WorkflowAlreadyRegisteredErrorCode,
+    );
+  }
+}
