@@ -123,6 +123,8 @@ import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
 import { registerAuthChecker } from './authdecorators';
 import assert from 'node:assert';
+import * as nodePath from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 type AnyConstructor = new (...args: unknown[]) => object;
 
@@ -196,61 +198,126 @@ export function runInternalStep<T>(
 }
 
 /**
- * WORKFLOW_SLUG dispatch-guard process-global state.
+ * Entrypoint-identity dispatch-guard process-global state (Codex Option 1A).
  *
  * The one-shot contract evaluates a deployed workflow's entrypoint module which
- * calls top-level `SolidActions.run(wf)`. A parent that `import`s a child whose
- * own module has a top-level `run(childTask)` would, without this guard, run the
- * CHILD body against the PARENT's input (Node fully evaluates the imported
- * module — including its top-level `run()` — before the importer's body). The
- * guard in `run()` compares the registered workflow identity against the
- * `WORKFLOW_SLUG` env the app injects (RuntimeEnvBuilder) and makes the
- * non-matching `run()` an inert no-op.
+ * calls top-level `SolidActions.runIfEntrypoint(wf, import.meta.url)`. A parent
+ * that `import`s a child whose own module has a top-level
+ * `runIfEntrypoint(childTask, import.meta.url)` would, WITHOUT this guard, run
+ * the CHILD body against the PARENT's input (Node fully evaluates the imported
+ * module — including its top-level call — before the importer's body). The
+ * guard in `runIfEntrypoint()` compares the CALLER MODULE's resolved path
+ * against `process.argv[1]` (the file Node was invoked with — the runner's
+ * `node dist/<file>.js`) and makes the imported module's call an inert no-op.
+ *
+ * Entrypoint identity (file === argv[1]) is alias-safe: a single source file
+ * deployed under N solidactions.yaml ids registers ONE workflow name but is the
+ * legitimate entrypoint under every alias. The old name==WORKFLOW_SLUG match
+ * regressed that pattern (registered name `simple-steps` ≠ deployed slug
+ * `webhook-test` → the real entrypoint was silently no-opped). File identity
+ * has no name dependency, so the alias entrypoint always runs.
  *
  * These module-level flags + the single `process.on('exit')` handler turn a
- * deploy/codemod identity mismatch (entrypoint's registered workflow ≠ its
- * WORKFLOW_SLUG, so NOTHING ever matches) into a loud non-zero exit instead of
- * a silent never-runs hang.
+ * genuine entrypoint/codemod misconfig (the dispatched one-shot module's
+ * top-level call was SKIPPED as non-entrypoint and NOTHING ran) into a loud
+ * non-zero exit instead of a silent never-runs hang.
  */
-let __anyRunMatched = false;
-let __anyRunSkippedForSlug = false;
+let __anyEntrypointRunExecuted = false;
+let __anyRunSkippedForNonEntrypoint = false;
 let __failLoudExitHandlerInstalled = false;
-/** Workflow identities seen by run() this process — used only for the FATAL diagnostic. */
-const __runWorkflowNamesSeen = new Set<string>();
 
 /**
- * Test-only snapshot of the diagnostic Set's size. Used by the WORKFLOW_SLUG
- * guard suite to prove the absent/empty-key path mutates NOTHING (strict
- * legacy parity, Defect B). NOT part of the public API and intentionally NOT
- * re-exported from `src/index.ts`.
+ * Test-only snapshots of the entrypoint-guard flags. Used by the guard suite to
+ * assert flag transitions without driving the real `process.on('exit')`
+ * handler. NOT part of the public API and intentionally NOT re-exported from
+ * `src/index.ts`.
  */
-export function __runWorkflowNamesSeenSize(): number {
-  return __runWorkflowNamesSeen.size;
+export function __entrypointGuardFlags(): {
+  executed: boolean;
+  skipped: boolean;
+} {
+  return {
+    executed: __anyEntrypointRunExecuted,
+    skipped: __anyRunSkippedForNonEntrypoint,
+  };
+}
+
+/**
+ * Synchronously decide whether `callerUrl` is the process entrypoint module.
+ *
+ * The runner dispatches a one-shot run as `node dist/<file>.js`, so
+ * `process.argv[1]` is the absolute path of the built entrypoint file. ESM
+ * modules pass `import.meta.url` (a `file:` URL); a path string is also
+ * accepted. We resolve both sides to absolute paths and compare for identity.
+ *
+ * Fully synchronous and total: never throws on odd input. If `process.argv[1]`
+ * is missing/empty (e.g. `node -e`, REPL, some test harnesses) we cannot
+ * identify an entrypoint and return `false` safely.
+ *
+ * @param callerUrl - the calling module's `import.meta.url` (a `file:` URL) or
+ *   a filesystem path.
+ * @returns true iff the resolved caller path === resolved `process.argv[1]`.
+ */
+export function isEntrypointModule(callerUrl: string): boolean {
+  const argv1 = process.argv[1];
+  if (typeof argv1 !== 'string' || argv1.length === 0) {
+    return false;
+  }
+  if (typeof callerUrl !== 'string' || callerUrl.length === 0) {
+    return false;
+  }
+
+  let callerPath: string;
+  try {
+    callerPath = callerUrl.startsWith('file:')
+      ? fileURLToPath(callerUrl)
+      : callerUrl;
+  } catch {
+    // Malformed file: URL — cannot identify; fail safe (not entrypoint).
+    return false;
+  }
+
+  let resolvedCaller: string;
+  let resolvedArgv1: string;
+  try {
+    resolvedCaller = nodePath.resolve(callerPath);
+    resolvedArgv1 = nodePath.resolve(argv1);
+  } catch {
+    return false;
+  }
+
+  return resolvedCaller === resolvedArgv1;
 }
 
 /**
  * Pure decision for the fail-loud `process.on('exit')` handler.
  *
- * Returns true ONLY when WORKFLOW_SLUG is a non-empty string, NO `run()` ever
- * matched it, and at least one `run()` was skipped for a slug mismatch — i.e. a
- * genuine entrypoint/deploy misconfiguration where the process would otherwise
- * exit 0 having run nothing. It must NOT fire for:
- *   - the legitimate imported-child no-op (the entrypoint's own matching run()
- *     DID run → `matched` is true),
- *   - absent/empty WORKFLOW_SLUG (legacy/mock/local — guard inactive),
- *   - a normal run with no skips.
+ * Returns true ONLY when this process is a dispatched one-shot run
+ * (`oneShotPresent`), at least one `runIfEntrypoint()` was SKIPPED as
+ * non-entrypoint, and NO `runIfEntrypoint()` ever executed at the entrypoint —
+ * i.e. a genuine entrypoint/codemod misconfiguration where the process would
+ * otherwise exit 0 having run nothing. It must NOT fire for:
+ *   - the legitimate imported-child no-op (the entrypoint's OWN call DID
+ *     execute → `executed` is true),
+ *   - a standalone/alias entrypoint that executed (`executed` true),
+ *   - a non-one-shot process (legacy/mock/local — guard inactive),
+ *   - a direct `SolidActions.run()` (non-runIfEntrypoint) usage — it never
+ *     sets `skipped`.
  *
  * Factored out as a pure function so it is unit-testable without driving the
  * real `process.on('exit')` handler under jest.
+ *
+ * @param oneShotPresent - whether this process is a dispatched one-shot run
+ *   (presence of `SOLIDACTIONS_RUN_ID`).
+ * @param executed - `__anyEntrypointRunExecuted` at exit time.
+ * @param skipped - `__anyRunSkippedForNonEntrypoint` at exit time.
  */
 export function __shouldFailLoudOnExit(
-  envSlug: string | undefined,
-  matched: boolean,
+  oneShotPresent: boolean,
+  executed: boolean,
   skipped: boolean,
 ): boolean {
-  return (
-    typeof envSlug === 'string' && envSlug.length > 0 && !matched && skipped
-  );
+  return oneShotPresent && !executed && skipped;
 }
 
 /**
@@ -285,23 +352,26 @@ export function __failLoudExitCode(
 }
 
 /**
- * Normalize a workflow identity the way the runner's configSync.ts:191-193
- * slugify does (lower-case, non-alphanumeric runs → `-`, trim leading/trailing
- * `-`). A no-op for the current kebab-case names; future-proofs a non-kebab
- * `config.name` so the guard's comparison stays slug-correct on both sides.
+ * Whether this process is a dispatched one-shot run.
+ *
+ * `SOLIDACTIONS_RUN_ID` is injected by the app (RuntimeEnvBuilder.php:59 =
+ * `$trigger->run_uuid`) on EVERY dispatched trigger and maps to
+ * `ctx.run.runUuid` (context-adapter.ts:117). It is the cleanest "this process
+ * IS a dispatched one-shot run" signal: present on every real one-shot run,
+ * absent for legacy/mock/local/direct-`run()` usage, and — unlike the retired
+ * `WORKFLOW_SLUG` — NOT a name matcher (Codex Option 1A removes the name
+ * dependency entirely). The fail-loud handler only arms when this is present.
  */
-export function __normalizeSlug(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
+function __oneShotModePresent(): boolean {
+  const runId = process.env.SOLIDACTIONS_RUN_ID;
+  return typeof runId === 'string' && runId.length > 0;
 }
 
 /**
  * Install (once) the fail-loud `process.on('exit')` handler. Idempotent: the
  * handler is registered a single time for the process lifetime; it reads the
- * live module-level flags at exit so multiple `run()` calls in one process
- * (import-then-entrypoint) are accounted for.
+ * live module-level flags at exit so multiple `runIfEntrypoint()` calls in one
+ * process (imported-child then real entrypoint) are accounted for.
  */
 function __installFailLoudExitHandler(): void {
   if (__failLoudExitHandlerInstalled) {
@@ -309,13 +379,18 @@ function __installFailLoudExitHandler(): void {
   }
   __failLoudExitHandlerInstalled = true;
   process.on('exit', () => {
-    const envSlug = process.env.WORKFLOW_SLUG;
-    if (__shouldFailLoudOnExit(envSlug, __anyRunMatched, __anyRunSkippedForSlug)) {
-      const registered =
-        [...__runWorkflowNamesSeen].join(', ') || '(none)';
+    if (
+      __shouldFailLoudOnExit(
+        __oneShotModePresent(),
+        __anyEntrypointRunExecuted,
+        __anyRunSkippedForNonEntrypoint,
+      )
+    ) {
       console.error(
-        `[solidactions] FATAL: no workflow matched WORKFLOW_SLUG=${String(envSlug)} ` +
-          `(registered: ${registered}) — entrypoint/deploy mismatch`,
+        `[solidactions] FATAL: the dispatched one-shot module's top-level ` +
+          `runIfEntrypoint() was skipped as non-entrypoint and NO workflow ran ` +
+          `(SOLIDACTIONS_RUN_ID=${String(process.env.SOLIDACTIONS_RUN_ID)}, ` +
+          `argv[1]=${String(process.argv[1])}) — entrypoint/codemod mismatch`,
       );
       // Signal failure without forcing exit from within an exit handler
       // (process.exit() inside 'exit' is a no-op / unsafe — set the code).
@@ -606,6 +681,87 @@ export class SolidActions {
   }
 
   /**
+   * Run a workflow ONLY when the calling module is the process entrypoint
+   * (Codex Option 1A — entrypoint-identity dispatch guard).
+   *
+   * Deployed workflow modules call this at top level instead of
+   * `SolidActions.run(wf)`:
+   *
+   * ```typescript
+   * SolidActions.runIfEntrypoint(myWorkflow, import.meta.url);
+   * ```
+   *
+   * WHY: the one-shot contract evaluates a deployed module which self-invokes at
+   * top level. A parent that `import`s a child module to `startWorkflow()` it
+   * would, with a bare top-level `run(childTask)`, run the CHILD body against
+   * the PARENT's input — Node fully evaluates the imported module (including its
+   * top-level call) before the importer's body. `runIfEntrypoint` makes the
+   * IMPORTED module's top-level call an inert no-op while the real entrypoint's
+   * call runs.
+   *
+   * Identity is the calling module vs `process.argv[1]` (the file the runner
+   * invoked: `node dist/<file>.js`). This is ALIAS-SAFE: one source file
+   * deployed under N solidactions.yaml ids is still its own entrypoint under
+   * every alias (file === argv[1]), with NO dependence on the registered
+   * workflow name vs the deployed slug — the exact regression the retired
+   * name==WORKFLOW_SLUG guard caused.
+   *
+   * Behavior:
+   * - Caller IS the entrypoint → delegates to {@link SolidActions.run} with the
+   *   same signature/return (runs the one-shot init/invoke/terminal-state flow).
+   * - Caller is NOT the entrypoint (imported-module side-effect) → returns a
+   *   resolved promise IMMEDIATELY: NO invoke, NO status-row writes, NO
+   *   process.exit. Control returns cleanly to the importing module.
+   *
+   * Synchronous up to the early non-entrypoint return (the method is `async`,
+   * so the identity check + return run before the caller's first microtask —
+   * that ordering is what neutralizes the imported child's top-level call). The
+   * non-entrypoint path resolves; it never rejects.
+   *
+   * A `process.on('exit')` fail-loud handler is armed so a genuine
+   * entrypoint/codemod misconfig (the dispatched one-shot module was skipped as
+   * non-entrypoint and NOTHING ran) becomes a loud non-zero exit instead of a
+   * silent never-runs hang. It fires ONLY when this process is a dispatched
+   * one-shot run AND a run was skipped AND none executed (see
+   * {@link __shouldFailLoudOnExit}).
+   *
+   * @param workflow  - the same value `run()` accepts (descriptor, registered
+   *   wrapper, or bare fn). No name dependency anywhere.
+   * @param callerUrl - the calling module's `import.meta.url` (ESM) or path.
+   * @param options   - forwarded verbatim to {@link SolidActions.run}.
+   */
+  static runIfEntrypoint<T, R>(
+    workflow: WorkflowDescriptor<T, R> | ((input: T) => R | Promise<R>),
+    callerUrl: string,
+    options?: {
+      input?: T;
+      workflowID?: string;
+    },
+  ): Promise<void> {
+    if (isEntrypointModule(callerUrl)) {
+      // This module IS the process entrypoint — the legitimate dispatched
+      // one-shot (or a standalone/alias entrypoint). Record that an entrypoint
+      // run executed, arm the fail-loud handler (it stays silent because
+      // executed === true), and delegate to run() with the identical
+      // signature/return.
+      __anyEntrypointRunExecuted = true;
+      __installFailLoudExitHandler();
+      return SolidActions.run(workflow, options);
+    }
+
+    // Not the entrypoint — this is an IMPORTED module's top-level call (e.g. a
+    // parent importing a child for startWorkflow()). Record the skip, arm the
+    // fail-loud handler so a true misconfig (the dispatched module itself was
+    // skipped and nothing ran) is detectable, and return a RESOLVED promise
+    // immediately: NO invoke(), NO status-row writes, NO process.exit().
+    // Control returns cleanly to the importing module; the unawaited resolved
+    // promise produces no unhandledRejection.
+    __anyRunSkippedForNonEntrypoint = true;
+    __installFailLoudExitHandler();
+    return Promise.resolve();
+  }
+
+  /**
    * Run a workflow as a one-shot process.
    *
    * Task 2.3 — this is now the one-shot compat layer. It no longer drives the
@@ -633,6 +789,12 @@ export class SolidActions {
    * when that env var is set we defer to the legacy launch() path (which owns
    * debug replay) instead of the one-shot path.
    *
+   * NOTE: `run()` itself is UNGUARDED — it always invokes the workflow. The
+   * imported-child hijack is prevented at the call site by
+   * {@link SolidActions.runIfEntrypoint}, which deployed entrypoint modules use
+   * for their top-level self-invoke. A bare `SolidActions.run()` is intentional
+   * direct invocation and runs.
+   *
    * @example
    * ```typescript
    * const wf = SolidActions.registerWorkflow(myWorkflow);
@@ -646,75 +808,6 @@ export class SolidActions {
       workflowID?: string; // Custom workflow ID (reserved; one-shot id comes from SOLIDACTIONS_RUN_ID)
     },
   ): Promise<void> {
-    // --- WORKFLOW_SLUG dispatch guard (SYNCHRONOUS-FIRST) --------------------
-    // These statements MUST run before any `await` (and before the
-    // DEBUG_WORKFLOW_ID branch / status-row init / anything async). The method
-    // is `async`, so synchronous code here executes before the caller's first
-    // microtask — that ordering is what neutralizes a top-level
-    // `run(childTask)` side-effect in an imported child module on a PARENT run.
-    //
-    // Identity is derived the SAME way the rest of run() derives workflowName
-    // (decorators.ts registration → `.name`, else the function's own `.name`).
-    // Both sides are normalized with the runner's exact slugify
-    // (configSync.ts:191-193) so a future non-kebab `config.name` still compares
-    // slug-correctly (no-op for today's kebab names).
-    //
-    // DEFECT B PARITY: read expectedSlug FIRST and gate the ENTIRE guard
-    // (registration lookup, normalization, the diagnostic Set, the match/skip
-    // flags, AND the process.on('exit') handler install) behind a non-empty
-    // WORKFLOW_SLUG. When the key is absent/empty the guard does ZERO extra work
-    // — no Set mutation, no flags, no handler — and falls straight through to
-    // the original unchanged body, byte-identical to pre-0aa91bc behavior
-    // (legacy / mock / local / older deploys).
-    const expectedSlug = process.env.WORKFLOW_SLUG;
-    if (typeof expectedSlug === 'string' && expectedSlug.length > 0) {
-      const reg = getFunctionRegistration(workflow as object);
-      const wfName = reg?.name || (workflow as { name?: string }).name || '';
-
-      if (wfName) {
-        __runWorkflowNamesSeen.add(__normalizeSlug(wfName));
-      }
-
-      // DEFECT A FAIL-SAFE: only no-op on a POSITIVE identifiable mismatch.
-      // `defineWorkflow({ run })` descriptors carry NO registration name and no
-      // function `.name`, so `wfName` is '' — the workflow's identity is
-      // UNKNOWN, not "different from the slug". Silently no-opping an
-      // unidentifiable workflow would skip a LEGITIMATE single-workflow
-      // `defineWorkflow` ENTRYPOINT (its own dispatched run never executes →
-      // the run hangs until timeout) — the catastrophic over-block failure.
-      // So when `wfName` is empty we DO NOT skip: fall through and run normally
-      // (legacy path). Favoring "run the entrypoint" over "silently hang it" is
-      // the correct trade — an unidentifiable IMPORTED child is a rare edge the
-      // broader 2.4c / codemod work addresses, whereas hanging every
-      // `defineWorkflow` entrypoint is catastrophic. We therefore require
-      // wfName to be a NON-EMPTY string before a mismatch can no-op.
-      if (wfName && __normalizeSlug(wfName) !== __normalizeSlug(expectedSlug)) {
-        // Positive mismatch: an identifiable workflow whose slug differs from
-        // the one this entrypoint process was dispatched for — an imported
-        // child module's top-level run() for a DIFFERENT workflow. Record the
-        // skip and return immediately — NO invoke(), NO status-row writes, NO
-        // process.exit(). Resolving the async fn cleanly discards the unawaited
-        // promise without an unhandledRejection. Arm the fail-loud exit handler
-        // so a true entrypoint/deploy misconfig (nothing ever matches) becomes
-        // a loud non-zero exit instead of a silent hang.
-        __anyRunSkippedForSlug = true;
-        __installFailLoudExitHandler();
-        return;
-      }
-
-      // Match, OR an unidentifiable workflow under a non-empty slug (fail-safe
-      // run-anyway above). Record the match and arm the handler so the
-      // ZERO-matched misconfig case is still detectable; on a match the handler
-      // stays silent (matched === true). Treating the unidentifiable
-      // run-anyway as a "match" here is deliberate: it ran, so the fail-loud
-      // handler must NOT fire for it.
-      __anyRunMatched = true;
-      __installFailLoudExitHandler();
-    }
-    // When expectedSlug is absent/empty we fall through here having done
-    // nothing — the guard block above did not execute at all.
-    // --- end WORKFLOW_SLUG dispatch guard ------------------------------------
-
     // SOLIDACTIONS_DEBUG_WORKFLOW_ID replay stays on the legacy lifecycle — that
     // path owns recorded-result comparison and is not part of one-shot run().
     if (process.env.SOLIDACTIONS_DEBUG_WORKFLOW_ID) {
