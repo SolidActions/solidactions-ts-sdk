@@ -1,3 +1,4 @@
+import { SolidActionsJSON } from '../serialization';
 import type { InvokeCtx, VarValue, ConnectionVar } from './types';
 
 /**
@@ -65,7 +66,8 @@ function isConnectionValue(value: string): boolean {
  * injects into a fully-typed `InvokeCtx<unknown>`.
  *
  * Env var → ctx field mapping:
- *   WORKFLOW_INPUT          → ctx.input  (parsed JSON; missing → {}; malformed → throw)
+ *   WORKFLOW_INPUT          → ctx.input  (SolidActionsJSON.parse: SuperJSON-envelope-aware
+ *                                         + plain JSON; missing → {}; malformed → throw)
  *   SOLIDACTIONS_RUN_ID     → ctx.run.runUuid
  *   STEPS_TRIGGER_ID        → ctx.run.triggerId
  *   SOLIDACTIONS_API_KEY    → ctx.run.runSecret (the part after the first `:`)
@@ -81,13 +83,24 @@ function isConnectionValue(value: string): boolean {
  *
  * Missing WORKFLOW_INPUT → input is {} (empty object).
  * Malformed JSON in WORKFLOW_INPUT → throws a descriptive Error immediately.
+ *
+ * Deserialization uses the canonical `SolidActionsJSON.parse` — the SAME helper
+ * the rest of the SDK uses for inputs/outputs (e.g. invoke.ts recv/step replay,
+ * child-workflow.ts getResult()). It transparently handles BOTH:
+ *   - SuperJSON-enveloped payloads `{"json":...,"__solidactions_serializer":"superjson"}`
+ *     — what child-workflow-dispatched runs deliver — unwrapping to the real,
+ *     fully-typed value (Date, Map, Set, BigInt, Buffer, …).
+ *   - Plain JSON (e.g. webhook triggers send `{"taskId":...}` with no marker),
+ *     which falls through to the legacy reviver path and is returned unchanged.
+ * Raw JSON.parse here was the defect: it returned the SuperJSON envelope itself
+ * for child-dispatched runs, so all input-derived fields came out null/undefined.
  */
 export function oneShotContextAdapter(transport: Record<string, string>): InvokeCtx {
   // --- input ---
   let input: unknown = {};
   if (transport['WORKFLOW_INPUT'] !== undefined) {
     try {
-      input = JSON.parse(transport['WORKFLOW_INPUT']) as unknown;
+      input = SolidActionsJSON.parse(transport['WORKFLOW_INPUT']);
     } catch (err) {
       throw new Error(
         `[ContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`,
