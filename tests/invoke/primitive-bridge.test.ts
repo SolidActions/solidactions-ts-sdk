@@ -101,10 +101,13 @@ function loggedBodies(method: string, suffix: string): Array<Record<string, unkn
 }
 
 it('setEvent bridges to the invoke-scoped engine (no launch error, invoke identity + funcID)', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    await SolidActions.setEvent('progress', { pct: 50 });
-    return 'done';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      await SolidActions.setEvent('progress', { pct: 50 });
+      return 'done';
+    },
+    { name: 'primitive-bridge-setEvent' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
 
   expect(code).toBe(0);
@@ -122,10 +125,13 @@ it('setEvent bridges to the invoke-scoped engine (no launch error, invoke identi
 
 it('send bridges to the invoke-scoped engine and supports a cross-workflow destination', async () => {
   const OTHER_WF = 'destination-workflow-xyz';
-  const wf = SolidActions.registerWorkflow(async () => {
-    await SolidActions.send(OTHER_WF, { hello: 'world' }, 'greetings');
-    return 'sent';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      await SolidActions.send(OTHER_WF, { hello: 'world' }, 'greetings');
+      return 'sent';
+    },
+    { name: 'primitive-bridge-send' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
 
   expect(code).toBe(0);
@@ -145,10 +151,13 @@ it('send bridges to the invoke-scoped engine and supports a cross-workflow desti
 });
 
 it('respond bridges to the invoke-scoped engine and the webhook PUT is awaited before exit', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    await SolidActions.respond({ ok: true, value: 7 });
-    return 'responded';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      await SolidActions.respond({ ok: true, value: 7 });
+      return 'responded';
+    },
+    { name: 'primitive-bridge-respond' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
 
   expect(code).toBe(0);
@@ -172,11 +181,14 @@ it('respond bridges to the invoke-scoped engine and the webhook PUT is awaited b
 it('workflowID getter resolves from the invoke scope (legacy-API body sees ctx.run.runUuid)', async () => {
   let seenWorkflowId: string | undefined;
   let seenIsWithin: boolean | undefined;
-  const wf = SolidActions.registerWorkflow(async () => {
-    seenWorkflowId = SolidActions.workflowID;
-    seenIsWithin = SolidActions.isWithinWorkflow();
-    return 'ok';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      seenWorkflowId = SolidActions.workflowID;
+      seenIsWithin = SolidActions.isWithinWorkflow();
+      return 'ok';
+    },
+    { name: 'primitive-bridge-workflowID' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
 
   expect(code).toBe(0);
@@ -186,10 +198,13 @@ it('workflowID getter resolves from the invoke scope (legacy-API body sees ctx.r
 
 it('getSignalUrls builds URLs from ctx.api.url (invoke scope), not process.env', async () => {
   let urls: { base: string; approve: string; reject: string; custom: (a: string) => string } | undefined;
-  const wf = SolidActions.registerWorkflow(async () => {
-    urls = SolidActions.getSignalUrls('approval');
-    return 'ok';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      urls = SolidActions.getSignalUrls('approval');
+      return 'ok';
+    },
+    { name: 'primitive-bridge-signalUrls' },
+  );
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     // Deliberately set the legacy env to a DIFFERENT host: the bridged
@@ -209,10 +224,13 @@ it('getSignalUrls builds URLs from ctx.api.url (invoke scope), not process.env',
 });
 
 it('recv bridges to the invoke-scoped engine: no message → suspends (exit 0, /wait posted, timeout preserved)', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    const msg = await SolidActions.recv<{ x: number }>('inbox', 45);
-    return msg;
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      const msg = await SolidActions.recv<{ x: number }>('inbox', 45);
+      return msg;
+    },
+    { name: 'primitive-bridge-recv-suspend' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
 
   // recv with no message → SuspensionRequired → invoke() maps to suspended →

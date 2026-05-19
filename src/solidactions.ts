@@ -41,6 +41,7 @@ import {
   SolidActionsNotRegisteredError,
   SolidActionsAwaitedWorkflowCancelledError,
   SolidActionsConflictingRegistrationError,
+  WorkflowNotRegisteredError,
 } from './error';
 import {
   getSolidActionsConfig,
@@ -117,9 +118,14 @@ import { StepConfig } from './step';
 // dependency is made type-only / the shared HttpClient base is extracted) —
 // NOT merely when the legacy executor or globalParams is deleted.
 import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
-import { invokeStartChildWorkflow } from './invoke/child-workflow';
+import { invokeStartChildWorkflow, invokeStartChildWorkflowByName } from './invoke/child-workflow';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
-import { registerWorkflowDescriptor } from './invoke/registry';
+import {
+  __getRegisteredWorkflow,
+  __getRegisteredWorkflows,
+  registerWorkflowDescriptor,
+  resolveWorkflowName,
+} from './invoke/registry';
 import { Conductor } from './conductor/conductor';
 import { EnqueueOptions, SOLIDACTIONS_STREAM_CLOSED_SENTINEL } from './system_database';
 import { registerAuthChecker } from './authdecorators';
@@ -1777,6 +1783,22 @@ export class SolidActions {
     params?: StartWorkflowParams,
   ): (...args: Args) => Promise<WorkflowHandle<Return>>;
   /**
+   * T2 launcher rework: accept a {@link WorkflowDescriptor} returned by
+   * `defineWorkflow` (resolved by registered name) or a bare `string` name
+   * (looked up directly in the registry). The legacy `(fn|obj|class).method`
+   * signatures remain below. Listed before the generic `<T extends object>`
+   * class-target overload so a descriptor / string call matches this signature
+   * first (overload resolution is top-to-bottom).
+   */
+  static startWorkflow<I, O>(
+    target: WorkflowDescriptor<I, O>,
+    params?: StartWorkflowParams,
+  ): (input: I) => Promise<WorkflowHandle<O>>;
+  static startWorkflow(
+    target: string,
+    params?: StartWorkflowParams,
+  ): (input: unknown) => Promise<WorkflowHandle<unknown>>;
+  /**
    * Start a workflow in the background, returning a handle that can be used to check status, await a result,
    *   or otherwise interact with the workflow.
    * The full syntax is:
@@ -1800,42 +1822,114 @@ export class SolidActions {
    */
   static startWorkflow<T extends object>(targetClass: T, params?: StartWorkflowParams): InvokeFunctionsAsync<T>;
   static startWorkflow(
-    target: UntypedAsyncFunction | ConfiguredInstance | object,
+    target: UntypedAsyncFunction | ConfiguredInstance | object | string | WorkflowDescriptor<unknown, unknown>,
     params?: StartWorkflowParams,
   ): unknown {
-    // Task 2.7: invoke-scope bridge (same getCurrentScope() pattern as Task 2.6
-    // send/recv/setEvent). Under one-shot invoke() the legacy
-    // ensureSolidActionsIsLaunched + SolidActionsExecutor.globalInstance path
-    // does not exist (and would throw "SolidActions.launch() must be called
-    // before running workflows"); a child is dispatched via the durable
+    // Task 2.7 / T2 launcher rework: invoke-scope bridge (same getCurrentScope()
+    // pattern as Task 2.6 send/recv/setEvent). Under one-shot invoke() the
+    // legacy ensureSolidActionsIsLaunched + SolidActionsExecutor.globalInstance
+    // path does not exist (and would throw "SolidActions.launch() must be
+    // called before running workflows"); a child is dispatched via the durable
     // enqueue+suspend bridge instead. The scope check MUST precede
     // ensureSolidActionsIsLaunched. Non-invoke path is byte-unchanged legacy
     // below.
     if (getCurrentScope()) {
-      return invokeStartChildWorkflow((t, p) => {
-        const regOp =
-          p === undefined
-            ? getFunctionRegistration(t)
-            : (getFunctionRegistration(Reflect.get(t as object, p)) ??
-              getRegisteredOperations(target).find((op) => op.name === p));
-        if (!regOp) {
-          const name =
-            p === undefined ? (typeof t === 'function' ? (t as { name: string }).name : String(t)) : String(p);
-          throw new SolidActionsNotRegisteredError(name, `${name} is not a registered SolidActions workflow function`);
+      // T2 resolution order (descriptor → string → function w/ registry-first
+      // then legacy fallback). Non-callable targets (descriptors / strings)
+      // bypass the function-Proxy form entirely: `startWorkflow(desc)(input)`
+      // and `startWorkflow('name')(input)` would not be Proxy-callable since
+      // their target is not a function (a Proxy is callable iff its target
+      // is). The Proxy form below covers function targets + the `.method`
+      // shape for objects/classes.
+
+      // (a) WorkflowDescriptor (object with a `run` function — what
+      //     `defineWorkflow` returns + stamps with `.name` per T1).
+      if (
+        target !== null &&
+        typeof target === 'object' &&
+        typeof (target as WorkflowDescriptor<unknown, unknown>).run === 'function'
+      ) {
+        const desc = target as WorkflowDescriptor<unknown, unknown>;
+        const name = desc.name;
+        if (typeof name === 'string' && name.length > 0 && __getRegisteredWorkflow(name)) {
+          return invokeStartChildWorkflowByName(name);
         }
-        return regOp.name;
+        throw SolidActions.#workflowNotRegisteredError(typeof name === 'string' && name.length > 0 ? name : '<anonymous-descriptor>');
+      }
+
+      // (b) bare string name (look up directly in the registry).
+      if (typeof target === 'string') {
+        if (__getRegisteredWorkflow(target)) {
+          return invokeStartChildWorkflowByName(target);
+        }
+        throw SolidActions.#workflowNotRegisteredError(target);
+      }
+
+      // (c) function / (d) object-with-method — Proxy form. Resolver tries
+      //     registry-first (by `.name`), then legacy `getFunctionRegistration`
+      //     as the LAST fallback (back-compat with registerWorkflow wrappers).
+      return invokeStartChildWorkflow((t, p) => {
+        if (p === undefined) {
+          // Function target.
+          if (typeof t === 'function') {
+            const fnName = (t as { name?: string }).name;
+            if (fnName && fnName.length > 0 && __getRegisteredWorkflow(fnName)) {
+              return fnName;
+            }
+            const legacy = getFunctionRegistration(t);
+            if (legacy) return legacy.name;
+            throw SolidActions.#workflowNotRegisteredError(fnName && fnName.length > 0 ? fnName : '<anonymous-fn>');
+          }
+          // Defensive: a non-function, non-descriptor, non-string target
+          // reaching this resolver is a misuse — surface the same error so
+          // the AI sees the registered candidates and acts.
+          throw SolidActions.#workflowNotRegisteredError(String(t));
+        }
+
+        // Object.method path (legacy `startWorkflow(obj).method(args)` form).
+        // Registry-first by method-name (works when an object property holds
+        // a fn whose registered name equals the prop name), then legacy
+        // getFunctionRegistration on the method, then class regOps fallback.
+        const propStr = String(p);
+        if (__getRegisteredWorkflow(propStr)) {
+          return propStr;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        const propVal = Reflect.get(t as object, p);
+        if (typeof propVal === 'function') {
+          const propFnName = (propVal as { name?: string }).name;
+          if (propFnName && propFnName.length > 0 && __getRegisteredWorkflow(propFnName)) {
+            return propFnName;
+          }
+        }
+        const regOp =
+          getFunctionRegistration(propVal) ?? getRegisteredOperations(target).find((op) => op.name === propStr);
+        if (regOp) return regOp.name;
+        throw SolidActions.#workflowNotRegisteredError(propStr);
       }, target as object);
     }
 
     ensureSolidActionsIsLaunched('workflows');
-    const instance = typeof target === 'function' ? null : (target as ConfiguredInstance);
+    // Legacy non-invoke path: string / descriptor targets are invoke-only (T2
+    // launcher rework). If they reach here, the caller invoked startWorkflow
+    // outside an invoke scope — reject with a clear error rather than
+    // crashing in Proxy/getRegisteredOperations.
+    if (typeof target === 'string' || (typeof target === 'object' && target !== null && typeof (target as WorkflowDescriptor<unknown, unknown>).run === 'function' && !(target instanceof ConfiguredInstance))) {
+      const ident = typeof target === 'string' ? target : ((target as WorkflowDescriptor<unknown, unknown>).name ?? '<descriptor>');
+      throw new SolidActionsNotRegisteredError(
+        ident,
+        `startWorkflow(${ident}) requires an active invoke scope — call inside a workflow body`,
+      );
+    }
+    const legacyTarget = target as UntypedAsyncFunction | ConfiguredInstance | object;
+    const instance = typeof legacyTarget === 'function' ? null : (legacyTarget as ConfiguredInstance);
     if (instance && typeof instance !== 'function' && !(instance instanceof ConfiguredInstance)) {
       throw new SolidActionsInvalidWorkflowTransitionError(
         'Attempt to call `startWorkflow` on an object that is not a `ConfiguredInstance`',
       );
     }
 
-    const regOps = getRegisteredOperations(target);
+    const regOps = getRegisteredOperations(legacyTarget);
 
     const handler: ProxyHandler<object> = {
       apply(target, _thisArg, args) {
@@ -1860,7 +1954,7 @@ export class SolidActions {
       },
     };
 
-    return new Proxy(target, handler);
+    return new Proxy(legacyTarget as object, handler);
   }
 
   /**
@@ -2282,19 +2376,14 @@ export class SolidActions {
     // (T6.2) removes legacy usage. If a deprecation surface is desired
     // later it belongs at SolidActions.run() / runIfEntrypoint() call
     // time, NOT at registration.
-    // Task 2.4c: still returns the legacy callable wrapper + registration so the
-    // legacy executor path and existing call sites keep working; run() recovers
-    // origFunction from this registration. Collapses when the legacy path goes.
-    // Anonymous functions (e.g. `registerWorkflow(async () => ...)`) all have
-    // an empty `.name`, so two of them would collide in the by-unique-name
-    // registry and throw SolidActionsConflictingRegistrationError. The one-shot
-    // run() path recovers the user fn via origFunction, not by registry name,
-    // so the name is no longer load-bearing here — give anonymous workflows a
-    // unique fallback name in this deprecated shim. Explicit `config.name` and
-    // named functions are unchanged (so decorator/legacy call sites are
-    // unaffected). Task 2.4c: removed with the legacy registration coupling.
-    const explicitName = config?.name ?? (func.name || undefined);
-    const wfName = explicitName ?? `__anon_workflow_${++SolidActions.#anonWorkflowSeq}`;
+    // Task 2.4c (T2 launcher rework): #anonWorkflowSeq retired. The new
+    // registry insists on an explicit OR derived name (resolveWorkflowName:
+    // config.name > func.name > throw) so anonymous arrows lacking either
+    // surface as a clear error at registration instead of being silently
+    // labelled `__anon_workflow_<n>`. The legacy callable wrapper +
+    // by-unique-name decorator registration are still produced so the
+    // legacy executor path / existing call sites keep working unchanged.
+    const wfName = resolveWorkflowName(config?.name, func as (...args: never[]) => unknown);
     const registration = wrapSolidActionsFunctionAndRegisterByUniqueName(
       config?.ctorOrProto,
       config?.className,
@@ -2304,9 +2393,7 @@ export class SolidActions {
     );
     // T1: additionally populate the new invoke registry so T2's
     // startWorkflow child-dispatch can resolve legacy registrations by name.
-    // Resolved-name precedence mirrors the legacy `wfName` above: explicit
-    // `config.name` > `func.name` > the anonymous `__anon_workflow_${seq}`
-    // fallback. The synthetic descriptor wraps the user function exactly as
+    // The synthetic descriptor wraps the user function exactly as
     // #toWorkflowDescriptor does for legacy wrappers passed to run() —
     // invoking it routes through the per-request invoke()/ALS scope, not
     // the legacy executor.
@@ -2321,8 +2408,19 @@ export class SolidActions {
     return SolidActions.#getWorkflowInvoker(registration, config);
   }
 
-  /** Monotonic counter for anonymous-workflow fallback names (Task 2.3 shim). */
-  static #anonWorkflowSeq = 0;
+  /**
+   * T2 launcher rework: build a {@link WorkflowNotRegisteredError} carrying
+   * the supplied identifier AND the sorted list of currently-registered
+   * candidate names. Helper for AI debug — the message answers
+   * "what was I trying to call, and what could I have called?" in one read.
+   */
+  static #workflowNotRegisteredError(suppliedIdentifier: string): WorkflowNotRegisteredError {
+    const names = __getRegisteredWorkflows()
+      .map((d) => d.name ?? '')
+      .filter((n) => n.length > 0)
+      .sort();
+    return new WorkflowNotRegisteredError(suppliedIdentifier, names);
+  }
 
   static async #invokeWorkflow<This, Args extends unknown[], Return>(
     $this: This,

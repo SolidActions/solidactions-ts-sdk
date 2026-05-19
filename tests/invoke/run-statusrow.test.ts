@@ -108,7 +108,9 @@ function mockEnv(extra: Record<string, string>): Record<string, string> {
 }
 
 it('completed → row create THEN PUT .../output {output,status:SUCCESS} THEN workflow-complete POST; output is the SolidActionsJSON-stringified value; run id from ctx', async () => {
-  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n * 2);
+  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n * 2, {
+    name: 'run-statusrow-completed',
+  });
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     mockEnv({ WORKFLOW_INPUT: JSON.stringify({ n: 21 }) }),
@@ -151,9 +153,12 @@ it('completed → row create THEN PUT .../output {output,status:SUCCESS} THEN wo
 });
 
 it('failed → row create THEN PUT .../error {error,status:ERROR} THEN workflow-complete POST; error is the serialize-error + SolidActionsJSON-stringified value; run id from ctx', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    throw new Error('boom');
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      throw new Error('boom');
+    },
+    { name: 'run-statusrow-failed' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
   expect(code).toBe(1);
 
@@ -213,7 +218,9 @@ it('NO pre-seeded row → run() itself POSTs /runs/status (row create) BEFORE th
   srv.store.workflows.delete(FRESH_RUN_ID); // belt-and-suspenders: never seeded
   expect(srv.store.workflows.has(FRESH_RUN_ID)).toBe(false);
 
-  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n + 1);
+  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n + 1, {
+    name: 'run-statusrow-fresh-run',
+  });
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     {
@@ -266,10 +273,13 @@ it('NO pre-seeded row + STEP-ful body → run() POSTs /runs/status (row create) 
   srv.store.operations.delete(STEP_RUN_ID);
   expect(srv.store.workflows.has(STEP_RUN_ID)).toBe(false);
 
-  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => {
-    const doubled = await SolidActions.runStep(() => input.n * 2);
-    return doubled + 1;
-  });
+  const wf = SolidActions.registerWorkflow(
+    async (input: { n: number }) => {
+      const doubled = await SolidActions.runStep(() => input.n * 2);
+      return doubled + 1;
+    },
+    { name: 'run-statusrow-step' },
+  );
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     {
@@ -322,11 +332,14 @@ it('suspended (sleep, no pre-seed) → row create BEFORE invoke (step record + s
   srv.store.operations.delete(SUSP_RUN_ID);
   expect(srv.store.workflows.has(SUSP_RUN_ID)).toBe(false);
 
-  const wf = SolidActions.registerWorkflow(async () => {
-    await SolidActions.runStep(() => 'step-A');
-    await SolidActions.sleepms(60_000);
-    return 'after-sleep';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      await SolidActions.runStep(() => 'step-A');
+      await SolidActions.sleepms(60_000);
+      return 'after-sleep';
+    },
+    { name: 'run-statusrow-suspend' },
+  );
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     {

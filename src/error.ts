@@ -315,3 +315,29 @@ export class WorkflowAlreadyRegisteredError extends SolidActionsError {
     );
   }
 }
+
+const WorkflowNotRegisteredErrorCode = 38;
+
+/**
+ * Thrown by T2's invoke-scope `startWorkflow` resolver when the supplied target
+ * (a `defineWorkflow` descriptor, a string name, or a function) cannot be
+ * resolved to any registry entry AND has no legacy `registerWorkflow`
+ * function-registration fallback.
+ *
+ * The message embeds the supplied identifier AND the sorted list of currently
+ * registered candidate names so an AI agent / developer can immediately see
+ * what was attempted vs what was available (the most common cause is "the
+ * parent forgot to import the child module"). Helper for AI debug.
+ */
+export class WorkflowNotRegisteredError extends SolidActionsError {
+  constructor(
+    readonly suppliedIdentifier: string,
+    readonly registeredNames: readonly string[],
+  ) {
+    const candidates = registeredNames.length === 0 ? '[]' : `[${registeredNames.join(', ')}]`;
+    super(
+      `Workflow '${suppliedIdentifier}' is not registered. Registered: ${candidates}. Did the parent forget to import the child module?`,
+      WorkflowNotRegisteredErrorCode,
+    );
+  }
+}

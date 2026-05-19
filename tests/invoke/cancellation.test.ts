@@ -224,10 +224,13 @@ describe('SolidActions.run() — one-shot CANCELLED terminal state', () => {
       },
     ]);
 
-    const wf = SolidActions.registerWorkflow(async () => {
-      await SolidActions.sleepms(60_000);
-      return 'after-sleep';
-    });
+    const wf = SolidActions.registerWorkflow(
+      async () => {
+        await SolidActions.sleepms(60_000);
+        return 'after-sleep';
+      },
+      { name: 'cancellation-sleep-cancelled' },
+    );
 
     const code = await expectProcessExit(
       () => SolidActions.run(wf),

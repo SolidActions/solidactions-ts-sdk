@@ -83,7 +83,9 @@ function mockEnv(extra: Record<string, string>): Record<string, string> {
 }
 
 it('completed workflow → exit 0, output POSTed, status=completed', async () => {
-  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n * 2);
+  const wf = SolidActions.registerWorkflow(async (input: { n: number }) => input.n * 2, {
+    name: 'run-compat-completed',
+  });
   const code = await expectProcessExit(
     () => SolidActions.run(wf),
     mockEnv({ WORKFLOW_INPUT: JSON.stringify({ n: 21 }) }),
@@ -94,20 +96,26 @@ it('completed workflow → exit 0, output POSTed, status=completed', async () =>
 });
 
 it('throwing workflow → exit 1, status=failed', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    throw new Error('boom');
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      throw new Error('boom');
+    },
+    { name: 'run-compat-throwing' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
   expect(code).toBe(1);
   expect(srv.lastWorkflowComplete()!.status).toBe('failed');
 });
 
 it('sleep → exit 0 + sleep scheduled (suspension via one-shot adapter)', async () => {
-  const wf = SolidActions.registerWorkflow(async () => {
-    await SolidActions.runStep(() => 'step-A');
-    await SolidActions.sleepms(60_000);
-    return 'after-sleep';
-  });
+  const wf = SolidActions.registerWorkflow(
+    async () => {
+      await SolidActions.runStep(() => 'step-A');
+      await SolidActions.sleepms(60_000);
+      return 'after-sleep';
+    },
+    { name: 'run-compat-sleep' },
+  );
   const code = await expectProcessExit(() => SolidActions.run(wf), mockEnv({ WORKFLOW_INPUT: '{}' }));
   expect(code).toBe(0);
   expect(srv.lastSleepSchedule()).toBeTruthy();

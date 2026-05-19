@@ -126,10 +126,85 @@ export class InvokeChildHandle<R> implements WorkflowHandle<R> {
 }
 
 /**
- * Invoke-path implementation of `SolidActions.startWorkflow(target)(args)`.
- * Returns a Proxy with the same call/method shape as the legacy startWorkflow
- * so `startWorkflow(fn)(input)` and `startWorkflow(obj).method(input)` both
- * yield an InvokeChildHandle.
+ * Spawn a child workflow under the current invoke scope, by registered name.
+ *
+ * Factored out of `invokeStartChildWorkflow` (T2 launcher rework) so the
+ * descriptor/string code path can dispatch directly without going through the
+ * function-Proxy form — `startWorkflow(workflowDescriptor)(input)` and
+ * `startWorkflow('child-name')(input)` are not function-callable targets, so
+ * they bypass the Proxy entirely. The function/object Proxy form below still
+ * routes through this same `spawn` so child dispatch is one mechanism.
+ *
+ * MUST be called with an active invoke scope — callers guard via
+ * `getCurrentScope()` before delegating, exactly like `invokeStartChildWorkflow`.
+ */
+async function spawnChildByName(childName: string, args: unknown[]): Promise<InvokeChildHandle<unknown>> {
+  const s = getCurrentScope();
+  if (!s) {
+    throw new Error('invoke scope lost before child spawn');
+  }
+  const engine = s.executor;
+  const parentWorkflowID = s.runtimeParams.workflowID;
+
+  // ONE durable funcId for the enqueue, consumed at call time so the child
+  // run UUID is deterministic across parent replay (idempotency anchor).
+  const enqueueFuncId = nextFunctionID();
+  const childWorkflowID = `${parentWorkflowID}-child-${enqueueFuncId}`;
+
+  // The result funcId is allocated NOW (right after the enqueue id) and
+  // captured in the handle so it is stable regardless of when/how often
+  // getResult() is called — matching the legacy startWf+getRes two-id
+  // ordering (solidactions.ts #getWorkflowInvoker:2092-2093).
+  const resultFuncId = nextFunctionID();
+
+  // Replay guard (risk 1): if the durable enqueue op already exists, the
+  // child was enqueued on a prior parent run — reuse it, do NOT re-enqueue.
+  const recordedEnqueue = await engine.getOperationResultAndThrowIfCancelled(parentWorkflowID, enqueueFuncId);
+  if (recordedEnqueue) {
+    if (recordedEnqueue.error) {
+      throw deserializeError(SolidActionsJSON.parse(recordedEnqueue.error));
+    }
+    const existingChildId = recordedEnqueue.childWorkflowID ?? childWorkflowID;
+    return new InvokeChildHandleWithResultId(engine, parentWorkflowID, existingChildId, resultFuncId);
+  }
+
+  // First parent run: create the child backend run (its own container via the
+  // pending child RunTrigger the backend creates) then record the durable
+  // enqueue op keyed (parentWf, enqueueFuncId) carrying the child id. Order:
+  // create FIRST, then record — mirrors solidactions-executor.ts:483-494 so a
+  // crash between them re-creates idempotently (backend short-circuits the
+  // duplicate UUID) rather than recording a child that was never created.
+  await engine.enqueueChildWorkflow(
+    childWorkflowID,
+    childName,
+    SolidActionsJSON.stringify(args.length === 1 ? args[0] : args),
+    resultFuncId,
+    {
+      executorID: s.runtimeParams.executorID,
+      appId: s.runtimeParams.appId,
+      appVersion: s.runtimeParams.appVersion,
+    },
+  );
+  await engine.recordOperationResult(
+    parentWorkflowID,
+    enqueueFuncId,
+    'SolidActions.startWorkflow',
+    true,
+    Date.now(),
+    { childWorkflowID },
+  );
+
+  return new InvokeChildHandleWithResultId(engine, parentWorkflowID, childWorkflowID, resultFuncId);
+}
+
+/**
+ * Invoke-path implementation of `SolidActions.startWorkflow(target)(args)` for
+ * function-callable targets. Returns a Proxy with the same call/method shape
+ * as the legacy startWorkflow so `startWorkflow(fn)(input)` and
+ * `startWorkflow(obj).method(input)` both yield an InvokeChildHandle.
+ *
+ * Descriptor + string targets bypass this Proxy form (they are not callable)
+ * and call `invokeStartChildWorkflowByName` directly instead.
  *
  * @param resolveName  maps the proxied target/method to the child's registered
  *                      workflow name (the backend resolves it to a Workflow by
@@ -145,75 +220,35 @@ export function invokeStartChildWorkflow(
     throw new Error('invokeStartChildWorkflow called with no active invoke scope');
   }
 
-  const spawn = async (childName: string, args: unknown[]): Promise<InvokeChildHandle<unknown>> => {
-    const s = getCurrentScope();
-    if (!s) {
-      throw new Error('invoke scope lost before child spawn');
-    }
-    const engine = s.executor;
-    const parentWorkflowID = s.runtimeParams.workflowID;
-
-    // ONE durable funcId for the enqueue, consumed at call time so the child
-    // run UUID is deterministic across parent replay (idempotency anchor).
-    const enqueueFuncId = nextFunctionID();
-    const childWorkflowID = `${parentWorkflowID}-child-${enqueueFuncId}`;
-
-    // The result funcId is allocated NOW (right after the enqueue id) and
-    // captured in the handle so it is stable regardless of when/how often
-    // getResult() is called — matching the legacy startWf+getRes two-id
-    // ordering (solidactions.ts #getWorkflowInvoker:2092-2093).
-    const resultFuncId = nextFunctionID();
-
-    // Replay guard (risk 1): if the durable enqueue op already exists, the
-    // child was enqueued on a prior parent run — reuse it, do NOT re-enqueue.
-    const recordedEnqueue = await engine.getOperationResultAndThrowIfCancelled(parentWorkflowID, enqueueFuncId);
-    if (recordedEnqueue) {
-      if (recordedEnqueue.error) {
-        throw deserializeError(SolidActionsJSON.parse(recordedEnqueue.error));
-      }
-      const existingChildId = recordedEnqueue.childWorkflowID ?? childWorkflowID;
-      return new InvokeChildHandleWithResultId(engine, parentWorkflowID, existingChildId, resultFuncId);
-    }
-
-    // First parent run: create the child backend run (its own container via the
-    // pending child RunTrigger the backend creates) then record the durable
-    // enqueue op keyed (parentWf, enqueueFuncId) carrying the child id. Order:
-    // create FIRST, then record — mirrors solidactions-executor.ts:483-494 so a
-    // crash between them re-creates idempotently (backend short-circuits the
-    // duplicate UUID) rather than recording a child that was never created.
-    await engine.enqueueChildWorkflow(
-      childWorkflowID,
-      childName,
-      SolidActionsJSON.stringify(args.length === 1 ? args[0] : args),
-      resultFuncId,
-      {
-        executorID: s.runtimeParams.executorID,
-        appId: s.runtimeParams.appId,
-        appVersion: s.runtimeParams.appVersion,
-      },
-    );
-    await engine.recordOperationResult(
-      parentWorkflowID,
-      enqueueFuncId,
-      'SolidActions.startWorkflow',
-      true,
-      Date.now(),
-      { childWorkflowID },
-    );
-
-    return new InvokeChildHandleWithResultId(engine, parentWorkflowID, childWorkflowID, resultFuncId);
-  };
-
   const handler: ProxyHandler<object> = {
     apply(t, _thisArg, args) {
-      return spawn(resolveName(t), args);
+      return spawnChildByName(resolveName(t), args);
     },
     get(_t, p) {
-      return (...args: unknown[]) => spawn(resolveName(target, p), args);
+      return (...args: unknown[]) => spawnChildByName(resolveName(target, p), args);
     },
   };
 
   return new Proxy(target, handler);
+}
+
+/**
+ * Invoke-path child-workflow dispatch for non-function targets — a
+ * {@link WorkflowDescriptor} returned by `defineWorkflow`, or a bare string
+ * registered name. Returns a callable `(args) => Promise<InvokeChildHandle>`,
+ * matching the calling convention `startWorkflow(target)(args)` so the same
+ * external shape works for descriptor/string + function/object targets.
+ *
+ * `childName` is the already-resolved registered name (the caller does the
+ * registry lookup in `solidactions.ts`'s invoke-scope branch so the error path
+ * sees the supplied identifier).
+ */
+export function invokeStartChildWorkflowByName(childName: string): (...args: unknown[]) => Promise<InvokeChildHandle<unknown>> {
+  const scope = getCurrentScope();
+  if (!scope) {
+    throw new Error('invokeStartChildWorkflowByName called with no active invoke scope');
+  }
+  return (...args: unknown[]) => spawnChildByName(childName, args);
 }
 
 /**
