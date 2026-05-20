@@ -120,6 +120,13 @@ import { StepConfig } from './step';
 import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
 import { invokeStartChildWorkflow, invokeStartChildWorkflowByName } from './invoke/child-workflow';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
+// Task 3.3 + §9.10: the workflow-output PUT must scrub plaintext secrets
+// (ConnectionVar.key / proxyToken) from the serialized output before it
+// crosses the persistence boundary, mirroring the scrubbing the step
+// primitive already does in invoke.ts. Static import here is safe because
+// secret-redaction is a leaf module (no transitive deps that re-enter the
+// solidactions.ts module load).
+import { collectSecretStrings, scrubSecretsFromString } from './invoke/secret-redaction';
 import {
   __getRegisteredWorkflow,
   __getRegisteredWorkflows,
@@ -1172,16 +1179,28 @@ export class SolidActions {
     // ERROR → SolidActionsJSON.stringify(serializeError(err)) (:531). Both are
     // the legacy serializer (SolidActionsJSON) over the same shapes — matching
     // src/invoke/invoke.ts:108's `SolidActionsJSON.stringify(serializeError(err))`.
+    //
+    // Task 3.3 §9.10: scrub plaintext secrets (ConnectionVar.key + proxyToken
+    // of every ctx.vars entry) BEFORE the PUT crosses the persistence boundary,
+    // mirroring the per-step scrubbing the invoke.ts step primitive already
+    // performs. The Phase-3 e2e gate caught this gap on real Daytona — a
+    // workflow body that legitimately consumed ctx.vars.X.proxyToken (intended
+    // for outbound proxy calls) and surfaced it in its return value leaked the
+    // bearer to run_status.output. Step outputs were already covered; this
+    // closes the workflow-output surface to match.
+    const secretStrings = collectSecretStrings(ctx.vars);
     // Best-effort swallow matches the swallow on legacy reportWorkflowComplete.
     try {
       if (result.status === 'completed') {
+        const outputSerialized = SolidActionsJSON.stringify(result.output) ?? 'null';
         await client.put(`/runs/status/${encodedID}/output`, {
-          output: SolidActionsJSON.stringify(result.output),
+          output: scrubSecretsFromString(outputSerialized, secretStrings),
           status: StatusString.SUCCESS,
         });
       } else {
+        const errorSerialized = SolidActionsJSON.stringify(serializeError(result.error)) ?? 'null';
         await client.put(`/runs/status/${encodedID}/error`, {
-          error: SolidActionsJSON.stringify(serializeError(result.error)),
+          error: scrubSecretsFromString(errorSerialized, secretStrings),
           status: StatusString.ERROR,
         });
       }
