@@ -42,6 +42,12 @@ import { SolidActionsJSON } from '../serialization';
 import { SolidActionsHttpConfig } from '../config';
 import { InvokeSystemDatabase, SuspensionRequired } from './invoke-system-database';
 import { runInScope, nextFunctionID, RuntimeParams, RuntimeScope } from './runtime-scope';
+import {
+  collectSecretStrings,
+  redactVarsForSnapshot,
+  rehydrateVarsFromSnapshot,
+  scrubSecretsFromString,
+} from './secret-redaction';
 import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } from './types';
 
 /**
@@ -58,7 +64,16 @@ import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } f
  * - send: minimal delegation straight to the engine's send(). Not exercised by
  *   Task 1.3 tests; safe for the same reason.
  */
-function buildPrimitives(engine: InvokeSystemDatabase, workflowID: string): DurablePrimitives {
+function buildPrimitives(
+  engine: InvokeSystemDatabase,
+  workflowID: string,
+  // Task 3.2: secret strings collected from ctx.vars (every ConnectionVar's
+  // `key` and `proxyToken`). The step success/error paths scrub each
+  // occurrence of these strings from the serialized payload before it
+  // crosses the persistence boundary (POST /operations). Empty array → the
+  // scrubber is a zero-cost no-op (no secret-bearing vars in this invoke).
+  secretStrings: readonly string[],
+): DurablePrimitives {
   const primitives: DurablePrimitives = {
     // MINIMAL 1.3: sleep delegates directly to engine.durableSleepms; no retry/deadline policy yet.
     sleep: (ms: number): Promise<void> => engine.durableSleepms(workflowID, nextFunctionID(), ms),
@@ -96,14 +111,28 @@ function buildPrimitives(engine: InvokeSystemDatabase, workflowID: string): Dura
       const startTime = Date.now();
       try {
         const output = await fn();
+        // Task 3.2: scrub every known secret string from the serialized
+        // step output before it crosses the persistence boundary. A step
+        // that legitimately consumes `ctx.vars.X.key` should derive a
+        // non-secret value to return; but if a workflow body accidentally
+        // (or intentionally) puts a secret in its return value, the
+        // serialized bytes the backend stores must not carry it.
+        const outputJson = scrubSecretsFromString(SolidActionsJSON.stringify(output) ?? 'null', secretStrings);
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
-          output: SolidActionsJSON.stringify(output),
+          output: outputJson,
         });
         return output;
       } catch (err) {
         // Serialize with serialize-error so custom Error props survive suspend+replay.
+        // Task 3.2: scrub the serialized error string too — a thrown error
+        // could include a secret in its message (e.g. an HTTP client
+        // serializing a request body into an error).
+        const errorJson = scrubSecretsFromString(
+          SolidActionsJSON.stringify(serializeError(err)) ?? 'null',
+          secretStrings,
+        );
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
-          error: SolidActionsJSON.stringify(serializeError(err)),
+          error: errorJson,
         });
         throw err;
       }
@@ -182,14 +211,27 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
   // warn). A failure to capture must NOT phase-init-fail the run — the
   // legacy run-record write path also swallows transient persistence blips.
   try {
-    const varsJson = SolidActionsJSON.stringify(ctx.vars);
+    // Task 3.2: redact ConnectionVar secrets BEFORE the snapshot crosses the
+    // persistence boundary. Each ConnectionVar in ctx.vars is replaced with
+    // a RedactedConnectionVarRef carrying only the var name + non-secret
+    // proxyUrl. The plaintext `key` and `proxyToken` never enter `varsJson`
+    // and therefore never enter the durable run record.
+    const redactedVars = redactVarsForSnapshot(ctx.vars);
+    const varsJson = SolidActionsJSON.stringify(redactedVars);
     const snapshot = await engine.captureVarsSnapshot(workflowID, varsJson);
     if (snapshot !== undefined) {
-      // SNAPSHOT WINS: substitute the parsed snapshot for ctx.vars. The
-      // workflow body sees the EXACT same vars object across every dispatch
-      // of this run uuid; the adapter-supplied current values are discarded.
-      const parsed = SolidActionsJSON.parse(snapshot) as InvokeCtx<I>['vars'];
-      ctx = { ...ctx, vars: Object.freeze(parsed) };
+      // SNAPSHOT WINS for non-secret vars (Task 3.1). For secret fields of
+      // a ConnectionVar (`key`, `proxyToken`), the snapshot carries only a
+      // reference; re-hydrate those from the adapter-supplied live ctx.vars
+      // by name. The runner re-injects the live connection per dispatch
+      // (the connection store is the source of truth at runtime); the
+      // workflow body sees a fully-populated ConnectionVar indistinguishable
+      // from the first dispatch's view. Secret rotation between dispatches
+      // is tolerated divergence (the connection store, not the SDK, owns
+      // that contract).
+      const parsed = SolidActionsJSON.parse(snapshot) as Record<string, unknown>;
+      const rehydrated = rehydrateVarsFromSnapshot(parsed, ctx.vars);
+      ctx = { ...ctx, vars: Object.freeze(rehydrated) as InvokeCtx<I>['vars'] };
     }
     // snapshot === undefined → backend lacks the route (legacy / in-flight
     // run created before this task landed); leave ctx.vars as-is.
@@ -216,7 +258,13 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
   // Build the durable primitives once; attach to ctx (for descriptor bodies that
   // take ctx) AND to the scope (Task 2.3: so legacy SolidActions.runStep/sleepms
   // free-functions delegate to these EXACT closures — single source of truth).
-  const primitives = buildPrimitives(engine, workflowID);
+  // Task 3.2: collect plaintext secret strings (key + proxyToken of every
+  // ConnectionVar) AFTER snapshot re-hydration so any rotated secret from
+  // the live ctx.vars is included. The step primitive scrubs these from
+  // serialized step outputs/errors before they cross the persistence
+  // boundary.
+  const secretStrings = collectSecretStrings(ctx.vars);
+  const primitives = buildPrimitives(engine, workflowID, secretStrings);
   const scope: RuntimeScope = { executor: engine, runtimeParams, primitives };
 
   try {
