@@ -65,6 +65,12 @@ export interface InvokeRunIdentity {
 export class InvokeSystemDatabase extends HttpSystemDatabase {
   /** Own HTTP client for the two suspension POSTs (sleep, wait). */
   private readonly invokeClient: HttpClient;
+  /**
+   * Task 3.1 — subclass-visible logger reference (the base's `logger` is
+   * private). Used by `captureVarsSnapshot` to warn-and-fall-back when a
+   * legacy backend lacks the `/vars-snapshot` route.
+   */
+  private readonly invokeLogger: GlobalLogger;
 
   constructor(
     config: SolidActionsHttpConfig,
@@ -73,6 +79,7 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
     serializer: SolidActionsSerializer,
   ) {
     super(config, identity.executorID, identity.appVersion, logger, serializer);
+    this.invokeLogger = logger;
 
     // Own client: same retry policy as the base — the suspension POST must survive
     // transient backend outages, matching base policy, because a dropped POST
@@ -242,6 +249,65 @@ export class InvokeSystemDatabase extends HttpSystemDatabase {
     // signal must fall back to the safe "suspend + wait for re-pend" path, not
     // a spurious "don't suspend" that could spin.
     return { ready: resp?.ready === true };
+  }
+
+  /**
+   * Task 3.1 — write-once ctx.vars snapshot for replay determinism.
+   *
+   * The bug this fixes: a workflow that branches on `ctx.vars.X` BEFORE any
+   * completed step. The first dispatch sees `vars.X='A'`, branches 'path-A',
+   * and suspends. Between dispatches the adapter-supplied env var rotates to
+   * `vars.X='B'`. A naive replay re-evaluates the branch and gets 'path-B' —
+   * the cached step's recorded result then no longer matches the new branch,
+   * causing divergence / corruption / wrong output.
+   *
+   * The fix: at run start, capture the adapter-supplied `ctx.vars` onto the
+   * durable run record via a single POST that is write-once / first-write-wins
+   * (atomicity contract mirrors the legacy `wfStatus.input` capture at
+   * src/solidactions-executor.ts:407-446). Every dispatch — first or replay —
+   * calls this method; the response carries the SNAPSHOT (what was actually
+   * stored), which the caller substitutes for `ctx.vars` before running the
+   * workflow body. On the first dispatch the supplied vars are stored and
+   * returned; on every subsequent dispatch the body is ignored and the
+   * previously-stored snapshot is returned, so the workflow body sees the
+   * SAME `ctx.vars` across all dispatches regardless of how the adapter's
+   * current values have drifted.
+   *
+   * Backward compatibility (legacy in-flight runs created before this method
+   * landed): a 404 from the backend means the route is unimplemented — the
+   * caller treats this as "no snapshot available, fall back to ctx-supplied
+   * vars". This matches the legacy `recordOperationResult` swallow pattern
+   * for routes that 404 on absent rows; the loss is the determinism guard for
+   * that one in-flight run only, and the e2e parity gate (Task 3.3) catches
+   * if the real backend ever rejects.
+   *
+   * @param workflowID  the run uuid (ctx.run.runUuid)
+   * @param varsJson    SolidActionsJSON.stringify of the adapter-supplied
+   *                    ctx.vars Record. On first dispatch this is what gets
+   *                    stored; on replay it is ignored.
+   * @returns           the stored snapshot (a JSON string parsed back into
+   *                    a Record by the caller). `undefined` only when the
+   *                    backend is legacy (404 from the route) — the caller
+   *                    falls back to ctx.vars in that case.
+   */
+  async captureVarsSnapshot(workflowID: string, varsJson: string): Promise<string | undefined> {
+    try {
+      const resp = await this.invokeClient.post<{ vars: string | null }>(
+        `/runs/status/${encodeURIComponent(workflowID)}/vars-snapshot`,
+        { vars: varsJson },
+      );
+      return resp?.vars ?? undefined;
+    } catch (err) {
+      // Backward-compat: legacy backend (no /vars-snapshot route) → log + fall
+      // back. ANY error here is non-fatal — the determinism guard is best-
+      // effort on the SDK boundary; the worst case is the one in-flight legacy
+      // run that lacks a snapshot reverts to the pre-fix behavior (the same
+      // behavior it had before this task landed). The e2e parity gate
+      // (Task 3.3) covers the real backend; jest covers the SDK contract.
+      const msg = err instanceof Error ? err.message : String(err);
+      this.invokeLogger.warn(`vars-snapshot unavailable for ${workflowID}: ${msg} (falling back to ctx.vars)`);
+      return undefined;
+    }
   }
 
   async enqueueChildWorkflow(

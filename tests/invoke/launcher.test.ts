@@ -140,6 +140,18 @@ function normalizeLog(runId: string): NormalizedEntry[] {
       if (/\/sleep$/.test(path) && entry.method === 'POST') {
         delete cloned.wakeupTime;
       }
+      // Task 3.1 vars-snapshot body: contains the WHOLE adapter-supplied
+      // ctx.vars (= the entire process.env minus reserved keys). The
+      // launcher path injects WORKFLOW_ENTRY_FILE / WORKFLOW_ID into
+      // process.env that the direct path does not, so the captured snapshot
+      // legitimately differs between paths. The semantically meaningful
+      // assertion is that BOTH paths POST `/vars-snapshot` exactly once with
+      // a `vars` body — not that the body is byte-identical. Strip the
+      // body's `vars` field for comparison purposes; the path + method are
+      // still compared verbatim.
+      if (/\/vars-snapshot$/.test(path) && entry.method === 'POST') {
+        delete cloned.vars;
+      }
       // Operation record bodies: startedAtEpochMs / startTimeEpochMs /
       // completedAtEpochMs / endTimeEpochMs are wall-clock timestamps.
       if (/\/operations$/.test(path) && entry.method === 'POST') {

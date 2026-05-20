@@ -29,6 +29,17 @@ interface MockWorkflow {
   input: string | null;
   output: string | null;
   error: string | null;
+  // Task 3.1: ctx.vars snapshot, captured once at run start (write-once via
+  // POST /runs/status/<id>/vars-snapshot). null/undefined until the first
+  // dispatch captures it; thereafter every replay reads vars from this
+  // snapshot INSTEAD of the adapter-supplied current values, guaranteeing
+  // the workflow body sees identical vars across dispatches (no replay
+  // divergence when the env-var changes between dispatches). Optional for
+  // backward-compat: legacy in-flight runs (seeded before this field landed)
+  // continue without a snapshot — the SDK falls back to ctx-supplied vars +
+  // logs a warn (degrades gracefully; mirrors the legacy `input` write-once
+  // contract this lives alongside).
+  vars?: string | null;
   createdAt: number;
   updatedAt: number;
   queueName?: string;
@@ -246,6 +257,22 @@ export class MockHttpServer {
     const outputMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/output$/);
     if (outputMatch && method === 'PUT') {
       return this.recordOutput(decodeURIComponent(outputMatch[1]), body as { output: string; status: string });
+    }
+
+    // Task 3.1 — vars snapshot (write-once, then read on every replay).
+    //   POST /runs/status/<id>/vars-snapshot  body { vars: string }
+    //   - first call:  store `vars` on the run row, return `{ vars }` (the
+    //                  value just written).
+    //   - subsequent:  IGNORE the body, return `{ vars }` from the row
+    //                  (write-once / first-write-wins, same atomicity
+    //                  contract as `input`).
+    //   - row missing: 404, same as every other run-keyed route — the
+    //                  caller MUST create the row first.
+    // Mirrors the legacy `input`-determinism shape (the system already
+    // persists wfStatus.input once per run); vars now lives next to it.
+    const varsSnapshotMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/vars-snapshot$/);
+    if (varsSnapshotMatch && method === 'POST') {
+      return this.captureVarsSnapshot(decodeURIComponent(varsSnapshotMatch[1]), body as { vars: string });
     }
 
     const errorMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/error$/);
@@ -500,6 +527,10 @@ export class MockHttpServer {
       input: data.input ?? null,
       output: null,
       error: null,
+      // Task 3.1: vars snapshot starts unset (undefined); first dispatch's
+      // POST /runs/status/<id>/vars-snapshot writes it write-once. Stored
+      // value is the SolidActionsJSON-stringified Record<string, VarValue>.
+      vars: data.vars,
       createdAt: data.createdAt || Date.now(),
       updatedAt: Date.now(),
       queueName: data.queueName,
@@ -610,6 +641,31 @@ export class MockHttpServer {
     workflow.status = data.status;
     workflow.updatedAt = Date.now();
     return { status: 200, body: {} };
+  }
+
+  /**
+   * Task 3.1 — write-once vars snapshot.
+   *
+   * First call on a row with no snapshot: stores `data.vars` and returns it.
+   * Every subsequent call: IGNORES the supplied `data.vars` and returns the
+   * stored value (first-write-wins, same atomicity contract as `input`).
+   * Missing row: 404. The SDK's invoke() seeds a fresh per-dispatch ctx.vars
+   * via this endpoint; the second-and-later dispatches see the snapshot from
+   * the first dispatch even when the adapter-supplied env vars have changed.
+   */
+  private captureVarsSnapshot(workflowUUID: string, data: { vars: string }): { status: number; body: unknown } {
+    const workflow = this.store.workflows.get(workflowUUID);
+    if (!workflow) {
+      return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
+    }
+    if (workflow.vars === undefined || workflow.vars === null) {
+      // First dispatch — capture.
+      workflow.vars = data.vars ?? null;
+      workflow.updatedAt = Date.now();
+    }
+    // Always return the stored snapshot (the supplied body is ignored on
+    // subsequent calls — write-once / first-write-wins).
+    return { status: 200, body: { vars: workflow.vars } };
   }
 
   private getResult(workflowUUID: string): { status: number; body: unknown } {

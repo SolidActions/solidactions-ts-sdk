@@ -58,10 +58,7 @@ import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } f
  * - send: minimal delegation straight to the engine's send(). Not exercised by
  *   Task 1.3 tests; safe for the same reason.
  */
-function buildPrimitives(
-  engine: InvokeSystemDatabase,
-  workflowID: string,
-): DurablePrimitives {
+function buildPrimitives(engine: InvokeSystemDatabase, workflowID: string): DurablePrimitives {
   const primitives: DurablePrimitives = {
     // MINIMAL 1.3: sleep delegates directly to engine.durableSleepms; no retry/deadline policy yet.
     sleep: (ms: number): Promise<void> => engine.durableSleepms(workflowID, nextFunctionID(), ms),
@@ -128,10 +125,7 @@ function buildPrimitives(
  *
  * Never calls process.exit; never lets an exception escape.
  */
-export async function invoke<I, O>(
-  workflow: WorkflowDescriptor<I, O>,
-  ctx: InvokeCtx<I>,
-): Promise<InvokeResult<O>> {
+export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: InvokeCtx<I>): Promise<InvokeResult<O>> {
   // --- Phase: init -------------------------------------------------------
   // Construct a FRESH per-request engine. Identity is taken strictly from ctx
   // (ctx.run / ctx.app / ctx.api) — no globalParams, no SolidActionsExecutor
@@ -159,6 +153,49 @@ export async function invoke<I, O>(
     await engine.init();
   } catch (error) {
     return { status: 'failed', error, phase: 'init' };
+  }
+
+  // --- Phase: vars snapshot (Task 3.1 — replay determinism) --------------
+  // Capture ctx.vars onto the durable run record write-once at run start, and
+  // on every dispatch (including the first) substitute ctx.vars with the
+  // returned SNAPSHOT. The first dispatch's POST writes & echoes back the
+  // supplied vars; every subsequent dispatch ignores the body and returns the
+  // previously-stored snapshot, so the workflow body sees identical ctx.vars
+  // across all dispatches regardless of how the adapter-supplied current
+  // values have drifted.
+  //
+  // This is the durable counterpart of the legacy `wfStatus.input` capture +
+  // determinism check (src/solidactions-executor.ts:441-451); the legacy path
+  // THROWS on a mismatch, the invoke path OVERRIDES with the snapshot —
+  // equivalent enforcement, lighter contract (no user-visible error class,
+  // the snapshot wins silently because for the invoke path there is no
+  // "user-supplied input" — vars come from the runner's transport, not from
+  // the user code).
+  //
+  // Backward-compat: a legacy backend without the /vars-snapshot route
+  // returns 404; captureVarsSnapshot logs a warn and resolves to undefined,
+  // and we fall back to the ctx-supplied vars (pre-fix behavior for that one
+  // in-flight legacy run — no regression, no crash).
+  //
+  // Errors here are isolated from the workflow body: any unexpected throw
+  // from captureVarsSnapshot itself is swallowed in the method (logged as
+  // warn). A failure to capture must NOT phase-init-fail the run — the
+  // legacy run-record write path also swallows transient persistence blips.
+  try {
+    const varsJson = SolidActionsJSON.stringify(ctx.vars);
+    const snapshot = await engine.captureVarsSnapshot(workflowID, varsJson);
+    if (snapshot !== undefined) {
+      // SNAPSHOT WINS: substitute the parsed snapshot for ctx.vars. The
+      // workflow body sees the EXACT same vars object across every dispatch
+      // of this run uuid; the adapter-supplied current values are discarded.
+      const parsed = SolidActionsJSON.parse(snapshot) as InvokeCtx<I>['vars'];
+      ctx = { ...ctx, vars: Object.freeze(parsed) };
+    }
+    // snapshot === undefined → backend lacks the route (legacy / in-flight
+    // run created before this task landed); leave ctx.vars as-is.
+  } catch {
+    // Defense in depth: captureVarsSnapshot already swallows + logs, but
+    // shield the workflow from any unexpected parse/stringify failure.
   }
 
   // --- Phase: run --------------------------------------------------------
