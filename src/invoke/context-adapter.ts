@@ -1,5 +1,22 @@
 import { SolidActionsJSON } from '../serialization';
-import type { InvokeCtx, VarValue, ConnectionVar } from './types';
+import type { InvokeCtx, VarValue, ConnectionVar, ConnectionBroker } from './types';
+
+/**
+ * Broker typing for connection vars (Task 6.2).
+ *
+ * A {@link ConnectionVar} now carries an OPTIONAL `broker` field
+ * ({@link ConnectionBroker}). The supported broker is `'pica'`; `'composio'` is
+ * DEPRECATED and will not be carried by the new ctx.vars path — the migration
+ * codemod (`src/migrate/codemod.ts`) reports any declared Composio connection.
+ *
+ * The interim one-shot transport (a flat env map) has NO broker signal, so this
+ * adapter does NOT emit a `broker` field at runtime — it stays `undefined`,
+ * which keeps existing `toEqual({ key, proxyUrl, proxyToken })` assertions and
+ * the replay snapshot byte-for-byte unchanged. Once the runtime transport
+ * surfaces the broker (alongside `SA_PROXY_URL`/`SA_PROXY_TOKEN`), populate it
+ * via {@link makeConnectionVar} below; Pica is the only non-deprecated value.
+ */
+export type { ConnectionBroker };
 
 /**
  * A one-arg adapter signature: converts a flat transport map (e.g. process.env)
@@ -59,6 +76,26 @@ function isConnectionValue(value: string): boolean {
     idx = value.indexOf('::', idx + 2);
   }
   return count >= 2;
+}
+
+/**
+ * Construct a {@link ConnectionVar}. `broker` is attached ONLY when supplied —
+ * when omitted the returned object has exactly `{ key, proxyUrl, proxyToken }`,
+ * preserving byte-for-byte equality with the pre-broker-typing shape (callers
+ * and the replay snapshot are unaffected). `'composio'` is deprecated; prefer
+ * `'pica'`.
+ */
+export function makeConnectionVar(
+  key: string,
+  proxyUrl: string,
+  proxyToken: string,
+  broker?: ConnectionBroker,
+): ConnectionVar {
+  const connVar: ConnectionVar = { key, proxyUrl, proxyToken };
+  if (broker !== undefined) {
+    return { ...connVar, broker };
+  }
+  return connVar;
 }
 
 /**
@@ -149,12 +186,10 @@ export function oneShotContextAdapter(transport: Record<string, string>): Invoke
       continue;
     }
     if (hasProxy && isConnectionValue(value)) {
-      const connVar: ConnectionVar = {
-        key: value,
-        proxyUrl,
-        proxyToken,
-      };
-      vars[key] = connVar;
+      // No broker signal in the one-shot transport → broker omitted (the
+      // returned shape stays `{ key, proxyUrl, proxyToken }`, runtime-identical
+      // to the pre-broker-typing behavior).
+      vars[key] = makeConnectionVar(value, proxyUrl, proxyToken);
     } else {
       vars[key] = value;
     }

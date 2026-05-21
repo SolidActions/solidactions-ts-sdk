@@ -9,11 +9,33 @@ export interface InvokeCtxApp {
   appId: string;
   tenantId: string;
 }
+/**
+ * Supported connection brokers.
+ *
+ * `pica` is the supported proxy contract. `composio` is **deprecated** (Task 6.2):
+ * Composio-backed connections will not be carried by the new `ctx.vars`
+ * ConnectionVar path. The migration codemod (`src/migrate/codemod.ts`) emits a
+ * deprecation report for any declared Composio connection. The literal is kept
+ * here so deprecation is expressible in the type system, but it is marked
+ * `@deprecated` so editors flag its use.
+ */
+export type ConnectionBroker =
+  | 'pica'
+  /** @deprecated Composio connections are no longer supported; migrate to the Pica proxy contract. */
+  | 'composio';
+
 /** A connection var: opaque key + run-shared proxy (proxyToken is a bearer — treat as secret). */
 export interface ConnectionVar {
   readonly key: string;
   readonly proxyUrl: string;
   readonly proxyToken: string;
+  /**
+   * Originating broker, when known. Optional so existing constructions and
+   * `toEqual` assertions are unaffected (the interim one-shot adapter has no
+   * broker signal in its transport and omits it). `'composio'` is deprecated —
+   * see {@link ConnectionBroker}.
+   */
+  readonly broker?: ConnectionBroker;
 }
 export type VarValue = string | ConnectionVar;
 /**
