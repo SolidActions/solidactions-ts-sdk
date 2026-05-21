@@ -31,6 +31,7 @@ export type ContextAdapter = (transport: Record<string, string>) => InvokeCtx;
  */
 const RESERVED_KEYS = new Set([
   'WORKFLOW_INPUT',
+  'WORKFLOW_INPUT_URL',
   'STEPS_TRIGGER_ID',
   'TENANT_ID',
   'SA_PROXY_URL',
@@ -204,5 +205,96 @@ export function oneShotContextAdapter(transport: Record<string, string>): Invoke
     mode: 'oneshot',
     ...(workflowSlug !== undefined ? { workflowSlug } : {}),
     // telemetry omitted: no env signal for it in the one-shot transport
+  };
+}
+
+/** The dispatched resident /run body (POC resident.mjs / spec dispatch contract). */
+export interface ResidentRunBody {
+  triggerId: string | number;
+  runSecret: string;
+  workerSessionId?: string;
+  envVars: Record<string, string>;
+}
+
+/**
+ * Resident adapter: maps the dispatched /run BODY into a fully-typed
+ * InvokeCtx<unknown> with mode 'resident'.
+ *
+ * Differs from oneShotContextAdapter (which reads a flat process.env map):
+ *  - identity/transport come from `body.envVars` (NEVER process.env);
+ *  - triggerId/runSecret/workerSessionId come from the body top-level, falling
+ *    back to envVars (STEPS_TRIGGER_ID / SOLIDACTIONS_WORKER_SESSION_ID);
+ *  - input comes from envVars.WORKFLOW_INPUT, OR — when absent — is FETCHED from
+ *    envVars.WORKFLOW_INPUT_URL (the large-payload fallback);
+ *  - both forms are parsed with SolidActionsJSON.parse (superjson-envelope aware);
+ *  - the callback base URL is envVars.SOLIDACTIONS_API_URL.
+ */
+export async function residentContextAdapter(body: ResidentRunBody): Promise<InvokeCtx> {
+  const env = body.envVars ?? {};
+
+  // --- input: WORKFLOW_INPUT, else WORKFLOW_INPUT_URL (fetched), else {} ---
+  let input: unknown = {};
+  if (env['WORKFLOW_INPUT'] !== undefined) {
+    try {
+      input = SolidActionsJSON.parse(env['WORKFLOW_INPUT']);
+    } catch (err) {
+      throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
+    }
+  } else if (env['WORKFLOW_INPUT_URL'] !== undefined) {
+    const res = await fetch(env['WORKFLOW_INPUT_URL']);
+    if (!res.ok) {
+      throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT_URL fetch failed: ${res.status} ${res.statusText}`);
+    }
+    const raw = await res.text();
+    try {
+      input = SolidActionsJSON.parse(raw);
+    } catch (err) {
+      throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT_URL contains invalid JSON: ${String(err)}`);
+    }
+  }
+
+  // --- run identity: body top-level, falling back to envVars ---
+  const apiKey = env['SOLIDACTIONS_API_KEY'] ?? '';
+  const colonIdx = apiKey.indexOf(':');
+  const runSecretFromKey = colonIdx !== -1 ? apiKey.slice(colonIdx + 1) : '';
+  const run = {
+    runUuid: env['SOLIDACTIONS_RUN_ID'] ?? '',
+    triggerId: String(body.triggerId ?? env['STEPS_TRIGGER_ID'] ?? ''),
+    runSecret: body.runSecret ?? runSecretFromKey,
+    workerSessionId: env['SOLIDACTIONS_WORKER_SESSION_ID'] ?? body.workerSessionId ?? '',
+  };
+
+  const api = { url: env['SOLIDACTIONS_API_URL'] ?? '', key: apiKey };
+  const app = {
+    appId: env['SOLIDACTIONS__APPID'] ?? '',
+    appVersion: env['SOLIDACTIONS__APPVERSION'] ?? '',
+    tenantId: env['TENANT_ID'] ?? '',
+  };
+  const workflowSlug = env['WORKFLOW_SLUG'];
+
+  // --- vars (same classification as oneShotContextAdapter) ---
+  const proxyUrl = env['SA_PROXY_URL'];
+  const proxyToken = env['SA_PROXY_TOKEN'];
+  const hasProxy = proxyUrl !== undefined && proxyToken !== undefined;
+  const vars: Record<string, VarValue> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (isReserved(key)) {
+      continue;
+    }
+    if (hasProxy && isConnectionValue(value)) {
+      vars[key] = makeConnectionVar(value, proxyUrl, proxyToken);
+    } else {
+      vars[key] = value;
+    }
+  }
+
+  return {
+    input,
+    vars: Object.freeze(vars),
+    run,
+    app,
+    api,
+    mode: 'resident',
+    ...(workflowSlug !== undefined ? { workflowSlug } : {}),
   };
 }
