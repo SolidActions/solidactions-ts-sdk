@@ -16,9 +16,29 @@ export interface ConnectionVar {
   readonly proxyToken: string;
 }
 export type VarValue = string | ConnectionVar;
+/**
+ * Open augmentation hook for generated `ctx.vars` types (Task 4.1).
+ *
+ * Users who run `solidactions generate-types` get a `.d.ts` that extends this
+ * interface with their project's typed var names. Without a generated file the
+ * interface is empty, so `ctx.vars` falls back to the permissive
+ * `Record<string, VarValue>` — existing code continues to compile unchanged.
+ *
+ * Declaration-merging example (auto-generated, do not edit manually):
+ *
+ *   declare module '@solidactions/sdk' {
+ *     interface InvokeCtxVarsAugment {
+ *       MY_FLAG: string;
+ *       GCAL: ConnectionVar;
+ *     }
+ *   }
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface InvokeCtxVarsAugment {}
+
 export interface InvokeCtx<I = unknown> {
   input: I;
-  vars: Readonly<Record<string, VarValue>>;
+  vars: Readonly<Record<string, VarValue> & InvokeCtxVarsAugment>;
   run: InvokeCtxRun;
   app: InvokeCtxApp;
   api: { url: string; key: string };

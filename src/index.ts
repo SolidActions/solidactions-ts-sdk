@@ -56,6 +56,9 @@ export type {
   DurablePrimitives,
   ConnectionVar,
   VarValue,
+  // Augmentation hook — generated .d.ts files extend this interface
+  // via `declare module '@solidactions/sdk' { interface InvokeCtxVarsAugment { ... } }`
+  InvokeCtxVarsAugment,
 } from './invoke/types';
 
 // Errors a user may catch at runtime
