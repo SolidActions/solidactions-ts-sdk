@@ -43,6 +43,14 @@ export { HttpClient, HttpClientConfig } from './http_client';
 // New contract: defineWorkflow + public types (T8 — package root export)
 export { defineWorkflow } from './invoke/define-workflow';
 
+// Resident-mode entrypoint (Blaxel Phase-1 MVP). runResident builds ctx from the
+// dispatched /run body, runs the durable run-status lifecycle, and RETURNS the
+// InvokeResult (never process.exit) so a warm resident can re-invoke on the next
+// dispatch.
+export { runResident } from './invoke/resident';
+export { residentContextAdapter } from './invoke/context-adapter';
+export type { ResidentRunBody } from './invoke/context-adapter';
+
 export type {
   // Context passed to every workflow's run() function
   InvokeCtx,

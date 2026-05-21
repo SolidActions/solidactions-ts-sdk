@@ -45,6 +45,12 @@ export const oneShotRuntimeAdapter: OneShotRuntimeAdapter = {
 };
 
 export const residentRuntimeAdapter: ResidentRuntimeAdapter = {
+  /**
+   * Resident policy: RETURN the InvokeResult unchanged (never process.exit), so a
+   * warm resident process can re-invoke on the next dispatch. runResident() owns
+   * the row-create/report lifecycle; this adapter is the codified "return, don't
+   * exit" contract that distinguishes the resident path from oneShotRuntimeAdapter.
+   */
   handle(result: InvokeResult): InvokeResult {
     return result;
   },
