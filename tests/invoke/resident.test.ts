@@ -29,6 +29,7 @@ import { __clearRegistry } from '../../src/invoke/registry';
 import { setUpSolidActionsTestServer, tearDownSolidActionsTestServer } from '../helpers';
 import { MockHttpServer } from '../../src/testing/mock_server';
 import { SolidActionsJSON } from '../../src/serialization';
+import { StatusString } from '../../src/workflow';
 import type { InvokeCtx, DurablePrimitives } from '../../src/invoke/types';
 
 let srv: MockHttpServer;
@@ -111,6 +112,79 @@ it('suspended (sleep) → returns {status:"suspended",reason:"sleep"}; row creat
   expect(srv.lastSleepSchedule()).toBeTruthy();
   expect(srv.lastOutputPut()).toBeUndefined();
   expect(srv.lastErrorPut()).toBeUndefined();
+  expect(srv.lastWorkflowCompleteIndex()).toBeUndefined();
+});
+
+it('cancelled → returns {status:"cancelled"} and writes a single CANCELLED output PUT, no workflow-complete POST', async () => {
+  // Task A.4 — explicit cancelled-branch coverage for runResident.
+  //
+  // Mirrors the cancellation.test.ts cancel mechanism: seed the run row as
+  // CANCELLED so the engine's getOperationResultAndThrowIfCancelled (reached on
+  // the first step() call) sees the CANCELLED row and throws
+  // SolidActionsWorkflowCancelledError. invoke() maps that to
+  // { status: 'cancelled' }. reportTerminalState writes the CANCELLED output PUT
+  // and returns without POSTing /workflow-complete.
+  const CANCEL_RUN_ID = '00000000-0000-4000-8000-0000000000a9';
+
+  // Seed the run row as CANCELLED (the cancel landed before this dispatch).
+  // Field names match MockStore's workflow record shape (see cancellation.test.ts:88-108).
+  srv.store.workflows.set(CANCEL_RUN_ID, {
+    workflowUUID: CANCEL_RUN_ID,
+    status: StatusString.CANCELLED,
+    workflowName: '',
+    workflowClassName: '',
+    workflowConfigName: '',
+    authenticatedUser: '',
+    assumedRole: '',
+    authenticatedRoles: [],
+    request: {},
+    executorId: '7',
+    applicationVersion: 'v1',
+    applicationID: 'app',
+    input: null,
+    output: null,
+    error: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    recoveryAttempts: 0,
+    priority: 0,
+  });
+  // Pre-record a sleep op (functionID 0) so the engine hits an existing op and
+  // calls getOperationResultAndThrowIfCancelled, which detects the CANCELLED row
+  // and throws. Without a recorded op, step() would POST a new op before
+  // checking cancellation — this pre-seed forces the cancel-check path.
+  srv.store.operations.set(CANCEL_RUN_ID, [
+    {
+      workflowUUID: CANCEL_RUN_ID,
+      functionId: 0,
+      functionName: 'SolidActions.sleep',
+      output: JSON.stringify({ wakeupTime: Date.now() + 60_000 }),
+      error: null,
+    },
+  ]);
+
+  const wf = defineWorkflow<unknown, string>({
+    name: 'residentCancelled',
+    run: async (ctx) => {
+      await ctx.sleep(60_000);
+      return 'unreachable';
+    },
+  });
+
+  const result = await runResident(wf, body({ SOLIDACTIONS_RUN_ID: CANCEL_RUN_ID }));
+
+  // runResident must RETURN (not throw, not process.exit) with { status: 'cancelled' }.
+  expect(result.status).toBe('cancelled');
+
+  // reportTerminalState must write the CANCELLED output PUT (status: CANCELLED,
+  // no output payload).
+  const outputPut = srv.lastOutputPut();
+  expect(outputPut).toBeTruthy();
+  expect(outputPut!.workflowID).toBe(CANCEL_RUN_ID);
+  expect(outputPut!.body.status).toBe(StatusString.CANCELLED);
+
+  // Must NOT POST /workflow-complete (legacy: reportWorkflowComplete was never
+  // reached on the cancelled-self path).
   expect(srv.lastWorkflowCompleteIndex()).toBeUndefined();
 });
 
