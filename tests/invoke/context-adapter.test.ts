@@ -176,3 +176,21 @@ it('throws a descriptive error when WORKFLOW_INPUT_URL fetch returns a non-ok st
     await new Promise<void>((r) => srv.close(() => r()));
   }
 });
+
+it('throws a descriptive error when WORKFLOW_INPUT_URL returns 200 with a non-JSON body (real local server, no mocks)', async () => {
+  const http = await import('node:http');
+  const srv = http.createServer((_req, res) => {
+    res.setHeader('content-type', 'text/plain');
+    res.end('this is not json at all');
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const addr = srv.address() as import('node:net').AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}/input.json`;
+  try {
+    await expect(oneShotContextAdapter({ WORKFLOW_INPUT_URL: url })).rejects.toThrow(
+      '[ContextAdapter] WORKFLOW_INPUT_URL contains invalid JSON',
+    );
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+});

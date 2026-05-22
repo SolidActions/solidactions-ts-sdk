@@ -100,12 +100,47 @@ export function makeConnectionVar(
 }
 
 /**
+ * Fetches workflow input from a URL with a 30-second timeout, then parses it
+ * with SolidActionsJSON.  Used by both adapters to eliminate duplication.
+ *
+ * @param url - The URL to fetch from.
+ * @param tag - Prefix used in error messages (e.g. `'ContextAdapter'`).
+ */
+async function fetchWorkflowInput(url: string, tag: string): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`[${tag}] WORKFLOW_INPUT_URL fetch timed out after 30s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) {
+    throw new Error(`[${tag}] WORKFLOW_INPUT_URL fetch failed: ${res.status} ${res.statusText}`);
+  }
+  const raw = await res.text();
+  try {
+    return SolidActionsJSON.parse(raw);
+  } catch (err) {
+    throw new Error(`[${tag}] WORKFLOW_INPUT_URL contains invalid JSON: ${String(err)}`);
+  }
+}
+
+/**
  * One-shot adapter: maps the flat env var map that the Daytona one-shot runtime
  * injects into a fully-typed `InvokeCtx<unknown>`.
  *
  * Env var → ctx field mapping:
  *   WORKFLOW_INPUT          → ctx.input  (SolidActionsJSON.parse: SuperJSON-envelope-aware
  *                                         + plain JSON; missing → {}; malformed → throw)
+ *   WORKFLOW_INPUT_URL      → ctx.input  (fetched + SolidActionsJSON.parse when
+ *                                         WORKFLOW_INPUT is absent; non-ok HTTP → throw;
+ *                                         malformed body → throw)
  *   SOLIDACTIONS_RUN_ID     → ctx.run.runUuid
  *   STEPS_TRIGGER_ID        → ctx.run.triggerId
  *   SOLIDACTIONS_API_KEY    → ctx.run.runSecret (the part after the first `:`)
@@ -119,7 +154,7 @@ export function makeConnectionVar(
  *   SA_PROXY_TOKEN          → used as proxyToken for connection vars
  *   Everything else         → ctx.vars (classified as ConnectionVar or scalar string)
  *
- * Missing WORKFLOW_INPUT → input is {} (empty object).
+ * Missing WORKFLOW_INPUT → falls back to WORKFLOW_INPUT_URL if present, else input is {}.
  * Malformed JSON in WORKFLOW_INPUT → throws a descriptive Error immediately.
  *
  * Deserialization uses the canonical `SolidActionsJSON.parse` — the SAME helper
@@ -143,16 +178,7 @@ export async function oneShotContextAdapter(transport: Record<string, string>): 
       throw new Error(`[ContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
     }
   } else if (transport['WORKFLOW_INPUT_URL'] !== undefined) {
-    const res = await fetch(transport['WORKFLOW_INPUT_URL']);
-    if (!res.ok) {
-      throw new Error(`[ContextAdapter] WORKFLOW_INPUT_URL fetch failed: ${res.status} ${res.statusText}`);
-    }
-    const raw = await res.text();
-    try {
-      input = SolidActionsJSON.parse(raw);
-    } catch (err) {
-      throw new Error(`[ContextAdapter] WORKFLOW_INPUT_URL contains invalid JSON: ${String(err)}`);
-    }
+    input = await fetchWorkflowInput(transport['WORKFLOW_INPUT_URL'], 'ContextAdapter');
   }
 
   // --- run ---
@@ -250,16 +276,7 @@ export async function residentContextAdapter(body: ResidentRunBody): Promise<Inv
       throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
     }
   } else if (env['WORKFLOW_INPUT_URL'] !== undefined) {
-    const res = await fetch(env['WORKFLOW_INPUT_URL']);
-    if (!res.ok) {
-      throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT_URL fetch failed: ${res.status} ${res.statusText}`);
-    }
-    const raw = await res.text();
-    try {
-      input = SolidActionsJSON.parse(raw);
-    } catch (err) {
-      throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT_URL contains invalid JSON: ${String(err)}`);
-    }
+    input = await fetchWorkflowInput(env['WORKFLOW_INPUT_URL'], 'ResidentContextAdapter');
   }
 
   // --- run identity: body top-level, falling back to envVars ---
