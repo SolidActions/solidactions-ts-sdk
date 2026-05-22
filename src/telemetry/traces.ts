@@ -7,7 +7,7 @@
 import type { Span } from '@opentelemetry/sdk-trace-base';
 import type { SpanContext } from '@opentelemetry/api';
 import { TelemetryCollector } from './collector';
-import { globalParams } from '../utils';
+import { bootParams } from '../utils';
 import type { BasicTracerProvider as BasicTracerProviderType } from '@opentelemetry/sdk-trace-base';
 
 // As SolidActions OTLP is optional, OTLP objects must only be dynamically imported
@@ -77,7 +77,7 @@ class StubSpan implements SolidActionsSpan {
 }
 
 export function runWithTrace<R>(span: SolidActionsSpan, func: () => Promise<R>): Promise<R> {
-  if (!globalParams.enableOTLP) {
+  if (!bootParams.enableOTLP) {
     return func();
   }
   const { context, trace } = require('@opentelemetry/api');
@@ -85,7 +85,7 @@ export function runWithTrace<R>(span: SolidActionsSpan, func: () => Promise<R>):
 }
 
 export function getActiveSpan() {
-  if (!globalParams.enableOTLP) {
+  if (!bootParams.enableOTLP) {
     return undefined;
   }
   const { trace } = require('@opentelemetry/api');
@@ -93,7 +93,7 @@ export function getActiveSpan() {
 }
 
 export function isTraceContextWorking(): boolean {
-  if (!globalParams.enableOTLP) {
+  if (!bootParams.enableOTLP) {
     return false;
   }
   const { context, trace } = require('@opentelemetry/api');
@@ -110,7 +110,7 @@ export function isTraceContextWorking(): boolean {
 }
 
 export function installTraceContextManager(appName: string = 'solidactions'): void {
-  if (!globalParams.enableOTLP) {
+  if (!bootParams.enableOTLP) {
     return;
   }
   const { AsyncLocalStorageContextManager } = require('@opentelemetry/context-async-hooks');
@@ -138,9 +138,9 @@ export class Tracer {
     private readonly telemetryCollector: TelemetryCollector,
     appName: string = 'solidactions',
   ) {
-    this.applicationID = globalParams.appID;
-    this.executorID = globalParams.executorID; // for consistency with src/context.ts
-    if (!globalParams.enableOTLP) {
+    this.applicationID = bootParams.appID;
+    this.executorID = bootParams.executorID; // for consistency with src/context.ts
+    if (!bootParams.enableOTLP) {
       return;
     }
     const { trace } = require('@opentelemetry/api');
@@ -157,7 +157,7 @@ export class Tracer {
   }
 
   startSpanWithContext(spanContext: unknown, name: string, attributes?: Attributes): SolidActionsSpan {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return new StubSpan();
     }
     const opentelemetry = require('@opentelemetry/api');
@@ -167,7 +167,7 @@ export class Tracer {
   }
 
   startSpan(name: string, attributes?: Attributes, inputSpan?: SolidActionsSpan): SolidActionsSpan {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return new StubSpan();
     }
     const parentSpan = inputSpan as Span;
@@ -184,14 +184,14 @@ export class Tracer {
   }
 
   endSpan(inputSpan: SolidActionsSpan) {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return;
     }
     const { hrTime } = require('@opentelemetry/core');
     const span = inputSpan as Span;
     span.setAttributes({
       applicationID: this.applicationID,
-      applicationVersion: globalParams.appVersion,
+      applicationVersion: bootParams.appVersion,
     });
     if (span.attributes && !('executorID' in span.attributes)) {
       span.setAttribute('executorID', this.executorID);

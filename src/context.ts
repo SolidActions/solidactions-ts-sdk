@@ -5,6 +5,10 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { SolidActionsInvalidWorkflowTransitionError } from './error';
 import Koa from 'koa';
 import { SolidActionsExecutor } from './solidactions-executor';
+// Type/value import of the invoke ALS accessor. runtime-scope only type-imports
+// the heavy engine classes, so this pulls no runtime import cycle (it is already
+// a static import in src/solidactions.ts).
+import { getCurrentScope } from './invoke/runtime-scope';
 
 export interface StepStatus {
   stepID: number;
@@ -68,7 +72,8 @@ export function getCurrentContextStore(): SolidActionsLocalCtx | undefined {
   return asyncLocalCtx.getStore();
 }
 
-// Track if we've used the SolidActions_RUN_ID env var
+// Track if we've used the legacy SOLIDACTIONS_RUN_ID env var (boot-only fallback).
+// Module-local to this legacy context; the invoke() path never reaches this code.
 let envRunIdUsed = false;
 
 export function getNextWFID(assignedID?: string) {
@@ -81,9 +86,22 @@ export function getNextWFID(assignedID?: string) {
       pctx.idAssignedForNextWorkflow = undefined;
     }
   }
-  // If still no ID and this is the first top-level workflow, use SOLIDACTIONS_RUN_ID env var
-  // This allows the runner to assign a specific UUID that links to run_triggers table
+  // Prefer the active invoke ALS scope's workflow id when present: under the
+  // one-shot run()->invoke() bridge a legacy-registered body executes inside an
+  // invoke scope, so the run id is the scope's (ctx-derived) workflowID — never
+  // a process.env read on the workflow path.
+  if (!wfId) {
+    const scopeWfId = getCurrentScope()?.runtimeParams.workflowID;
+    if (scopeWfId) {
+      wfId = scopeWfId;
+    }
+  }
+  // If still no ID and this is the first top-level workflow, fall back to the
+  // legacy SOLIDACTIONS_RUN_ID env var. This is the legacy runner's run-id
+  // injection (links to the run_triggers table) and applies ONLY to the legacy
+  // boot path; the invoke() workflow path resolved its id from scope above.
   if (!wfId && !envRunIdUsed) {
+    /* boot-only */ // legacy runner run-id transport; invoke()'s run id comes from the ALS scope (ctx.run.runUuid)
     const envRunId = process.env.SOLIDACTIONS_RUN_ID;
     if (envRunId) {
       wfId = envRunId;
@@ -159,6 +177,11 @@ export async function runInStepContext<R>(
       stepStatus: stepStatus,
       curStepFunctionId: stepID,
       parentCtx: pctx,
+      // Task 2.4c: legacy run() step-context logger. This path is LEGACY-only —
+      // invoke() never calls runInStepContext (it uses src/invoke/runtime-scope
+      // + its own GlobalLogger). The SolidActionsExecutor.globalInstance
+      // singleton coupling is retired with the legacy wrapper in Task 2.4c, not
+      // here (2.4a deletes globalParams/process.env identity, not globalInstance).
       logger: SolidActionsExecutor.globalInstance!.ctxLogger,
     },
     callback,

@@ -29,6 +29,17 @@ interface MockWorkflow {
   input: string | null;
   output: string | null;
   error: string | null;
+  // Task 3.1: ctx.vars snapshot, captured once at run start (write-once via
+  // POST /runs/status/<id>/vars-snapshot). null/undefined until the first
+  // dispatch captures it; thereafter every replay reads vars from this
+  // snapshot INSTEAD of the adapter-supplied current values, guaranteeing
+  // the workflow body sees identical vars across dispatches (no replay
+  // divergence when the env-var changes between dispatches). Optional for
+  // backward-compat: legacy in-flight runs (seeded before this field landed)
+  // continue without a snapshot — the SDK falls back to ctx-supplied vars +
+  // logs a warn (degrades gracefully; mirrors the legacy `input` write-once
+  // contract this lives alongside).
+  vars?: string | null;
   createdAt: number;
   updatedAt: number;
   queueName?: string;
@@ -37,8 +48,27 @@ interface MockWorkflow {
   deadlineEpochMS?: number;
   deduplicationID?: string;
   priority: number;
+  // Task 2.7: present only on a child-workflow run created via the one-shot
+  // child branch of POST /runs/status. childResultFunctionID is the PARENT's
+  // durable funcID awaiting this child; parentWorkflowID is derived from the
+  // deterministic child uuid (`${parent}-child-<funcId>`) the SDK sends — the
+  // real backend re-derives it from the authenticated bearer trigger, the mock
+  // models the resulting linkage so completeChild() can target the parent op.
+  childResultFunctionID?: number;
+  parentWorkflowID?: string;
   queuePartitionKey?: string;
   forkedFrom?: string;
+  // Task 2.7 (FIX 1/3): the REAL backend tracks a parent RunTrigger.status
+  // ALONGSIDE the RunStatus.status (run_triggers.status vs run_status.status —
+  // distinct columns). The lost-wakeup convergence + re-pend rule operate on
+  // the TRIGGER status, not the run status, so the mock must model it field-
+  // for-field to prove the FIX-1 behavior (and not fiction). It starts unset;
+  // the child-wait endpoint moves an ACTIVE parent → 'waiting' (mirrors
+  // MessageController::childWait), and completeChild re-pends per the EXACT
+  // TriggerCompletionService::notifyParentOfChildCompletion rule. Values are
+  // the real run_triggers.status literals
+  // ('started'|'waiting'|'pending'|'queued'|'cancelled'|'completed'|'failed').
+  triggerStatus?: string;
 }
 
 interface MockOperation {
@@ -105,7 +135,12 @@ export class MockHttpServer {
   private server: Server | null = null;
   private port: number;
   public store: MockStore;
-  public requestLog: Array<{ method: string; path: string; body?: unknown }> = [];
+  public requestLog: Array<{
+    method: string;
+    path: string;
+    body?: unknown;
+    headers: Record<string, string | string[] | undefined>;
+  }> = [];
 
   constructor(port: number = 0) {
     this.port = port;
@@ -156,11 +191,12 @@ export class MockHttpServer {
       body = await this.readBody(req);
     }
 
-    // Log request
-    this.requestLog.push({ method, path, body });
+    // Log request (headers captured read-only for identity-isolation assertions;
+    // this only records — it does not alter routing or responses below)
+    this.requestLog.push({ method, path, body, headers: { ...req.headers } });
 
     try {
-      const result = await this.route(method, path, query, body);
+      const result = this.route(method, path, query, body);
       res.writeHead(result.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result.body));
     } catch (error) {
@@ -184,12 +220,12 @@ export class MockHttpServer {
     });
   }
 
-  private async route(
+  private route(
     method: string,
     path: string,
     query: URLSearchParams,
     body: unknown,
-  ): Promise<{ status: number; body: unknown }> {
+  ): { status: number; body: unknown } {
     // Health check
     if (path === '/health' && method === 'GET') {
       return { status: 200, body: { status: 'ok' } };
@@ -221,6 +257,22 @@ export class MockHttpServer {
     const outputMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/output$/);
     if (outputMatch && method === 'PUT') {
       return this.recordOutput(decodeURIComponent(outputMatch[1]), body as { output: string; status: string });
+    }
+
+    // Task 3.1 — vars snapshot (write-once, then read on every replay).
+    //   POST /runs/status/<id>/vars-snapshot  body { vars: string }
+    //   - first call:  store `vars` on the run row, return `{ vars }` (the
+    //                  value just written).
+    //   - subsequent:  IGNORE the body, return `{ vars }` from the row
+    //                  (write-once / first-write-wins, same atomicity
+    //                  contract as `input`).
+    //   - row missing: 404, same as every other run-keyed route — the
+    //                  caller MUST create the row first.
+    // Mirrors the legacy `input`-determinism shape (the system already
+    // persists wfStatus.input once per run); vars now lives next to it.
+    const varsSnapshotMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/vars-snapshot$/);
+    if (varsSnapshotMatch && method === 'POST') {
+      return this.captureVarsSnapshot(decodeURIComponent(varsSnapshotMatch[1]), body as { vars: string });
     }
 
     const errorMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/error$/);
@@ -283,6 +335,53 @@ export class MockHttpServer {
     const waitMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/wait$/);
     if (waitMatch && method === 'POST') {
       return { status: 200, body: {} };
+    }
+
+    // Task 2.7 — atomic child-wait compare-and-set (Codex fix#2, DEFECT 1b).
+    // FAITHFUL model of the revised MessageController::childWait: a SINGLE
+    // atomic step that (a) checks whether the SPECIFIC awaited child op
+    // (parent run_uuid + the SDK-supplied result functionID) is ALREADY
+    // resolved — output OR error present — and (b) only if NOT resolved
+    // transitions an active parent → `waiting`. It returns the `ready` signal:
+    //   · ready:true  → child already complete (happened-before the suspend);
+    //                   the trigger is NOT marked waiting; the SDK re-reads &
+    //                   resolves instead of suspending (closes the
+    //                   op-read↔child-wait lost-wakeup window).
+    //   · ready:false → op unresolved; active parent moved to `waiting`; a
+    //                   later completion sees `waiting` and re-pends.
+    // The real backend does this under DB::transaction + lockForUpdate; the
+    // single-threaded mock route() IS already atomic per request, so this is
+    // field-for-field faithful WITHOUT asserting anything the real backend
+    // does not do. (The worker-session/job-skip lifecycle that creates the
+    // REAL race is NOT modellable here — that is validated by the real-Daytona
+    // e2e gate, not this mock; see the design doc.)
+    const childWaitMatch = normalizedPath.match(/^\/workflows\/([^/]+)\/child-wait$/);
+    if (childWaitMatch && method === 'POST') {
+      const parentId = decodeURIComponent(childWaitMatch[1]);
+      const parent = this.store.workflows.get(parentId);
+      if (!parent) {
+        return { status: 404, body: { message: 'Run not found', type: 'run_not_found' } };
+      }
+      const fnId = (body as { functionID?: number } | undefined)?.functionID;
+      const parentOps = this.store.operations.get(parentId) ?? [];
+      const op = parentOps.find((o) => (o.functionId ?? o.functionID) === fnId);
+      const resolved = !!op && ((op.output ?? null) !== null || (op.error ?? null) !== null);
+
+      const current = parent.triggerStatus ?? 'started';
+      if (resolved) {
+        // Happened-before: do NOT mark waiting (that would strand an in-flight
+        // parent). Tell the SDK to re-read & resolve.
+        return { status: 200, body: { ready: true, status: current } };
+      }
+
+      // Unresolved → suspend. Real backend active-state gate
+      // (MessageController::childWait): started|running|dispatched|queued|
+      // pending → waiting; terminal/already-waiting → no-op (never resurrect).
+      const active = ['started', 'running', 'dispatched', 'queued', 'pending'];
+      if (active.includes(current)) {
+        parent.triggerStatus = 'waiting';
+      }
+      return { status: 200, body: { ready: false, status: parent.triggerStatus ?? current } };
     }
 
     // Events
@@ -428,6 +527,10 @@ export class MockHttpServer {
       input: data.input ?? null,
       output: null,
       error: null,
+      // Task 3.1: vars snapshot starts unset (undefined); first dispatch's
+      // POST /runs/status/<id>/vars-snapshot writes it write-once. Stored
+      // value is the SolidActionsJSON-stringified Record<string, VarValue>.
+      vars: data.vars,
       createdAt: data.createdAt || Date.now(),
       updatedAt: Date.now(),
       queueName: data.queueName,
@@ -438,10 +541,26 @@ export class MockHttpServer {
       priority: data.priority ?? 0,
       queuePartitionKey: data.queuePartitionKey,
       forkedFrom: data.forkedFrom,
+      childResultFunctionID: data.childResultFunctionID,
+      // Task 2.7: derive the parent from the deterministic child uuid
+      // (`${parent}-child-<funcId>`). The real backend instead re-derives the
+      // parent from the authenticated bearer trigger; the mock models the same
+      // resulting parent→child link so completeChild() can write the
+      // parent-keyed durable op the SDK's getResult reads.
+      parentWorkflowID: data.childResultFunctionID !== undefined ? workflowUUID.replace(/-child-\d+$/, '') : undefined,
     };
 
     this.store.workflows.set(workflowUUID, workflow);
     this.store.operations.set(workflowUUID, []);
+
+    // Task 2.7 (Codex fix#3): child creation does NOT mark the parent trigger
+    // `waiting`. The real backend (RunStatusController::ensureChildTrigger) no
+    // longer pre-marks the parent at child-create — the parent is not yet
+    // blocked there (the SDK permits arbitrary parent work between
+    // startWorkflow() and getResult()). The ONLY transition of the parent to
+    // `waiting` is the atomic /child-wait CAS, modeled by the mock's
+    // /child-wait handler. Mirror the corrected backend field-for-field: no
+    // pre-mark here.
 
     return {
       status: 201,
@@ -485,6 +604,16 @@ export class MockHttpServer {
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
     }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.recordOutput —
+    // a row already in CANCELLED must NOT be clobbered to SUCCESS/ERROR by a
+    // late output PUT racing the cancel. A CANCELLED → CANCELLED write (the
+    // one-shot cancelled terminal-state write) is the no-op idempotent case.
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
+    }
     workflow.output = data.output;
     workflow.status = data.status;
     workflow.updatedAt = Date.now();
@@ -499,10 +628,44 @@ export class MockHttpServer {
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
     }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.recordError —
+    // a row already in CANCELLED must NOT be clobbered to ERROR by a late
+    // error PUT racing the cancel.
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
+    }
     workflow.error = data.error;
     workflow.status = data.status;
     workflow.updatedAt = Date.now();
     return { status: 200, body: {} };
+  }
+
+  /**
+   * Task 3.1 — write-once vars snapshot.
+   *
+   * First call on a row with no snapshot: stores `data.vars` and returns it.
+   * Every subsequent call: IGNORES the supplied `data.vars` and returns the
+   * stored value (first-write-wins, same atomicity contract as `input`).
+   * Missing row: 404. The SDK's invoke() seeds a fresh per-dispatch ctx.vars
+   * via this endpoint; the second-and-later dispatches see the snapshot from
+   * the first dispatch even when the adapter-supplied env vars have changed.
+   */
+  private captureVarsSnapshot(workflowUUID: string, data: { vars: string }): { status: number; body: unknown } {
+    const workflow = this.store.workflows.get(workflowUUID);
+    if (!workflow) {
+      return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
+    }
+    if (workflow.vars === undefined || workflow.vars === null) {
+      // First dispatch — capture.
+      workflow.vars = data.vars ?? null;
+      workflow.updatedAt = Date.now();
+    }
+    // Always return the stored snapshot (the supplied body is ignored on
+    // subsequent calls — write-once / first-write-wins).
+    return { status: 200, body: { vars: workflow.vars } };
   }
 
   private getResult(workflowUUID: string): { status: number; body: unknown } {
@@ -530,6 +693,16 @@ export class MockHttpServer {
     const workflow = this.store.workflows.get(workflowUUID);
     if (!workflow) {
       return { status: 404, body: { message: 'Workflow not found', type: 'workflow_not_found' } };
+    }
+    // Task 2.8 backend-guard parity: mirror RunStatusController.updateStatus —
+    // a CANCELLED run is terminal; the recovery-loop status setter must NOT
+    // silently move it out of CANCELLED. An idempotent CANCELLED → CANCELLED
+    // write is allowed (the one sanctioned idempotent path).
+    if (workflow.status === StatusString.CANCELLED && data.status !== StatusString.CANCELLED) {
+      return {
+        status: 409,
+        body: { message: 'Run already cancelled', type: 'run_already_cancelled' },
+      };
     }
     workflow.status = data.status;
     if (data.resetRecoveryAttempts) {
@@ -627,16 +800,34 @@ export class MockHttpServer {
   private getOperation(workflowUUID: string, functionId: number): { status: number; body: unknown } {
     const ops = this.store.operations.get(workflowUUID) || [];
     const op = ops.find((o) => o.functionId === functionId);
+    const workflow = this.store.workflows.get(workflowUUID);
+    const runCancelled = workflow?.status === StatusString.CANCELLED;
     if (!op) {
+      // Mirror the real OperationController::show: a CANCELLED run
+      // short-circuits EVERY operation fetch with cancelled:true even when no
+      // operation row exists for the requested functionID, so the SDK's
+      // getOperationResultAndThrowIfCancelled throws and the workflow aborts
+      // on its next durable checkpoint. Otherwise the empty result is null.
+      if (runCancelled) {
+        return {
+          status: 200,
+          body: {
+            output: null,
+            error: null,
+            cancelled: true,
+            childWorkflowID: null,
+            functionName: null,
+          },
+        };
+      }
       return { status: 200, body: null };
     }
-    const workflow = this.store.workflows.get(workflowUUID);
     return {
       status: 200,
       body: {
         output: op.output,
         error: op.error,
-        cancelled: workflow?.status === StatusString.CANCELLED,
+        cancelled: runCancelled,
         childWorkflowID: op.childWorkflowId,
         functionName: op.functionName,
       },
@@ -793,6 +984,435 @@ export class MockHttpServer {
     const dispatchKey = `${d.service_name}:${d.workflow_fn_name}:${d.key}`;
     this.store.eventDispatch.set(dispatchKey, data);
     return { status: 200, body: data };
+  }
+
+  // ==========================================
+  // Identity-isolation assertion (read-only)
+  // ==========================================
+
+  /**
+   * Concurrency proof helper (Task 1.4). READ-ONLY: inspects the recorded
+   * requestLog only — never mutates store or affects routing/responses.
+   *
+   * Correlates each backend request to its issuing run via TWO independent
+   * on-the-wire identity dimensions and asserts they agree:
+   *
+   *   A) the workflowID embedded in the request path — every workflow-scoped
+   *      route is `/runs/status/<workflowID>/...` (the SDK's natural run key,
+   *      = ctx.run.runUuid), and
+   *   B) the `Authorization: Bearer <apiKey>` header — sourced from ctx.api.key
+   *      via a SEPARATE per-request HttpClient instance, NOT derived from the
+   *      path.
+   *
+   * For every workflow-scoped request, the bearer MUST equal the apiKey the
+   * run identified by the path was constructed with (passed in
+   * `expectedKeyByRun`, keyed by runUuid). If any request for run-i carries a
+   * different run's bearer (e.g. run-j's apiKey leaking through shared/global
+   * state), A and B disagree and this throws with a precise message naming the
+   * offending request. Returns `true` only when every workflow-scoped request
+   * is internally identity-consistent.
+   *
+   * This is genuinely falsifiable, not a tautology: A (path) and B (bearer)
+   * are produced by independent machinery, so a cross-request identity leak
+   * would surface as a path/bearer mismatch and fail this check.
+   *
+   * @param expectedKeyByRun map of runUuid -> the apiKey that run was built
+   *   with. Runs not present in the map are ignored (non-workflow / health
+   *   requests carry no run key and are skipped automatically).
+   */
+  assertNoIdentityCrossContamination(expectedKeyByRun: Record<string, string>): boolean {
+    // Matches `/runs/status/<workflowID>/...` (raw path is logged BEFORE the
+    // route() normalization, so this is the on-the-wire path).
+    const runPathRe = /^\/runs\/status\/([^/?]+)/;
+
+    for (let i = 0; i < this.requestLog.length; i++) {
+      const entry = this.requestLog[i];
+      const match = runPathRe.exec(entry.path);
+      if (!match) {
+        // Not a workflow-scoped request (e.g. /health) — no run key on the
+        // wire to correlate; skip.
+        continue;
+      }
+
+      const runUuid = decodeURIComponent(match[1]);
+      const expectedKey = expectedKeyByRun[runUuid];
+      if (expectedKey === undefined) {
+        // This run was not part of the asserted set — skip.
+        continue;
+      }
+
+      // Dimension B: the bearer that actually rode on this request.
+      const rawAuth = entry.headers['authorization'];
+      const authHeader = Array.isArray(rawAuth) ? rawAuth[0] : rawAuth;
+      const prefix = 'Bearer ';
+      if (typeof authHeader !== 'string' || !authHeader.startsWith(prefix)) {
+        throw new Error(
+          `Identity cross-contamination check: request #${i} ${entry.method} ${entry.path} ` +
+            `(run "${runUuid}") carried no usable Authorization bearer (got: ${JSON.stringify(rawAuth)}). ` +
+            `Cannot prove identity isolation without an on-the-wire bearer.`,
+        );
+      }
+      const actualKey = authHeader.slice(prefix.length);
+
+      // The proof: path-derived run identity (A) MUST agree with the
+      // independently-sourced bearer identity (B).
+      if (actualKey !== expectedKey) {
+        const leakedRun =
+          Object.keys(expectedKeyByRun).find((r) => expectedKeyByRun[r] === actualKey) ?? '<unknown run>';
+        throw new Error(
+          `IDENTITY CROSS-CONTAMINATION DETECTED: request #${i} ${entry.method} ${entry.path} ` +
+            `is path-scoped to run "${runUuid}" (expected bearer "${expectedKey}") but its ` +
+            `Authorization header carried bearer "${actualKey}", which belongs to run ` +
+            `"${leakedRun}". A concurrent invoke leaked another run's api.key onto this ` +
+            `request — per-request identity isolation is broken.`,
+        );
+      }
+    }
+
+    return true;
+  }
+
+  // ==========================================
+  // One-shot compat-layer observation accessors (read-only)
+  // ==========================================
+
+  /**
+   * Task 2.3 (READ-ONLY): the body of the most recent workflow-completion POST,
+   * or undefined if none was observed.
+   *
+   * The SDK's completion path (legacy executor AND the new one-shot run() compat
+   * layer) reports terminal status via `POST /runs/status/<id>/workflow-complete`
+   * with body `{ status: 'completed' | 'failed', output?, error? }`
+   * (HttpSystemDatabase.reportWorkflowComplete). This route has no store handler
+   * — it is intentionally a fire-and-forget infrastructure signal — so the only
+   * faithful place to observe it is the recorded requestLog. This accessor
+   * inspects requestLog only; it never mutates store or affects routing.
+   */
+  lastWorkflowComplete(): { status: 'completed' | 'failed'; output?: unknown; error?: unknown } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/workflow-complete$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return entry.body as {
+          status: 'completed' | 'failed';
+          output?: unknown;
+          error?: unknown;
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.3 (READ-ONLY): the body of the most recent durable-sleep schedule
+   * POST, or undefined if none was observed.
+   *
+   * Durable sleep posts `{ functionID, duration, wakeupTime }` to
+   * `POST /runs/status/<id>/sleep` (the sleep route returns `{}` and stores
+   * nothing). Inspects requestLog only; never mutates store or affects routing.
+   */
+  /**
+   * Task 2.7 (READ-ONLY): the body of the most recent child-create POST
+   * (`POST /runs/status` carrying `childResultFunctionID`), or undefined.
+   * Mirrors the real backend's child branch trigger: this is the exact call
+   * the SDK already makes for a child via initWorkflowStatus, plus the one
+   * protocol addition. Inspects requestLog only.
+   */
+  lastChildCreate():
+    | {
+        workflowUUID: string;
+        workflowName: string;
+        childResultFunctionID: number;
+        applicationID: string;
+        input: string | null;
+      }
+    | undefined {
+    const re = /\/(?:runs\/status|workflows)$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const b = entry.body as { childResultFunctionID?: number } | undefined;
+      if (entry.method === 'POST' && re.test(entry.path) && b?.childResultFunctionID !== undefined) {
+        return entry.body as {
+          workflowUUID: string;
+          workflowName: string;
+          childResultFunctionID: number;
+          applicationID: string;
+          input: string | null;
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.7 test-driver — simulate the BACKEND completion hook for a child
+   * workflow EXACTLY as TriggerCompletionService::notifyParentOfChildCompletion
+   * does it, field-for-field, INCLUDING the FIX-1 lost-wakeup-safe re-pend:
+   *   1. mark the child run terminal (SUCCESS/ERROR);
+   *   2. write the PARENT-keyed durable op (parent run uuid, child's
+   *      childResultFunctionID) carrying child_workflow_id + output|error —
+   *      the row the SDK's getResult reads via
+   *      getOperationResultAndThrowIfCancelled; AND
+   *   3. apply the REAL re-pend rule to the parent's TRIGGER status: the
+   *      backend re-pends (triggerStatus → 'pending') for ANY parent that is
+   *      NOT terminal/cancelled and NOT already pending/queued — the exact
+   *      `$terminalOrInFlight` gate in notifyParentOfChildCompletion. This is
+   *      what makes the lost-wakeup convergence true: a parent that is
+   *      `started` (mid-replay) or `waiting` is re-pended; a finished or
+   *      in-flight parent is not double-dispatched.
+   *
+   * The harness models the resulting scheduler re-invoke by the test invoking
+   * the parent again (same as it models sleep/recv resume). triggerStatus is
+   * left at 'pending' after a re-pend so a test can assert the parent WAS
+   * re-pended (no lost wakeup) vs. NOT (terminal/in-flight).
+   *
+   * FIX 1 failure invariant: on `error`, the parent-keyed op error is NEVER
+   * null and is ALWAYS a JSON-parseable serialized envelope — the exact
+   * guarantee TriggerCompletionService::notifyParentOfChildCompletion now
+   * makes (it wraps a plain/absent child error into `{name,message}` so the
+   * SDK's deserializeError(SolidActionsJSON.parse(error)) rethrows and the
+   * parent fails fast instead of stalling). NO field here is absent from /
+   * divergent from the real backend.
+   */
+  completeChild(childWorkflowID: string, result: { output?: string; error?: string }): void {
+    const child = this.store.workflows.get(childWorkflowID);
+    if (!child || child.childResultFunctionID === undefined || !child.parentWorkflowID) {
+      throw new Error(`completeChild: ${childWorkflowID} is not a tracked child run`);
+    }
+
+    child.status = result.error ? StatusString.ERROR : StatusString.SUCCESS;
+    child.output = result.output ?? null;
+    child.error = result.error ?? null;
+    child.updatedAt = Date.now();
+
+    const parentOps = this.store.operations.get(child.parentWorkflowID);
+    if (!parentOps) {
+      throw new Error(`completeChild: parent ${child.parentWorkflowID} has no operation store`);
+    }
+    const fnId = child.childResultFunctionID;
+    const existing = parentOps.find((o) => o.functionId === fnId);
+    const row: MockOperation = {
+      workflowUUID: child.parentWorkflowID,
+      functionId: fnId,
+      functionName: 'SolidActions.startWorkflow',
+      output: result.output ?? null,
+      error: result.error ?? null,
+      childWorkflowId: childWorkflowID,
+      startedAtEpochMs: Date.now(),
+      completedAtEpochMs: Date.now(),
+    };
+    if (existing) {
+      Object.assign(existing, row);
+    } else {
+      parentOps.push(row);
+    }
+
+    // Step 3: the FIX-1 re-pend rule on the parent TRIGGER status. Mirror the
+    // exact `$terminalOrInFlight` gate in notifyParentOfChildCompletion.
+    this.rependParentTrigger(child.parentWorkflowID);
+  }
+
+  /**
+   * Task 2.7 (FIX 1/3) test-driver — simulate the INFRA-FALLBACK child failure
+   * path (RunnerController::failTrigger / container-exit / reaper) where the
+   * child completes WITHOUT its SDK ever writing a structured RunStatus.error.
+   * Models TriggerCompletionService::notifyParentOfChildCompletion's failure
+   * invariant FAITHFULLY: the parent-keyed op error is a NON-NULL JSON
+   * envelope `{name:'Error',message:<infraError>}` (the backend wraps the
+   * plain infra error string into the serialize-error shape), output is null,
+   * and the parent is re-pended per the SAME rule as completeChild. This is
+   * the exact row the real failTrigger path now produces — no fiction; the
+   * matching app Feature test proves the backend writes this shape.
+   */
+  failChildFromInfra(childWorkflowID: string, infraError: string): void {
+    const child = this.store.workflows.get(childWorkflowID);
+    if (!child || child.childResultFunctionID === undefined || !child.parentWorkflowID) {
+      throw new Error(`failChildFromInfra: ${childWorkflowID} is not a tracked child run`);
+    }
+    // Infra fallback marks the child run ERROR (status-only — the SDK never
+    // wrote a structured error itself).
+    child.status = StatusString.ERROR;
+    child.output = null;
+    child.error = null;
+    child.updatedAt = Date.now();
+
+    const parentOps = this.store.operations.get(child.parentWorkflowID);
+    if (!parentOps) {
+      throw new Error(`failChildFromInfra: parent ${child.parentWorkflowID} has no operation store`);
+    }
+    // Backend invariant: serialized, non-null, JSON-parseable error envelope.
+    const serialized = JSON.stringify({ name: 'Error', message: infraError });
+    const fnId = child.childResultFunctionID;
+    const existing = parentOps.find((o) => o.functionId === fnId);
+    const errorRow: MockOperation = {
+      workflowUUID: child.parentWorkflowID,
+      functionId: fnId,
+      functionName: 'SolidActions.startWorkflow',
+      output: null,
+      error: serialized,
+      childWorkflowId: childWorkflowID,
+      startedAtEpochMs: Date.now(),
+      completedAtEpochMs: Date.now(),
+    };
+    if (existing) {
+      Object.assign(existing, errorRow);
+    } else {
+      parentOps.push(errorRow);
+    }
+    this.rependParentTrigger(child.parentWorkflowID);
+  }
+
+  /**
+   * The REAL corrected `notifyParentOfChildCompletion` re-pend gate
+   * (Codex fix#2, DEFECT 1a), shared by completeChild + failChildFromInfra.
+   * Re-pend (triggerStatus → 'pending') ONLY when the parent is genuinely
+   * blocked-waiting on the child (`waiting`). An IN-FLIGHT parent
+   * (started/running/dispatched/queued/pending) is NOT re-pended — the live
+   * parent reads the op itself / its /child-wait CAS returns ready; re-pending
+   * a running session would double-dispatch and reopen the lost-wakeup window.
+   * TERMINAL (completed/failed/cancelled/dispatch_failed) is never re-pended
+   * (no resurrection — DEFECT 5). This is field-for-field the app backend's
+   * gate; the op is ALWAYS written first (in completeChild/failChildFromInfra)
+   * as the single source of truth regardless of the parent's state.
+   */
+  private rependParentTrigger(parentWorkflowID: string): void {
+    const parent = this.store.workflows.get(parentWorkflowID);
+    if (!parent) {
+      return;
+    }
+    const current = parent.triggerStatus ?? 'started';
+    if (current === 'waiting') {
+      parent.triggerStatus = 'pending';
+    }
+  }
+
+  /**
+   * Task 2.7 (FIX 1/3, READ-ONLY): the most recent child-wait POST body
+   * (`POST /runs/status/<id>/child-wait`), or undefined. This is the
+   * server-side waiting-state marking the SDK's getResult() does BEFORE
+   * throwing SuspensionRequired('child') — the lost-wakeup fix. Inspects
+   * requestLog only; never mutates store or affects routing.
+   */
+  lastChildWait(): { runID: string; functionID: number } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/child-wait$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'POST' && m) {
+        return {
+          runID: decodeURIComponent(m[1]),
+          functionID: (entry.body as { functionID: number }).functionID,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /** Task 2.7 (FIX 3, READ-ONLY): a parent run's modeled TRIGGER status. */
+  triggerStatusOf(workflowUUID: string): string | undefined {
+    return this.store.workflows.get(workflowUUID)?.triggerStatus;
+  }
+
+  lastSleepSchedule(): { functionID: number; duration: number; wakeupTime: number } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/sleep$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return entry.body as { functionID: number; duration: number; wakeupTime: number };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `PUT /runs/status/<id>/output` (the durable success status-row
+   * write — HttpSystemDatabase.recordWorkflowOutput), or undefined if none.
+   *
+   * Returns the requestLog index alongside the body+workflowID so tests can
+   * assert ORDER (the PUT must precede the workflow-complete POST) and prove the
+   * path's run id is the ctx run uuid. The /output route HAS a store handler
+   * (recordOutput); this accessor still reads requestLog only — it never mutates
+   * store or affects routing.
+   */
+  lastOutputPut(): { index: number; workflowID: string; body: { output?: unknown; status?: unknown } } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/output$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'PUT' && m) {
+        return {
+          index: i,
+          workflowID: decodeURIComponent(m[1]),
+          body: entry.body as { output?: unknown; status?: unknown },
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `PUT /runs/status/<id>/error` (the durable failure status-row
+   * write — HttpSystemDatabase.recordWorkflowError), or undefined if none.
+   * Same shape/contract as {@link lastOutputPut}.
+   */
+  lastErrorPut(): { index: number; workflowID: string; body: { error?: unknown; status?: unknown } } | undefined {
+    const re = /\/(?:runs\/status|workflows)\/([^/]+)\/error$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      const m = re.exec(entry.path);
+      if (entry.method === 'PUT' && m) {
+        return {
+          index: i,
+          workflowID: decodeURIComponent(m[1]),
+          body: entry.body as { error?: unknown; status?: unknown },
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the index in `requestLog` and decoded body of the
+   * most recent `POST /runs/status` run-row CREATE (the legacy
+   * HttpSystemDatabase.initWorkflowStatus shape), or undefined if none.
+   *
+   * This is the row-create the real backend requires before recordOutput /
+   * recordError can 200 (those 404 on an absent row). Returns the requestLog
+   * index alongside the body so tests can assert ORDER (the CREATE must precede
+   * the output/error PUT) and prove the create path runs without external
+   * seeding. The `POST /runs/status` route maps to the createWorkflow store
+   * handler; this accessor still reads requestLog only — it never mutates store
+   * or affects routing. The path match is exact (no trailing segment) so it
+   * never collides with `/runs/status/<id>/...` sub-routes.
+   */
+  lastRunStatusCreate(): { index: number; body: Record<string, unknown> } | undefined {
+    const re = /^\/(?:runs\/status|workflows)$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return { index: i, body: entry.body as Record<string, unknown> };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Task 2.4b (READ-ONLY): the requestLog index of the most recent
+   * workflow-complete POST, or undefined if none. Pairs with
+   * {@link lastOutputPut}/{@link lastErrorPut} for order-sensitive assertions
+   * (PUT index must be < this index). Inspects requestLog only.
+   */
+  lastWorkflowCompleteIndex(): number | undefined {
+    const re = /\/(?:runs\/status|workflows)\/[^/]+\/workflow-complete$/;
+    for (let i = this.requestLog.length - 1; i >= 0; i--) {
+      const entry = this.requestLog[i];
+      if (entry.method === 'POST' && re.test(entry.path)) {
+        return i;
+      }
+    }
+    return undefined;
   }
 }
 

@@ -67,12 +67,17 @@ export interface SolidActionsHttpConfig {
   apiKey: string; // Required: Bearer token
   timeout?: number; // Optional: Request timeout in ms (default: 30000)
   maxRetries?: number; // Optional: Retry count (default: 3)
+  // Optional: worker session id for the X-Worker-Session-ID header. invoke()
+  // threads this from ctx.run.workerSessionId; legacy boot leaves it unset and
+  // HttpClient falls back to the SOLIDACTIONS_WORKER_SESSION_ID env var.
+  workerSessionId?: string;
 }
 
 /**
  * Get HTTP configuration from environment variables or config file
  */
 export function getHttpConfig(configFile?: ConfigFile): SolidActionsHttpConfig {
+  /* boot-only */ // legacy boot/CLI config resolution; invoke() takes api.url/key from ctx.api, never these env vars
   const apiUrl = process.env.SOLIDACTIONS_API_URL ?? configFile?.api?.url;
   const apiKey = process.env.SOLIDACTIONS_API_KEY ?? configFile?.api?.key;
   const timeout = process.env.SOLIDACTIONS_API_TIMEOUT
@@ -131,6 +136,7 @@ export interface ConfigFile {
  * Will find anything in curly braces like ${VAR_NAME}.
  */
 export function substituteEnvVars(content: string): string {
+  /* boot-only */ // legacy config-file (solidactions-config.yaml) env interpolation; not on the invoke() workflow path
   const regex = /\${([^}]+)}/g;
   return content.replace(regex, (_, g1: string) => {
     return process.env[g1] || '""';

@@ -47,11 +47,24 @@ export function defaultEnableOTLP() {
   return process.env.SOLIDACTIONS__CLOUD === 'true';
 }
 
-export const globalParams = {
-  appVersion: process.env.SOLIDACTIONS__APPVERSION || '', // The one true source of appVersion
+/* boot-only */
+/**
+ * Boot-time identity for the LEGACY `SolidActionsExecutor` / `launch()` path
+ * ONLY. The workflow EXECUTION path (invoke()) never reads this — it takes
+ * identity strictly from `ctx` via the ALS runtime scope (see
+ * src/invoke/runtime-scope.ts). This object is mutated during the legacy
+ * launch()/executor.init()/shutdown() lifecycle (e.g. computed appVersion);
+ * that mutability is load-bearing for the legacy path and must be preserved.
+ *
+ * The former process-wide ambient-identity global was deleted in Task 2.4a to
+ * make the deglobalization explicit; `bootParams` is the narrowly-scoped,
+ * clearly-named survivor confined to legacy boot/CLI code (never `src/invoke/*`).
+ */
+export const bootParams = {
+  appVersion: process.env.SOLIDACTIONS__APPVERSION || '', // The one true source of appVersion (legacy boot)
   wasComputed: false, // Was app version set or computed? Stored procs don't support computed versions.
-  executorID: process.env.SOLIDACTIONS_RUN_ID || 'local', // The one true source of executorID
-  appID: process.env.SOLIDACTIONS__APPID || '', // The one true source of appID
+  executorID: process.env.SOLIDACTIONS_RUN_ID || 'local', // The one true source of executorID (legacy boot)
+  appID: process.env.SOLIDACTIONS__APPID || '', // The one true source of appID (legacy boot)
   enableOTLP: defaultEnableOTLP(), // Whether OTLP is enabled
   solidActionsVersion: loadSolidActionsVersion(), // The version of the SolidActions library
 };

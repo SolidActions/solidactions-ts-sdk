@@ -11,7 +11,7 @@ import type { ExportResult } from '@opentelemetry/core';
 import type { Span } from '@opentelemetry/sdk-trace-base';
 import type { LogRecord } from '@opentelemetry/api-logs';
 import { OTLPExporterConfig } from '../solidactions-executor';
-import { globalParams } from '../utils';
+import { bootParams } from '../utils';
 
 // As SolidActions OTLP is optional, OTLP objects must only be dynamically imported
 // and only when OTLP is enabled. Importing OTLP types is fine as long
@@ -37,7 +37,7 @@ export class TelemetryExporter implements ITelemetryExporter {
   private readonly logsExporters: OTLPLogExporter[] = [];
 
   constructor(config: OTLPExporterConfig) {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return;
     }
     const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-proto');
@@ -65,7 +65,7 @@ export class TelemetryExporter implements ITelemetryExporter {
   }
 
   async export(signals: object[]): Promise<void> {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return;
     }
     const { ExportResultCode } = require('@opentelemetry/core');
@@ -118,7 +118,7 @@ export class TelemetryExporter implements ITelemetryExporter {
   }
 
   async flush() {
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       return;
     }
     for (const exporter of this.tracesExporters) {

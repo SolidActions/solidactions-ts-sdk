@@ -1,5 +1,5 @@
 import { SolidActionsExecutor } from '../solidactions-executor';
-import { globalParams } from '../utils';
+import { bootParams } from '../utils';
 import WebSocket from 'ws';
 import * as protocol from './protocol';
 import { GetWorkflowsInput, StatusString } from '..';
@@ -125,11 +125,11 @@ export class Conductor {
           case protocol.MessageType.EXECUTOR_INFO:
             const infoResp = new protocol.ExecutorInfoResponse(
               baseMsg.request_id,
-              globalParams.executorID,
-              globalParams.appVersion,
+              bootParams.executorID,
+              bootParams.appVersion,
               hostname(),
               'typescript',
-              globalParams.solidActionsVersion,
+              bootParams.solidActionsVersion,
             );
             currWebsocket.send(JSON.stringify(infoResp));
             this.solidActionsExec.logger.info('Connected to SolidActions conductor');

@@ -6,7 +6,7 @@
 import type { Logger as OTelLogger, LogAttributes } from '@opentelemetry/api-logs';
 import type { LoggerProvider as LoggerProviderType } from '@opentelemetry/sdk-logs';
 import { TelemetryCollector } from './collector';
-import { globalParams, interceptStreams } from '../utils';
+import { bootParams, interceptStreams } from '../utils';
 import { SolidActionsJSON } from '../serialization';
 import { LoggerConfig } from '../solidactions-executor';
 import { SolidActionsSpan } from './traces';
@@ -68,7 +68,7 @@ export class GlobalLogger {
     appName: string = 'solidactions',
   ) {
     this.addContextMetadata = config?.addContextMetadata || false;
-    if (!globalParams.enableOTLP) {
+    if (!bootParams.enableOTLP) {
       this.logger = new SolidActionsConsoleLogger(config ?? {});
       return;
     }
@@ -110,8 +110,8 @@ export class GlobalLogger {
           processors: [logRecordProcessor],
         });
         this.otelLogger = loggerProvider.getLogger('solidactions-logger');
-        this.applicationID = globalParams.appID;
-        this.executorID = globalParams.executorID;
+        this.applicationID = bootParams.appID;
+        this.executorID = bootParams.executorID;
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -141,7 +141,7 @@ export class GlobalLogger {
             spanId: span?.spanContext()?.spanId,
             stack,
             applicationID: this.applicationID,
-            applicationVersion: globalParams.appVersion,
+            applicationVersion: bootParams.appVersion,
             executorID: this.executorID,
           } as LogAttributes,
         });
@@ -163,14 +163,14 @@ export class GlobalLogger {
     );
     let otlpTransport: OTLPLogQueueTransport | undefined = undefined;
     // Only enable the OTLP transport if we have a telemetry collector and an exporter
-    if (globalParams.enableOTLP && this.telemetryCollector?.exporter) {
+    if (bootParams.enableOTLP && this.telemetryCollector?.exporter) {
       otlpTransport = new OTLPLogQueueTransport(this.telemetryCollector, config?.logLevel || 'info');
       winstonTransports.push(otlpTransport);
     }
     this.logger = createLogger({ transports: winstonTransports });
 
     if (
-      globalParams.enableOTLP &&
+      bootParams.enableOTLP &&
       process.env.SOLIDACTIONS__CAPTURE_STD !== 'false' &&
       this.telemetryCollector?.exporter
     ) {
@@ -331,7 +331,7 @@ function getConsoleFormat() {
     format.colorize(),
     format.printf((info) => {
       const { timestamp, level, message, stack } = info;
-      const applicationVersion = globalParams.appVersion;
+      const applicationVersion = bootParams.appVersion;
       const ts = typeof timestamp === 'string' ? timestamp.slice(0, 19).replace('T', ' ') : undefined;
       const formattedStack = typeof stack === 'string' ? stack?.split('\n').slice(1).join('\n') : undefined;
 
