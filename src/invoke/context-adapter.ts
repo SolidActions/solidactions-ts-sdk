@@ -22,7 +22,7 @@ export type { ConnectionBroker };
  * A one-arg adapter signature: converts a flat transport map (e.g. process.env)
  * into a fully-typed InvokeCtx.
  */
-export type ContextAdapter = (transport: Record<string, string>) => InvokeCtx;
+export type ContextAdapter = (transport: Record<string, string>) => Promise<InvokeCtx>;
 
 /**
  * Reserved env keys that are never forwarded into ctx.vars.
@@ -133,16 +133,25 @@ export function makeConnectionVar(
  * Raw JSON.parse here was the defect: it returned the SuperJSON envelope itself
  * for child-dispatched runs, so all input-derived fields came out null/undefined.
  */
-export function oneShotContextAdapter(transport: Record<string, string>): InvokeCtx {
-  // --- input ---
+export async function oneShotContextAdapter(transport: Record<string, string>): Promise<InvokeCtx> {
+  // --- input: WORKFLOW_INPUT, else WORKFLOW_INPUT_URL (fetched), else {} ---
   let input: unknown = {};
   if (transport['WORKFLOW_INPUT'] !== undefined) {
     try {
       input = SolidActionsJSON.parse(transport['WORKFLOW_INPUT']);
     } catch (err) {
-      throw new Error(
-        `[ContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`,
-      );
+      throw new Error(`[ContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
+    }
+  } else if (transport['WORKFLOW_INPUT_URL'] !== undefined) {
+    const res = await fetch(transport['WORKFLOW_INPUT_URL']);
+    if (!res.ok) {
+      throw new Error(`[ContextAdapter] WORKFLOW_INPUT_URL fetch failed: ${res.status} ${res.statusText}`);
+    }
+    const raw = await res.text();
+    try {
+      input = SolidActionsJSON.parse(raw);
+    } catch (err) {
+      throw new Error(`[ContextAdapter] WORKFLOW_INPUT_URL contains invalid JSON: ${String(err)}`);
     }
   }
 

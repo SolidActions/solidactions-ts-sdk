@@ -275,9 +275,7 @@ export function isEntrypointModule(callerUrl: string): boolean {
 
   let callerPath: string;
   try {
-    callerPath = callerUrl.startsWith('file:')
-      ? fileURLToPath(callerUrl)
-      : callerUrl;
+    callerPath = callerUrl.startsWith('file:') ? fileURLToPath(callerUrl) : callerUrl;
   } catch {
     // Malformed file: URL — cannot identify; fail safe (not entrypoint).
     return false;
@@ -318,11 +316,7 @@ export function isEntrypointModule(callerUrl: string): boolean {
  * @param executed - `__anyEntrypointRunExecuted` at exit time.
  * @param skipped - `__anyRunSkippedForNonEntrypoint` at exit time.
  */
-export function __shouldFailLoudOnExit(
-  oneShotPresent: boolean,
-  executed: boolean,
-  skipped: boolean,
-): boolean {
+export function __shouldFailLoudOnExit(oneShotPresent: boolean, executed: boolean, skipped: boolean): boolean {
   return oneShotPresent && !executed && skipped;
 }
 
@@ -346,9 +340,7 @@ export function __shouldFailLoudOnExit(
  * @param currentCode - the value of `process.exitCode` at exit time.
  * @returns 1 when the handler should set the code, or undefined to leave it.
  */
-export function __failLoudExitCode(
-  currentCode: number | string | undefined | null,
-): number | undefined {
+export function __failLoudExitCode(currentCode: number | string | undefined | null): number | undefined {
   // Treat undefined / null / 0 (and the string '0') as "unset/success" — only
   // those are safe to overwrite with our misconfig signal.
   if (currentCode === undefined || currentCode === null || currentCode === 0 || currentCode === '0') {
@@ -385,13 +377,7 @@ function __installFailLoudExitHandler(): void {
   }
   __failLoudExitHandlerInstalled = true;
   process.on('exit', () => {
-    if (
-      __shouldFailLoudOnExit(
-        __oneShotModePresent(),
-        __anyEntrypointRunExecuted,
-        __anyRunSkippedForNonEntrypoint,
-      )
-    ) {
+    if (__shouldFailLoudOnExit(__oneShotModePresent(), __anyEntrypointRunExecuted, __anyRunSkippedForNonEntrypoint)) {
       console.error(
         `[solidactions] FATAL: the dispatched one-shot module's top-level ` +
           `runIfEntrypoint() was skipped as non-entrypoint and NO workflow ran ` +
@@ -848,7 +834,7 @@ export class SolidActions {
     const { oneShotRuntimeAdapter } = require('./invoke/runtime-adapter') as typeof import('./invoke/runtime-adapter');
 
     const descriptor = SolidActions.#toWorkflowDescriptor<T, R>(workflow, options?.input);
-    const ctx = oneShotContextAdapter(process.env as Record<string, string>);
+    const ctx = await oneShotContextAdapter(process.env as Record<string, string>);
 
     // Derive workflowName the way the legacy executor did
     // (src/solidactions-executor.ts:374-375 `wfname = getRegisteredFunctionFullName(wf).name`;
@@ -1597,7 +1583,9 @@ export class SolidActions {
         if (typeof name === 'string' && name.length > 0 && __getRegisteredWorkflow(name)) {
           return invokeStartChildWorkflowByName(name);
         }
-        throw SolidActions.#workflowNotRegisteredError(typeof name === 'string' && name.length > 0 ? name : '<anonymous-descriptor>');
+        throw SolidActions.#workflowNotRegisteredError(
+          typeof name === 'string' && name.length > 0 ? name : '<anonymous-descriptor>',
+        );
       }
 
       // (b) bare string name (look up directly in the registry).
@@ -1657,8 +1645,15 @@ export class SolidActions {
     // launcher rework). If they reach here, the caller invoked startWorkflow
     // outside an invoke scope — reject with a clear error rather than
     // crashing in Proxy/getRegisteredOperations.
-    if (typeof target === 'string' || (typeof target === 'object' && target !== null && typeof (target as WorkflowDescriptor<unknown, unknown>).run === 'function' && !(target instanceof ConfiguredInstance))) {
-      const ident = typeof target === 'string' ? target : ((target as WorkflowDescriptor<unknown, unknown>).name ?? '<descriptor>');
+    if (
+      typeof target === 'string' ||
+      (typeof target === 'object' &&
+        target !== null &&
+        typeof (target as WorkflowDescriptor<unknown, unknown>).run === 'function' &&
+        !(target instanceof ConfiguredInstance))
+    ) {
+      const ident =
+        typeof target === 'string' ? target : ((target as WorkflowDescriptor<unknown, unknown>).name ?? '<descriptor>');
       throw new SolidActionsNotRegisteredError(
         ident,
         `startWorkflow(${ident}) requires an active invoke scope — call inside a workflow body`,
@@ -2141,10 +2136,7 @@ export class SolidActions {
     // invoking it routes through the per-request invoke()/ALS scope, not
     // the legacy executor.
     const descriptor: WorkflowDescriptor<unknown, unknown> = {
-      run: (ctx) =>
-        Promise.resolve(
-          (func as unknown as (input: unknown) => Promise<unknown>)(ctx.input),
-        ),
+      run: (ctx) => Promise.resolve((func as unknown as (input: unknown) => Promise<unknown>)(ctx.input)),
       name: wfName,
     };
     registerWorkflowDescriptor(descriptor, wfName);
