@@ -76,3 +76,31 @@ it('does not leak reserved keys into ctx.vars but keeps scalar vars', async () =
   expect(Object.keys(ctx.vars)).not.toContain('TENANT_ID');
   expect(Object.keys(ctx.vars)).not.toContain('WORKFLOW_INPUT_URL');
 });
+
+// --- Authorization header for WORKFLOW_INPUT_URL (the bug — resident path) ---
+
+it('sends Authorization: Bearer <SOLIDACTIONS_API_KEY> when fetching WORKFLOW_INPUT_URL on the resident path (real local auth-gated server, no mocks)', async () => {
+  const expectedApiKey = '7:secret'; // same as body() default fixture
+  const payload = JSON.stringify({ resident: true });
+  const http = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    const authHeader = req.headers['authorization'] ?? '';
+    if (authHeader !== `Bearer ${expectedApiKey}`) {
+      res.writeHead(401, 'Unauthorized');
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(payload);
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const addr = srv.address() as import('node:net').AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}/workflow-input`;
+  try {
+    // SOLIDACTIONS_API_KEY is set in the body() fixture's envVars.
+    const ctx = await residentContextAdapter(body({ WORKFLOW_INPUT_URL: url }));
+    expect(ctx.input).toEqual({ resident: true });
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+});

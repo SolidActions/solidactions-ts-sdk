@@ -194,3 +194,63 @@ it('throws a descriptive error when WORKFLOW_INPUT_URL returns 200 with a non-JS
     await new Promise<void>((r) => srv.close(() => r()));
   }
 });
+
+// --- Authorization header for WORKFLOW_INPUT_URL (the bug) ---
+// The endpoint requires Bearer auth (triggerId:runSecret = SOLIDACTIONS_API_KEY).
+// Without the header the server returns 401, which used to throw and abort the run.
+
+it('sends Authorization: Bearer <SOLIDACTIONS_API_KEY> when fetching WORKFLOW_INPUT_URL (real local auth-gated server, no mocks)', async () => {
+  const expectedApiKey = '42:supersecret';
+  const payload = JSON.stringify({ answer: 42 });
+  const http = await import('node:http');
+  // Real server that enforces Bearer auth — returns 401 without the correct header.
+  const srv = http.createServer((req, res) => {
+    const authHeader = req.headers['authorization'] ?? '';
+    if (authHeader !== `Bearer ${expectedApiKey}`) {
+      res.writeHead(401, 'Unauthorized');
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(payload);
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const addr = srv.address() as import('node:net').AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}/workflow-input`;
+  try {
+    // With the correct api key: succeeds and parses the payload.
+    const ctx = await oneShotContextAdapter({
+      WORKFLOW_INPUT_URL: url,
+      SOLIDACTIONS_API_KEY: expectedApiKey,
+    });
+    expect(ctx.input).toEqual({ answer: 42 });
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+});
+
+it('throws a descriptive error when WORKFLOW_INPUT_URL fetch returns 401 because no api key is available (real local auth-gated server, no mocks)', async () => {
+  const http = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    const authHeader = req.headers['authorization'] ?? '';
+    if (!authHeader.startsWith('Bearer ')) {
+      res.writeHead(401, 'Unauthorized');
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const addr = srv.address() as import('node:net').AddressInfo;
+  const url = `http://127.0.0.1:${addr.port}/workflow-input`;
+  try {
+    // Without SOLIDACTIONS_API_KEY the adapter must still attempt the fetch
+    // (with an empty/no Bearer) and throw the 401 error descriptively.
+    await expect(oneShotContextAdapter({ WORKFLOW_INPUT_URL: url })).rejects.toThrow(
+      '[ContextAdapter] WORKFLOW_INPUT_URL fetch failed',
+    );
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+});

@@ -103,15 +103,25 @@ export function makeConnectionVar(
  * Fetches workflow input from a URL with a 30-second timeout, then parses it
  * with SolidActionsJSON.  Used by both adapters to eliminate duplication.
  *
- * @param url - The URL to fetch from.
- * @param tag - Prefix used in error messages (e.g. `'ContextAdapter'`).
+ * The endpoint (`/api/internal/workflow-input`) is protected by the
+ * `VerifyRunnerSecret` middleware in `bearer_only` mode — it requires an
+ * `Authorization: Bearer <triggerId>:<runSecret>` header.  `apiKey` is the
+ * full `SOLIDACTIONS_API_KEY` value (`triggerId:runSecret`), which is exactly
+ * what the middleware validates via `RunTrigger.run_secret`.
+ *
+ * @param url    - The URL to fetch from.
+ * @param tag    - Prefix used in error messages (e.g. `'ContextAdapter'`).
+ * @param apiKey - The `SOLIDACTIONS_API_KEY` value; sent as `Bearer` token.
  */
-async function fetchWorkflowInput(url: string, tag: string): Promise<unknown> {
+async function fetchWorkflowInput(url: string, tag: string, apiKey: string): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   let res: Response;
   try {
-    res = await fetch(url, { signal: controller.signal });
+    res = await fetch(url, {
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error(`[${tag}] WORKFLOW_INPUT_URL fetch timed out after 30s`);
@@ -178,7 +188,11 @@ export async function oneShotContextAdapter(transport: Record<string, string>): 
       throw new Error(`[ContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
     }
   } else if (transport['WORKFLOW_INPUT_URL'] !== undefined) {
-    input = await fetchWorkflowInput(transport['WORKFLOW_INPUT_URL'], 'ContextAdapter');
+    input = await fetchWorkflowInput(
+      transport['WORKFLOW_INPUT_URL'],
+      'ContextAdapter',
+      transport['SOLIDACTIONS_API_KEY'] ?? '',
+    );
   }
 
   // --- run ---
@@ -276,7 +290,11 @@ export async function residentContextAdapter(body: ResidentRunBody): Promise<Inv
       throw new Error(`[ResidentContextAdapter] WORKFLOW_INPUT contains invalid JSON: ${String(err)}`);
     }
   } else if (env['WORKFLOW_INPUT_URL'] !== undefined) {
-    input = await fetchWorkflowInput(env['WORKFLOW_INPUT_URL'], 'ResidentContextAdapter');
+    input = await fetchWorkflowInput(
+      env['WORKFLOW_INPUT_URL'],
+      'ResidentContextAdapter',
+      env['SOLIDACTIONS_API_KEY'] ?? '',
+    );
   }
 
   // --- run identity: body top-level, falling back to envVars ---
