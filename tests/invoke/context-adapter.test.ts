@@ -66,6 +66,76 @@ it('does not leak reserved keys into ctx.vars', async () => {
   expect(varKeys).not.toContain('SA_PROXY_TOKEN');
 });
 
+// --- SOLIDACTIONS__VAR_KEYS manifest: allowlist + single-source-of-truth scrub ---
+// RuntimeEnvBuilder emits SOLIDACTIONS__VAR_KEYS = the tenant-declared var keys.
+// When present it is authoritative: ctx.vars is built from EXACTLY those keys
+// (so container base env like PATH never pollutes ctx.vars), and those keys are
+// deleted from the transport (process.env) so ctx.vars is the single source.
+
+it('with a manifest present, builds ctx.vars from ONLY the listed keys (container base env like PATH is ignored)', async () => {
+  const ctx = await oneShotContextAdapter({
+    SOLIDACTIONS__VAR_KEYS: 'MY_FLAG,GCAL',
+    MY_FLAG: 'on',
+    GCAL: 'live::gcal::abc|u',
+    SA_PROXY_URL: 'http://proxy',
+    SA_PROXY_TOKEN: 'ptok',
+    PATH: '/usr/local/bin:/usr/bin',
+    HOME: '/root',
+    NODE_VERSION: '22.0.0',
+    SOLIDACTIONS_RUN_ID: 'ru',
+  });
+  expect(Object.keys(ctx.vars).sort()).toEqual(['GCAL', 'MY_FLAG']);
+  expect(ctx.vars.MY_FLAG).toBe('on');
+  expect(ctx.vars.GCAL).toEqual({ key: 'live::gcal::abc|u', proxyUrl: 'http://proxy', proxyToken: 'ptok' });
+});
+
+it('with a manifest present, deletes the listed var keys from the transport but keeps reserved + base env', async () => {
+  const env: Record<string, string> = {
+    SOLIDACTIONS__VAR_KEYS: 'MY_FLAG,GCAL',
+    MY_FLAG: 'on',
+    GCAL: 'live::gcal::abc|u',
+    SA_PROXY_URL: 'http://proxy',
+    SA_PROXY_TOKEN: 'ptok',
+    PATH: '/usr/bin',
+    SOLIDACTIONS_RUN_ID: 'ru',
+    SOLIDACTIONS_API_KEY: '7:secret',
+  };
+  await oneShotContextAdapter(env);
+  // Tenant vars are scrubbed → ctx.vars is the only way to read them.
+  expect(env.MY_FLAG).toBeUndefined();
+  expect(env.GCAL).toBeUndefined();
+  // Reserved framework keys stay — the SDK's own internals still read them from process.env.
+  expect(env.SOLIDACTIONS_RUN_ID).toBe('ru');
+  expect(env.SOLIDACTIONS_API_KEY).toBe('7:secret');
+  expect(env.SA_PROXY_URL).toBe('http://proxy');
+  // Container base env is never touched.
+  expect(env.PATH).toBe('/usr/bin');
+});
+
+it('with an empty manifest, produces no vars and scrubs nothing', async () => {
+  const env: Record<string, string> = { SOLIDACTIONS__VAR_KEYS: '', MY_FLAG: 'on', PATH: '/usr/bin' };
+  const ctx = await oneShotContextAdapter(env);
+  expect(Object.keys(ctx.vars)).toEqual([]);
+  // MY_FLAG is not in the (authoritative) manifest, so it is not a tenant var and is not deleted.
+  expect(env.MY_FLAG).toBe('on');
+});
+
+it('WITHOUT a manifest (legacy/local), falls back to scanning non-reserved keys and does NOT scrub the transport', async () => {
+  const env: Record<string, string> = {
+    MY_FLAG: 'on',
+    GCAL: 'live::gcal::abc|u',
+    SA_PROXY_URL: 'http://proxy',
+    SA_PROXY_TOKEN: 'ptok',
+    SOLIDACTIONS_RUN_ID: 'ru',
+  };
+  const ctx = await oneShotContextAdapter(env);
+  expect(ctx.vars.MY_FLAG).toBe('on');
+  expect(ctx.vars.GCAL).toEqual({ key: 'live::gcal::abc|u', proxyUrl: 'http://proxy', proxyToken: 'ptok' });
+  // No authoritative key list → unsafe to delete, so the transport is left intact.
+  expect(env.MY_FLAG).toBe('on');
+  expect(env.GCAL).toBe('live::gcal::abc|u');
+});
+
 it('throws a descriptive error on malformed WORKFLOW_INPUT', async () => {
   await expect(oneShotContextAdapter({ WORKFLOW_INPUT: '{bad json' })).rejects.toThrow(
     '[ContextAdapter] WORKFLOW_INPUT contains invalid JSON',

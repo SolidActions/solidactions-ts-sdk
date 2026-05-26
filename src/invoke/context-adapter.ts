@@ -52,6 +52,64 @@ function isReserved(key: string): boolean {
 }
 
 /**
+ * Reserved key carrying a comma-separated allowlist of the tenant-declared var
+ * keys, emitted by Laravel's `RuntimeEnvBuilder` (it equals every non-reserved
+ * key it injected — project variables + OAuth/connection `env_name`s).
+ *
+ * When present it is AUTHORITATIVE: `ctx.vars` is built from exactly these keys,
+ * so container base env (`PATH`, `HOME`, `NODE_VERSION`, …) never pollutes
+ * `ctx.vars`. The one-shot adapter additionally deletes these keys from the
+ * transport (process.env), making `ctx.vars` the single way to read them.
+ *
+ * When ABSENT (legacy deploys, local/mock transports) the adapters fall back to
+ * scanning every non-reserved key — the pre-manifest behavior — and the
+ * one-shot adapter does NOT scrub, since without an authoritative list deleting
+ * would risk removing container base env like `PATH`.
+ */
+const VAR_KEYS_MANIFEST = 'SOLIDACTIONS__VAR_KEYS';
+
+/**
+ * Resolve which transport keys are tenant vars: the {@link VAR_KEYS_MANIFEST}
+ * allowlist when present (filtered to keys actually present and non-reserved),
+ * otherwise every non-reserved key (legacy fallback).
+ */
+function resolveVarKeys(transport: Record<string, string>): string[] {
+  const manifest = transport[VAR_KEYS_MANIFEST];
+  if (manifest !== undefined) {
+    return manifest
+      .split(',')
+      .map((key) => key.trim())
+      .filter((key) => key.length > 0 && !isReserved(key) && transport[key] !== undefined);
+  }
+  return Object.keys(transport).filter((key) => !isReserved(key));
+}
+
+/**
+ * Build `ctx.vars` from the resolved key list, classifying each value as a
+ * {@link ConnectionVar} (when `SA_PROXY_URL`/`SA_PROXY_TOKEN` are present and
+ * the value looks like a connection key) or a scalar string.
+ */
+function buildVars(transport: Record<string, string>, keys: string[]): Record<string, VarValue> {
+  const proxyUrl = transport['SA_PROXY_URL'];
+  const proxyToken = transport['SA_PROXY_TOKEN'];
+  const hasProxy = proxyUrl !== undefined && proxyToken !== undefined;
+
+  const vars: Record<string, VarValue> = {};
+  for (const key of keys) {
+    const value = transport[key];
+    if (hasProxy && isConnectionValue(value)) {
+      // No broker signal in the flat transport → broker omitted (the returned
+      // shape stays `{ key, proxyUrl, proxyToken }`, runtime-identical to the
+      // pre-broker-typing behavior).
+      vars[key] = makeConnectionVar(value, proxyUrl, proxyToken);
+    } else {
+      vars[key] = value;
+    }
+  }
+  return vars;
+}
+
+/**
  * INTERIM HEURISTIC (Task 4.1 replaces this with the declared connection set from solidactions.yaml):
  *
  * A var value is a connection key iff it matches the pattern *::*::*  — at least two
@@ -226,22 +284,19 @@ export async function oneShotContextAdapter(transport: Record<string, string>): 
   const workflowSlug = transport['WORKFLOW_SLUG'];
 
   // --- vars ---
-  const proxyUrl = transport['SA_PROXY_URL'];
-  const proxyToken = transport['SA_PROXY_TOKEN'];
-  const hasProxy = proxyUrl !== undefined && proxyToken !== undefined;
+  const varKeys = resolveVarKeys(transport);
+  const vars = buildVars(transport, varKeys);
 
-  const vars: Record<string, VarValue> = {};
-  for (const [key, value] of Object.entries(transport)) {
-    if (isReserved(key)) {
-      continue;
-    }
-    if (hasProxy && isConnectionValue(value)) {
-      // No broker signal in the one-shot transport → broker omitted (the
-      // returned shape stays `{ key, proxyUrl, proxyToken }`, runtime-identical
-      // to the pre-broker-typing behavior).
-      vars[key] = makeConnectionVar(value, proxyUrl, proxyToken);
-    } else {
-      vars[key] = value;
+  // Single source of truth: when the manifest is present, scrub the tenant var
+  // keys from the transport (process.env) so workflow code can only reach them
+  // via ctx.vars — eliminating the "is it process.env.X or ctx.vars.X?"
+  // confusion. Reserved framework keys are deliberately NOT scrubbed (the SDK's
+  // own internals still read SOLIDACTIONS_*/SA_PROXY_* from process.env), and
+  // container base env (PATH/HOME/…) is never in varKeys. Skipped without a
+  // manifest: with no authoritative list, deleting could remove base env.
+  if (transport[VAR_KEYS_MANIFEST] !== undefined) {
+    for (const key of varKeys) {
+      delete transport[key];
     }
   }
 
@@ -316,21 +371,11 @@ export async function residentContextAdapter(body: ResidentRunBody): Promise<Inv
   };
   const workflowSlug = env['WORKFLOW_SLUG'];
 
-  // --- vars (same classification as oneShotContextAdapter) ---
-  const proxyUrl = env['SA_PROXY_URL'];
-  const proxyToken = env['SA_PROXY_TOKEN'];
-  const hasProxy = proxyUrl !== undefined && proxyToken !== undefined;
-  const vars: Record<string, VarValue> = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (isReserved(key)) {
-      continue;
-    }
-    if (hasProxy && isConnectionValue(value)) {
-      vars[key] = makeConnectionVar(value, proxyUrl, proxyToken);
-    } else {
-      vars[key] = value;
-    }
-  }
+  // --- vars (same classification as oneShotContextAdapter via the shared
+  // helpers: manifest allowlist when present, else scan non-reserved keys).
+  // No scrub here — the resident adapter reads a per-run request body, not the
+  // shared process.env, so there is nothing to de-duplicate. ---
+  const vars = buildVars(env, resolveVarKeys(env));
 
   return {
     input,
