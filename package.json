@@ -1,6 +1,6 @@
 {
   "name": "@solidactions/sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "SolidActions SDK - Durable workflow execution framework",
   "license": "MIT",
   "files": [
