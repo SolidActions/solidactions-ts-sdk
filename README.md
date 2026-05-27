@@ -29,9 +29,9 @@ npm install @solidactions/sdk
 ## Quick Start
 
 ```typescript
-import { SolidActions } from '@solidactions/sdk';
+import { SolidActions, defineWorkflow } from '@solidactions/sdk';
 
-// Register workflow steps
+// Step functions
 async function stepOne() {
   SolidActions.logger.info('Step one completed!');
 }
@@ -40,12 +40,15 @@ async function stepTwo() {
   SolidActions.logger.info('Step two completed!');
 }
 
-// Register the workflow
-async function workflowFunction() {
-  await SolidActions.runStep(stepOne);
-  await SolidActions.runStep(stepTwo);
-}
-const workflow = SolidActions.registerWorkflow(workflowFunction);
+// Define and export the workflow descriptor.
+// The platform loads this module and runs run(ctx) per request.
+export const workflow = defineWorkflow({
+  name: 'my-workflow',
+  async run(ctx) {
+    await SolidActions.runStep(stepOne, { name: 'step-one' });
+    await SolidActions.runStep(stepTwo, { name: 'step-two' });
+  },
+});
 ```
 
 ## Configuration
@@ -89,15 +92,19 @@ Workflows checkpoint their state so they can resume from the last completed step
 ```typescript
 async function paymentWorkflow(orderId: string) {
   // Step 1: Reserve inventory
-  await SolidActions.runStep(() => reserveInventory(orderId));
+  await SolidActions.runStep(() => reserveInventory(orderId), { name: 'reserve' });
 
   // Step 2: Process payment (if this fails, we resume from step 2)
-  await SolidActions.runStep(() => processPayment(orderId));
+  await SolidActions.runStep(() => processPayment(orderId), { name: 'pay' });
 
   // Step 3: Ship order
-  await SolidActions.runStep(() => shipOrder(orderId));
+  await SolidActions.runStep(() => shipOrder(orderId), { name: 'ship' });
 }
-const workflow = SolidActions.registerWorkflow(paymentWorkflow);
+
+export const workflow = defineWorkflow<{ orderId: string }, void>({
+  name: 'payment',
+  run: (ctx) => paymentWorkflow(ctx.input.orderId),
+});
 ```
 
 ## Durable Queues
@@ -105,17 +112,19 @@ const workflow = SolidActions.registerWorkflow(paymentWorkflow);
 Run tasks in the background with guaranteed completion:
 
 ```typescript
-import { SolidActions, WorkflowQueue } from '@solidactions/sdk';
-
-const queue = new WorkflowQueue('background_tasks');
+import { SolidActions, defineWorkflow } from '@solidactions/sdk';
 
 async function processTask(task: Task) {
   // Process the task...
 }
-const taskWorkflow = SolidActions.registerWorkflow(processTask);
 
-// Enqueue work
-await SolidActions.startWorkflow(taskWorkflow, { queueName: queue.name })(task);
+export const taskWorkflow = defineWorkflow<Task, void>({
+  name: 'process-task',
+  run: (ctx) => processTask(ctx.input),
+});
+
+// Enqueue work onto a named queue
+await SolidActions.startWorkflow(taskWorkflow, { queueName: 'background_tasks' })(task);
 ```
 
 ## Durable Sleep
@@ -124,10 +133,15 @@ Sleep for any duration (even days) - workflows resume exactly when the sleep end
 
 ```typescript
 async function reminderWorkflow(email: string) {
-  await SolidActions.runStep(() => sendConfirmationEmail(email));
+  await SolidActions.runStep(() => sendConfirmationEmail(email), { name: 'confirm' });
   await SolidActions.sleep(86400000); // Sleep 24 hours
-  await SolidActions.runStep(() => sendReminderEmail(email));
+  await SolidActions.runStep(() => sendReminderEmail(email), { name: 'remind' });
 }
+
+export const reminder = defineWorkflow<{ email: string }, void>({
+  name: 'reminder',
+  run: (ctx) => reminderWorkflow(ctx.input.email),
+});
 ```
 
 ## Signals and Events
@@ -140,9 +154,14 @@ async function approvalWorkflow(requestId: string) {
   const approved = await SolidActions.recv<boolean>('approval', 3600);
 
   if (approved) {
-    await SolidActions.runStep(() => processApproval(requestId));
+    await SolidActions.runStep(() => processApproval(requestId), { name: 'process-approval' });
   }
 }
+
+export const approval = defineWorkflow<{ requestId: string }, void>({
+  name: 'approval',
+  run: (ctx) => approvalWorkflow(ctx.input.requestId),
+});
 ```
 
 ## Client API
@@ -185,8 +204,9 @@ The CLI handles project creation, source upload, Docker builds, environment vari
 
 See [`docs/sdk-reference.md`](docs/sdk-reference.md) for comprehensive SDK documentation including:
 
-- Lifecycle: `SolidActions.run()`, `setConfig()`/`launch()`/`shutdown()`, `getInput()`
-- Workflows: registration, determinism rules, IDs and idempotency, timeouts, child workflows
+- The workflow contract: `defineWorkflow({ name, run })` and the `ctx` object (`ctx.input`, `ctx.vars`, `ctx.run`, `ctx.app`, modes)
+- Context variables: typed `ctx.vars`, plain vars vs. `ConnectionVar` (OAuth proxy)
+- Workflows: determinism rules, IDs and idempotency, timeouts, child workflows
 - Steps: `runStep()`, configurable retries, parallel execution with `Promise.allSettled()`
 - Durable primitives: `sleep()`, `now()`, `randomUUID()`
 - Communication: `send()`/`recv()` messaging, `setEvent()`/`getEvent()` events, streaming, `respond()`
