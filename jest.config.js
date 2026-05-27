@@ -13,4 +13,5 @@ module.exports = {
   modulePathIgnorePatterns: ['tests/proc-test'],
   collectCoverageFrom: ['src/**/*.ts', '!src/**/index.ts'],
   setupFiles: ['./jest.setup.ts'],
+  setupFilesAfterEnv: ['./jest.teardown.ts'],
 };
