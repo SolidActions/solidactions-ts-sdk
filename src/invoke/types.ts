@@ -41,7 +41,7 @@ export type VarValue = string | ConnectionVar;
 /**
  * Open augmentation hook for generated `ctx.vars` types (Task 4.1).
  *
- * Users who run `solidactions generate-types` get a `.d.ts` that extends this
+ * A generated `.d.ts` (emitted by the SDK's vars-types generator) extends this
  * interface with their project's typed var names. Without a generated file the
  * interface is empty, so `ctx.vars` falls back to the permissive
  * `Record<string, VarValue>` — existing code continues to compile unchanged.
