@@ -36,6 +36,7 @@ import { DLogger, GlobalLogger } from './telemetry/logs';
 import {
   SolidActionsError,
   SolidActionsExecutorNotInitializedError,
+  SolidActionsInvalidContextError,
   SolidActionsInvalidWorkflowTransitionError,
   SolidActionsNotRegisteredError,
   SolidActionsAwaitedWorkflowCancelledError,
@@ -1385,7 +1386,21 @@ export class SolidActions {
    */
   static async now(): Promise<number> {
     if (SolidActions.isInWorkflow()) {
-      return runInternalStep(async () => Promise.resolve(Date.now()), 'SolidActions.now');
+      // Invoke path: SolidActionsExecutor.globalInstance is unset; delegate to the
+      // invoke-scope step primitive (record-or-replay). Pattern matches sleepms().
+      const invokePrimitives = getCurrentPrimitives();
+      if (invokePrimitives) {
+        return invokePrimitives.step(() => Promise.resolve(Date.now()), { name: 'SolidActions.now' });
+      }
+      // Legacy launch() path: globalInstance is set; route through executor.runInternalStep
+      // (childWorkflowID recording, serializer, operation replay all happen there).
+      if (SolidActionsExecutor.globalInstance) {
+        return runInternalStep(async () => Promise.resolve(Date.now()), 'SolidActions.now');
+      }
+      throw new SolidActionsInvalidContextError(
+        'SolidActions.now',
+        'Call SolidActions.now() inside a workflow body defined with defineWorkflow() or SolidActions.registerWorkflow()',
+      );
     }
     return Date.now();
   }
@@ -1396,7 +1411,17 @@ export class SolidActions {
    */
   static async randomUUID(): Promise<string> {
     if (SolidActions.isInWorkflow()) {
-      return runInternalStep(async () => Promise.resolve(randomUUID()), 'SolidActions.randomUUID');
+      const invokePrimitives = getCurrentPrimitives();
+      if (invokePrimitives) {
+        return invokePrimitives.step(() => Promise.resolve(randomUUID()), { name: 'SolidActions.randomUUID' });
+      }
+      if (SolidActionsExecutor.globalInstance) {
+        return runInternalStep(async () => Promise.resolve(randomUUID()), 'SolidActions.randomUUID');
+      }
+      throw new SolidActionsInvalidContextError(
+        'SolidActions.randomUUID',
+        'Call SolidActions.randomUUID() inside a workflow body defined with defineWorkflow() or SolidActions.registerWorkflow()',
+      );
     }
     return randomUUID();
   }
