@@ -517,12 +517,17 @@ for await (const value of SolidActions.readStream(workflowID, 'progress')) {
 Sends an early response body to the external caller. Used in webhook wait-mode workflows to return a response before the workflow completes.
 
 ```typescript
-static async respond(body: unknown): Promise<void>
+static async respond(
+  body: unknown,
+  options?: { status?: number; headers?: Record<string, string> },
+): Promise<void>
 ```
 
 - Can only be called from a workflow `run` function (not from steps).
 - The body is sent back to the HTTP caller that triggered the webhook.
 - Must be called while the webhook request is still waiting (within the webhook timeout).
+- `options.status` — HTTP status code to return (default: `200`)
+- `options.headers` — Additional response headers (merged with `Content-Type: application/json`)
 
 ```typescript
 export const webhookWf = defineWorkflow<{ query: string }, void>({

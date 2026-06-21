@@ -1886,13 +1886,13 @@ export class SolidActions {
   }
 
   /**
-   * Set the webhook response body for wait-mode webhooks.
+   * Set the webhook response for wait-mode webhooks.
    * When a workflow is triggered via a wait-mode webhook (response: wait),
    * this method controls what the webhook caller receives.
    *
-   * Without respond(), the webhook returns the workflow's return value (which may
-   * include SuperJSON wrappers). With respond(), the webhook returns exactly
-   * the body you provide, as clean JSON.
+   * Without respond(), the webhook returns the workflow's return value as a 200
+   * body. With respond(), you override body plus optional status and headers.
+   * respond() is the only way to return a non-200 status or custom headers.
    *
    * This method is idempotent — if called multiple times, the last write wins.
    * It does NOT create a durable checkpoint (no functionIDGetIncrement).
@@ -1900,8 +1900,10 @@ export class SolidActions {
    * Must be called between steps (not inside a step or transaction).
    *
    * @param body - The data to return to the webhook caller (any JSON-serializable value)
+   * @param options.status - HTTP status code (default: 200)
+   * @param options.headers - Additional HTTP response headers
    */
-  static async respond(body: unknown): Promise<void> {
+  static async respond(body: unknown, options?: { status?: number; headers?: Record<string, string> }): Promise<void> {
     // Task 2.6: invoke-scope bridge (see setEvent for the rationale). respond
     // is NOT a durable checkpoint (no function id, matching the legacy path).
     // The webhook-output PUT MUST be awaited end-to-end before control returns:
@@ -1913,7 +1915,7 @@ export class SolidActions {
     // path is byte-unchanged legacy below.
     const scope = getCurrentScope();
     if (scope) {
-      await scope.executor.setWebhookOutput(scope.runtimeParams.workflowID, body);
+      await scope.executor.setWebhookOutput(scope.runtimeParams.workflowID, body, options);
       return;
     }
 
@@ -1928,7 +1930,7 @@ export class SolidActions {
         'Invalid call to `SolidActions.respond` inside a `step` or `transaction`',
       );
     }
-    await SolidActionsExecutor.globalInstance!.systemDatabase.setWebhookOutput(SolidActions.workflowID!, body);
+    await SolidActionsExecutor.globalInstance!.systemDatabase.setWebhookOutput(SolidActions.workflowID!, body, options);
   }
 
   /**
