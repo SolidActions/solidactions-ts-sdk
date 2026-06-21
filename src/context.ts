@@ -1,5 +1,4 @@
 import { SolidActionsContextualLogger } from './telemetry/logs';
-import { IncomingHttpHeaders } from 'http';
 import { ParsedUrlQuery } from 'querystring';
 import { AsyncLocalStorage } from 'async_hooks';
 import { SolidActionsInvalidWorkflowTransitionError } from './error';
@@ -189,16 +188,18 @@ export async function runInStepContext<R>(
 }
 
 /**
- * HTTPRequest includes useful information from http.IncomingMessage and parsed body,
- *   URL parameters, and parsed query string.
- * In essence, it is the serializable part of the request.
+ * HTTPRequest is the serializable portion of an HTTP request used for legacy
+ * context-store–based API handlers (e.g. `SolidActions.getRequest()`).
+ *
+ * NOTE: This type is NOT `ctx.input`. For webhook triggers, `ctx.input` is the
+ * parsed request body/query only — request headers and raw body are never
+ * populated on the invoke path and are intentionally absent from this type.
+ * Do not cast `ctx.input` to `HTTPRequest` or add `headers`/`rawBody` to your
+ * webhook input interface; those fields will always be undefined.
  */
 export interface HTTPRequest {
-  readonly headers?: IncomingHttpHeaders; // A node's http.IncomingHttpHeaders object.
-  readonly rawHeaders?: string[]; // Raw headers.
   readonly params?: unknown; // Parsed path parameters from the URL.
-  readonly body?: unknown; // parsed HTTP body as an object.
-  readonly rawBody?: string; // Unparsed raw HTTP body string.
+  readonly body?: unknown; // Parsed HTTP body as an object.
   readonly query?: ParsedUrlQuery; // Parsed query string.
   readonly querystring?: string; // Unparsed raw query string.
   readonly url?: string; // Request URL.

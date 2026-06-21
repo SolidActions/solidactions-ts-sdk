@@ -341,3 +341,19 @@ export class WorkflowNotRegisteredError extends SolidActionsError {
     );
   }
 }
+
+const InvalidContextErrorCode = 39;
+/**
+ * Thrown when a durable SolidActions primitive (e.g. `now()`, `randomUUID()`)
+ * is called outside any recognised workflow execution context (neither
+ * invoke-scope ALS nor the legacy executor path is active).
+ *
+ * @param callerName - The name of the calling function, e.g. `'SolidActions.now'`
+ * @param remedy     - Human-readable fix hint shown in the error message
+ */
+export class SolidActionsInvalidContextError extends SolidActionsError {
+  constructor(callerName: string, remedy: string) {
+    super(`\`${callerName}\` was called with no active workflow context. ${remedy}`, InvalidContextErrorCode);
+    this.name = 'SolidActionsInvalidContextError';
+  }
+}

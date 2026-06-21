@@ -15,7 +15,7 @@ export {
 
 export * as Error from './error';
 
-export { SolidActionsWorkflowConflictError } from './error';
+export { SolidActionsWorkflowConflictError, SolidActionsInvalidContextError } from './error';
 
 export { WorkflowConfig, WorkflowHandle, StatusString, GetWorkflowsInput, WorkflowStatus } from './workflow';
 

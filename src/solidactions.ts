@@ -36,6 +36,7 @@ import { DLogger, GlobalLogger } from './telemetry/logs';
 import {
   SolidActionsError,
   SolidActionsExecutorNotInitializedError,
+  SolidActionsInvalidContextError,
   SolidActionsInvalidWorkflowTransitionError,
   SolidActionsNotRegisteredError,
   SolidActionsAwaitedWorkflowCancelledError,
@@ -1385,18 +1386,42 @@ export class SolidActions {
    */
   static async now(): Promise<number> {
     if (SolidActions.isInWorkflow()) {
-      return runInternalStep(async () => Promise.resolve(Date.now()), 'SolidActions.now');
+      // Invoke path: SolidActionsExecutor.globalInstance is unset; delegate to the
+      // invoke-scope step primitive (record-or-replay). Pattern matches sleepms().
+      const invokePrimitives = getCurrentPrimitives();
+      if (invokePrimitives) {
+        return invokePrimitives.step(() => Promise.resolve(Date.now()), { name: 'SolidActions.now' });
+      }
+      // Legacy launch() path: globalInstance is set; route through executor.runInternalStep
+      // (childWorkflowID recording, serializer, operation replay all happen there).
+      if (SolidActionsExecutor.globalInstance) {
+        return runInternalStep(async () => Promise.resolve(Date.now()), 'SolidActions.now');
+      }
+      throw new SolidActionsInvalidContextError(
+        'SolidActions.now',
+        'Call SolidActions.now() inside a workflow body defined with defineWorkflow() or SolidActions.registerWorkflow()',
+      );
     }
     return Date.now();
   }
 
   /**
-   * Generate a random (v4) UUUID, similar to `node:crypto.randomUUID`.
+   * Generate a random (v4) UUID, similar to `node:crypto.randomUUID`.
    * This function is deterministic and can be used within workflows.
    */
   static async randomUUID(): Promise<string> {
     if (SolidActions.isInWorkflow()) {
-      return runInternalStep(async () => Promise.resolve(randomUUID()), 'SolidActions.randomUUID');
+      const invokePrimitives = getCurrentPrimitives();
+      if (invokePrimitives) {
+        return invokePrimitives.step(() => Promise.resolve(randomUUID()), { name: 'SolidActions.randomUUID' });
+      }
+      if (SolidActionsExecutor.globalInstance) {
+        return runInternalStep(async () => Promise.resolve(randomUUID()), 'SolidActions.randomUUID');
+      }
+      throw new SolidActionsInvalidContextError(
+        'SolidActions.randomUUID',
+        'Call SolidActions.randomUUID() inside a workflow body defined with defineWorkflow() or SolidActions.registerWorkflow()',
+      );
     }
     return randomUUID();
   }
@@ -1861,13 +1886,13 @@ export class SolidActions {
   }
 
   /**
-   * Set the webhook response body for wait-mode webhooks.
+   * Set the webhook response for wait-mode webhooks.
    * When a workflow is triggered via a wait-mode webhook (response: wait),
    * this method controls what the webhook caller receives.
    *
-   * Without respond(), the webhook returns the workflow's return value (which may
-   * include SuperJSON wrappers). With respond(), the webhook returns exactly
-   * the body you provide, as clean JSON.
+   * Without respond(), the webhook returns the workflow's return value as a 200
+   * body. With respond(), you override body plus optional status and headers.
+   * respond() is the only way to return a non-200 status or custom headers.
    *
    * This method is idempotent — if called multiple times, the last write wins.
    * It does NOT create a durable checkpoint (no functionIDGetIncrement).
@@ -1875,8 +1900,10 @@ export class SolidActions {
    * Must be called between steps (not inside a step or transaction).
    *
    * @param body - The data to return to the webhook caller (any JSON-serializable value)
+   * @param options.status - HTTP status code (default: 200)
+   * @param options.headers - Additional HTTP response headers
    */
-  static async respond(body: unknown): Promise<void> {
+  static async respond(body: unknown, options?: { status?: number; headers?: Record<string, string> }): Promise<void> {
     // Task 2.6: invoke-scope bridge (see setEvent for the rationale). respond
     // is NOT a durable checkpoint (no function id, matching the legacy path).
     // The webhook-output PUT MUST be awaited end-to-end before control returns:
@@ -1888,7 +1915,7 @@ export class SolidActions {
     // path is byte-unchanged legacy below.
     const scope = getCurrentScope();
     if (scope) {
-      await scope.executor.setWebhookOutput(scope.runtimeParams.workflowID, body);
+      await scope.executor.setWebhookOutput(scope.runtimeParams.workflowID, body, options);
       return;
     }
 
@@ -1903,7 +1930,7 @@ export class SolidActions {
         'Invalid call to `SolidActions.respond` inside a `step` or `transaction`',
       );
     }
-    await SolidActionsExecutor.globalInstance!.systemDatabase.setWebhookOutput(SolidActions.workflowID!, body);
+    await SolidActionsExecutor.globalInstance!.systemDatabase.setWebhookOutput(SolidActions.workflowID!, body, options);
   }
 
   /**
