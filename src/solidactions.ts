@@ -1406,7 +1406,7 @@ export class SolidActions {
   }
 
   /**
-   * Generate a random (v4) UUUID, similar to `node:crypto.randomUUID`.
+   * Generate a random (v4) UUID, similar to `node:crypto.randomUUID`.
    * This function is deterministic and can be used within workflows.
    */
   static async randomUUID(): Promise<string> {
