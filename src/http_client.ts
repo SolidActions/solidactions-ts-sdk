@@ -31,6 +31,48 @@ export interface HttpRequestOptions {
 }
 
 /**
+ * Node's fetch reports network failures as TypeError('fetch failed') with the
+ * real error (ECONNREFUSED / DNS / timeout) nested in .cause. Surface class,
+ * message, request target, and one level of cause so the string that reaches
+ * operation/run error columns is diagnosable on its own.
+ *
+ * Duck-types rather than using `instanceof Error`/`instanceof TypeError`:
+ * under ts-jest, errors thrown by Node's built-in fetch (undici) cross a VM
+ * realm boundary and fail `instanceof` checks against the test file's local
+ * Error/TypeError, even though `.constructor.name`, `.message`, and `.cause`
+ * are all intact.
+ */
+function describeNetworkFailure(error: unknown, method: string, url: string): string {
+  if (error === null || typeof error !== 'object' || !('message' in error)) {
+    return `Network error (${method} ${url})`;
+  }
+  const err = error as { message: unknown; cause?: unknown; constructor?: { name?: string } };
+  if (typeof err.message !== 'string') {
+    return `Network error (${method} ${url})`;
+  }
+  const className = err.constructor?.name ?? 'Error';
+  const cause = err.cause;
+  const causeText = cause !== undefined && cause !== null ? `, cause: ${stringifyCause(cause)}` : '';
+  return `${className}: ${err.message} (${method} ${url}${causeText})`;
+}
+
+/**
+ * Stringify an error `.cause` without `instanceof Error` (cross-realm errors
+ * fail that check under ts-jest — see describeNetworkFailure) and without
+ * tripping ESLint's no-base-to-string on plain objects.
+ */
+function stringifyCause(cause: unknown): string {
+  if (cause !== null && typeof cause === 'object') {
+    const c = cause as { name?: unknown; message?: unknown };
+    if (typeof c.name === 'string' && typeof c.message === 'string') {
+      return c.message ? `${c.name}: ${c.message}` : c.name;
+    }
+    return JSON.stringify(cause);
+  }
+  return String(cause);
+}
+
+/**
  * HTTP Client for SolidActions SDK with retry logic and error handling.
  *
  * Features:
@@ -141,7 +183,7 @@ export class HttpClient {
 
         // Network errors - retry with backoff
         if (this.isNetworkError(error)) {
-          lastError = new SolidActionsNetworkError(error instanceof Error ? error.message : 'Network error');
+          lastError = new SolidActionsNetworkError(describeNetworkFailure(error, method, url));
 
           if (attempt < this.maxRetries) {
             const delay = this.calculateRetryDelay(attempt);
@@ -161,7 +203,7 @@ export class HttpClient {
     }
 
     // All retries exhausted
-    throw lastError ?? new SolidActionsNetworkError('Request failed after all retries');
+    throw lastError ?? new SolidActionsNetworkError(`Request failed after all retries (${method} ${url})`);
   }
 
   /**
@@ -320,22 +362,30 @@ export class HttpClient {
    * Check if an error is a network error
    */
   private isNetworkError(error: unknown): boolean {
-    if (error instanceof TypeError) {
+    // Duck-type rather than `instanceof TypeError`/`instanceof Error`: under
+    // ts-jest, errors thrown by Node's built-in fetch (undici) cross a VM
+    // realm boundary and fail `instanceof` checks even though `.constructor.name`
+    // and `.message` are intact (see describeNetworkFailure above).
+    if (error === null || typeof error !== 'object' || !('message' in error)) {
+      return false;
+    }
+    const err = error as { message: unknown; constructor?: { name?: string } };
+    if (err.constructor?.name === 'TypeError') {
       // fetch throws TypeError for network errors
       return true;
     }
-    if (error instanceof Error) {
-      const message = error.message.toLowerCase();
-      return (
-        message.includes('network') ||
-        message.includes('fetch') ||
-        message.includes('econnrefused') ||
-        message.includes('enotfound') ||
-        message.includes('etimedout') ||
-        message.includes('abort')
-      );
+    if (typeof err.message !== 'string') {
+      return false;
     }
-    return false;
+    const message = err.message.toLowerCase();
+    return (
+      message.includes('network') ||
+      message.includes('fetch') ||
+      message.includes('econnrefused') ||
+      message.includes('enotfound') ||
+      message.includes('etimedout') ||
+      message.includes('abort')
+    );
   }
 
   /**

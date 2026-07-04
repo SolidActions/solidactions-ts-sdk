@@ -193,6 +193,37 @@ describe('HttpClient', () => {
     });
   });
 
+  describe('Network error detail (UX Sweep B item 3-SDK)', () => {
+    test('unreachable host rejects with class, method, URL, and connection-refused cause', async () => {
+      // 127.0.0.1:59987: nothing listens there — Node fetch fails fast with
+      // TypeError('fetch failed') whose .cause carries ECONNREFUSED.
+      // (Port 1 was tried first per the original spec, but it's on fetch's
+      // restricted "bad port" list — undici rejects it pre-connect with
+      // cause "bad port" rather than actually dialing and getting ECONNREFUSED.)
+      const deadClient = new HttpClient({
+        baseUrl: 'http://127.0.0.1:59987',
+        apiKey: 'test-key',
+        timeout: 2000,
+        maxRetries: 0,
+        retryDelay: 10,
+      });
+
+      let caught: unknown;
+      try {
+        await deadClient.get('/health');
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(SolidActionsNetworkError);
+      const message = (caught as Error).message;
+      expect(message).toMatch(/^TypeError: fetch failed/);
+      expect(message).toContain('GET http://127.0.0.1:59987/health');
+      expect(message).toContain('cause:');
+      expect(message).toContain('ECONNREFUSED');
+    });
+  });
+
   describe('Authorization header', () => {
     test('sends Bearer token', async () => {
       await client.get('/health');
