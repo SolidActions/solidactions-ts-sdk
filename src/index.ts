@@ -40,6 +40,9 @@ export { HttpSystemDatabase, SystemDatabase } from './system_database';
 
 export { HttpClient, HttpClientConfig } from './http_client';
 
+export { createDoc } from './docs';
+export type { DocsCreateConfig, DocsCreateInput, DocsCreateResult, Doc, DocTypeRef } from './docs';
+
 // New contract: defineWorkflow + public types (T8 — package root export)
 export { defineWorkflow } from './invoke/define-workflow';
 
