@@ -28,9 +28,25 @@ export interface DocsCreateInput {
   folderId?: number | null;
   docTypeId?: number | null;
   type?: string | null;
+  /**
+   * Sent to the server, but pending server support: `POST /api/v1/docs`
+   * currently ignores this field (spec-vs-implementation drift, tracked
+   * separately).
+   */
   parseFrontmatter?: boolean | null;
+  /**
+   * Sent to the server, but pending server support: `POST /api/v1/docs`
+   * currently ignores this field (spec-vs-implementation drift, tracked
+   * separately).
+   */
   createMissingFolders?: boolean | null;
-  /** Sent as the `Idempotency-Key` header on the POST. */
+  /**
+   * Sent as the `Idempotency-Key` header on the POST, but pending server
+   * support: `POST /api/v1/docs` currently ignores this header (spec-vs-
+   * implementation drift, tracked separately). Until the server honors it,
+   * HttpClient's automatic POST retries can duplicate docs on transient
+   * 5xx/network failures.
+   */
   idempotencyKey?: string;
 }
 
@@ -76,6 +92,12 @@ export async function createDoc(input: DocsCreateInput, config: DocsCreateConfig
     throw new SolidActionsDataValidationError(
       'SolidActions.docs.create() requires config.workspaceId (the target workspace UUID, sent as ' +
         'X-Workspace-Id). Read it from your own project env var — e.g. process.env.MY_SA_WORKSPACE_ID.',
+    );
+  }
+  if (!config?.baseUrl) {
+    throw new SolidActionsDataValidationError(
+      'SolidActions.docs.create() requires config.baseUrl (the base URL of the SolidActions app, ' +
+        'e.g. https://app.solidactions.com — not the internal runner API).',
     );
   }
   if (!input?.title) {

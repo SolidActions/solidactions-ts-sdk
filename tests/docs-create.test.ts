@@ -85,6 +85,13 @@ describe('createDoc — validation (no network call on missing config)', () => {
     expect(lastRequest).toBeNull();
   });
 
+  test('throws when config.baseUrl is missing', async () => {
+    await expect(createDoc({ title: 'x' }, { apiKey: 'sk_test', workspaceId: 'ws-1', baseUrl: '' })).rejects.toThrow(
+      SolidActionsDataValidationError,
+    );
+    expect(lastRequest).toBeNull();
+  });
+
   test('throws when input.title is missing', async () => {
     await expect(createDoc({ title: '' }, { apiKey: 'sk_test', workspaceId: 'ws-1', baseUrl })).rejects.toThrow(
       /title/,
