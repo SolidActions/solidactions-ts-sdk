@@ -10,11 +10,11 @@
 //   workflowUUID = ctx.run.runUuid, executorId = ctx.run.triggerId,
 //   applicationID = ctx.app.appId, applicationVersion = ctx.app.appVersion.
 import { randomUUID } from 'crypto';
-import { serializeError } from 'serialize-error';
 import { StatusString } from '../workflow';
 import { GlobalLogger } from '../telemetry/logs';
 import { SolidActionsJSON } from '../serialization';
 import { collectSecretStrings, scrubSecretsFromString } from './secret-redaction';
+import { serializeErrorWithCause } from './serialize-error-with-cause';
 import type { InvokeCtx, InvokeResult } from './types';
 
 const logger = new GlobalLogger();
@@ -117,7 +117,7 @@ export async function reportTerminalState(ctx: InvokeCtx, result: InvokeResult):
         status: StatusString.SUCCESS,
       });
     } else {
-      const errorSerialized = SolidActionsJSON.stringify(serializeError(result.error)) ?? 'null';
+      const errorSerialized = SolidActionsJSON.stringify(serializeErrorWithCause(result.error)) ?? 'null';
       await client.put(`/runs/status/${encodedID}/error`, {
         error: scrubSecretsFromString(errorSerialized, secretStrings),
         status: StatusString.ERROR,
@@ -125,7 +125,9 @@ export async function reportTerminalState(ctx: InvokeCtx, result: InvokeResult):
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.warn(`Failed to persist run status ${result.status === 'completed' ? 'output' : 'error'} for ${workflowID}: ${errMsg}`);
+    logger.warn(
+      `Failed to persist run status ${result.status === 'completed' ? 'output' : 'error'} for ${workflowID}: ${errMsg}`,
+    );
   }
 
   try {

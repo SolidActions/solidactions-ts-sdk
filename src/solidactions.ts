@@ -94,6 +94,7 @@ import { Server } from 'http';
 import { randomUUID } from 'node:crypto';
 
 import { StepConfig } from './step';
+import { createDoc } from './docs';
 // Task 2.3: the one-shot compat path — run() = ContextAdapter -> invoke() -> RuntimeAdapter.
 //
 // invoke()/contextAdapter/runtimeAdapter/HttpClient are required LAZILY inside
@@ -404,6 +405,14 @@ export class SolidActions {
   ///////
   static adminServer: Server | undefined = undefined;
   static conductor: Conductor | undefined = undefined;
+
+  /**
+   * Docs surface (Track 3, → 0.7.2). `create` only — see src/docs.ts for the
+   * explicit-config auth contract (never reads reserved SOLIDACTIONS_* envs).
+   */
+  static readonly docs = {
+    create: createDoc,
+  };
 
   /**
    * Set configuration of `SolidActions` prior to `launch`
