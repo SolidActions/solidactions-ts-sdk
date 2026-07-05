@@ -35,7 +35,7 @@
  *   tests — see notes on each).
  */
 
-import { deserializeError, serializeError } from 'serialize-error';
+import { deserializeError } from 'serialize-error';
 import { SolidActionsWorkflowCancelledError } from '../error';
 import { GlobalLogger } from '../telemetry/logs';
 import { SolidActionsJSON } from '../serialization';
@@ -48,6 +48,7 @@ import {
   rehydrateVarsFromSnapshot,
   scrubSecretsFromString,
 } from './secret-redaction';
+import { serializeErrorWithCause } from './serialize-error-with-cause';
 import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } from './types';
 
 /**
@@ -128,7 +129,7 @@ function buildPrimitives(
         // could include a secret in its message (e.g. an HTTP client
         // serializing a request body into an error).
         const errorJson = scrubSecretsFromString(
-          SolidActionsJSON.stringify(serializeError(err)) ?? 'null',
+          SolidActionsJSON.stringify(serializeErrorWithCause(err)) ?? 'null',
           secretStrings,
         );
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
