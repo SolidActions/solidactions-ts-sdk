@@ -2,7 +2,7 @@
 
 This document is the comprehensive reference for the **SolidActions SDK** (`@solidactions/sdk`). It covers the full TypeScript API for building durable, checkpointed workflows.
 
-**For platform deployment, webhook configuration, `solidactions.yaml`, CLI usage, and environment variables**, see the [platform reference](https://github.com/SolidActions/solidactions) (`docs/platform-reference.md`) in the SolidActions platform repo.
+**For platform deployment, webhook configuration, `solidactions.yaml`, CLI usage, and environment variables**, see the scaffolded `solidactions-deploy-and-config` skill (`.claude/skills/` or `.agents/skills/`) and the public examples repo: https://github.com/SolidActions/solidactions-examples.
 
 ## The Workflow Contract
 
