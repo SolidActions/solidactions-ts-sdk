@@ -45,6 +45,7 @@ import {
   makeSelectionFailureDescriptor,
   LAUNCHER_MISCONFIG_EXIT_CODE,
 } from '../../src/launcher';
+import { __getStartedOneShotRun, __resetStartedOneShotRunForTests } from '../../src/solidactions';
 
 let srv: MockHttpServer;
 
@@ -212,6 +213,7 @@ function normalizeLog(runId: string): NormalizedEntry[] {
 beforeEach(() => {
   srv.store.clear();
   srv.requestLog.length = 0;
+  __resetStartedOneShotRunForTests();
 });
 
 // =============================================================================
@@ -247,6 +249,14 @@ describe('paired parity: direct run() vs launcher selection', () => {
     // registry populated is therefore both correct AND necessary.
     srv.store.clear();
     srv.requestLog.length = 0;
+    // The direct-path phase above just called SolidActions.run(wf), which
+    // records __startedOneShotRun (issue solidactions-app#414's guard state).
+    // In production each one-shot process runs exactly once; this helper
+    // simulates TWO INDEPENDENT process invocations sharing one Jest process,
+    // so reset the record here — otherwise the launcher phase's guard would
+    // (correctly, given its own logic) mistake the direct phase's run for a
+    // self-invoke of THIS phase's module and defer instead of running.
+    __resetStartedOneShotRunForTests();
 
     const LAUNCHER_RUN_ID = '00000000-0000-4000-8000-000000000d02';
     seedRun(LAUNCHER_RUN_ID);
@@ -581,5 +591,209 @@ describe('makeSelectionFailureDescriptor', () => {
     expect(desc.name).toBe('__launcher_selection_failure__');
     // The registry stays empty — the synthetic name was NOT inserted.
     expect(__getRegisteredWorkflow('__launcher_selection_failure__')).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// SELF-INVOKING MODULES (issue solidactions-app#414) — the launcher must never
+// start a SECOND run when the imported module already self-invoked
+// SolidActions.run() at top level (legacy pre-codemod style). A second,
+// concurrent one-shot run would re-run the workflow body AND its
+// oneShotContextAdapter would observe process.env AFTER the first run's
+// var-manifest scrub — the root cause of the empty-ctx.vars bug.
+// =============================================================================
+
+describe('self-invoking modules (issue solidactions-app#414)', () => {
+  /**
+   * Capture `console.log`/`console.error` output for the duration of the
+   * callback while still forwarding to the real methods (so Jest's own
+   * console reporting is unaffected) — not a mock of any SDK behavior, just
+   * an observation seam on real output.
+   *
+   * NOT implemented via `process.stdout.write`/`process.stderr.write`
+   * interception: Jest's `CustomConsole` (installed as the test-environment
+   * `console`) formats every `console.*` call — `log` AND `error` alike —
+   * and writes ALL of it to `process.stdout` for its own test-output
+   * grouping; `process.stderr.write` is never actually called, so a
+   * stream-level interceptor cannot distinguish log-level (verified: a
+   * standalone repro showed `console.error` output landing in the captured
+   * "stdout" buffer, never the "stderr" one). Intercepting at the
+   * `console.log`/`console.error` method level instead preserves the
+   * distinction the fixtures and the launcher's warnings rely on.
+   */
+  function captureStreams(): { stop: () => { stdout: string; stderr: string } } {
+    const realLog = console.log.bind(console);
+    const realError = console.error.bind(console);
+    let stdout = '';
+    let stderr = '';
+    console.log = (...args: unknown[]) => {
+      stdout += args.map((a) => String(a)).join(' ') + '\n';
+      realLog(...args);
+    };
+    console.error = (...args: unknown[]) => {
+      stderr += args.map((a) => String(a)).join(' ') + '\n';
+      realError(...args);
+    };
+    return {
+      stop: () => {
+        console.log = realLog;
+        console.error = realError;
+        return { stdout, stderr };
+      },
+    };
+  }
+
+  /**
+   * A self-invoking fixture calls `void SolidActions.run(wf)` at module top
+   * level — the promise is intentionally discarded (that IS the legacy shape
+   * under test), so there is no handle the test can `await` directly, and
+   * nothing ever consumes its rejection if `process.exit()` throws (jest's
+   * own unhandled-rejection handling derails whatever test is currently
+   * running when that happens — verified experimentally, not just theory).
+   * Make `process.exit()` a harmless recording no-op instead of the shared
+   * armed-throw interceptor for the scope of one drive call: the self-invoked
+   * run's promise then RESOLVES normally (no throw, no unhandled rejection),
+   * and polling `exitCodes` tells us when it (and the workflow body inside
+   * it) has finished. This overrides the SAME built-in `process.exit` the
+   * shared jest.setup.ts interceptor already overrides — not a mock/spy of
+   * any SDK function, just a different swap of the same real global.
+   */
+  function stubProcessExitNoop(): { exitCodes: number[]; restore: () => void } {
+    const prior = process.exit.bind(process);
+    const exitCodes: number[] = [];
+    process.exit = ((code?: number) => {
+      exitCodes.push(code ?? 0);
+    }) as typeof process.exit;
+    return {
+      exitCodes,
+      restore: () => {
+        process.exit = prior;
+      },
+    };
+  }
+
+  /** Poll `predicate` on a real timer until it's true or `timeoutMs` elapses. */
+  async function waitUntil(predicate: () => boolean, timeoutMs = 5000, intervalMs = 10): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('waitUntil: timed out waiting for condition');
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  /**
+   * Drive the launcher against a self-invoking fixture: set env, capture
+   * stdout/stderr, stub process.exit as a no-op, run `launcherMain()` (which
+   * — once the guard under test exists — defers and returns WITHOUT calling
+   * process.exit itself), then poll until the fixture's own unawaited
+   * top-level `SolidActions.run()` call has reached ITS process.exit —
+   * proof its workflow body (and everything before the exit) has run.
+   */
+  async function driveSelfInvokingLauncher(env: Record<string, string>): Promise<{ stdout: string; stderr: string }> {
+    const priorEnv: Record<string, string | undefined> = {};
+    for (const key of Object.keys(env)) {
+      priorEnv[key] = process.env[key];
+      process.env[key] = env[key];
+    }
+
+    const capture = captureStreams();
+    const exitStub = stubProcessExitNoop();
+    let captured: { stdout: string; stderr: string };
+    try {
+      await launcherMain();
+      await waitUntil(() => exitStub.exitCodes.length >= 1);
+    } finally {
+      captured = capture.stop();
+      exitStub.restore();
+      for (const key of Object.keys(env)) {
+        if (priorEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = priorEnv[key];
+        }
+      }
+    }
+    return captured;
+  }
+
+  it('defers to a legacy self-invoking module: body runs exactly once, launcher warns and does not run again', async () => {
+    const RUN_ID = '00000000-0000-4000-8000-000000000e01';
+    seedRun(RUN_ID);
+
+    const { stdout, stderr } = await driveSelfInvokingLauncher(
+      mockEnv(RUN_ID, {
+        WORKFLOW_ENTRY_FILE: fixturePath('launcher-self-invoke-legacy.ts'),
+        WORKFLOW_ID: 'legacy-self-invoked',
+        WORKFLOW_INPUT: JSON.stringify({ probe: 'hello' }),
+      }),
+    );
+
+    expect(stdout.match(/SELF_INVOKE_LEGACY_RAN/g)).toHaveLength(1);
+    expect(stderr).toContain('solidactions-launch: legacy self-invoking module detected');
+  });
+
+  it('a self-invoking defineWorkflow module keeps populated ctx.vars (regression: empty-vars)', async () => {
+    const RUN_ID = '00000000-0000-4000-8000-000000000e02';
+    seedRun(RUN_ID);
+
+    const { stdout } = await driveSelfInvokingLauncher(
+      mockEnv(RUN_ID, {
+        WORKFLOW_ENTRY_FILE: fixturePath('launcher-self-invoke-ctx.ts'),
+        WORKFLOW_ID: 'ctx-self-invoked',
+        WORKFLOW_INPUT: '{}',
+        SOLIDACTIONS__VAR_KEYS: 'FOO',
+        FOO: 'bar-secret',
+      }),
+    );
+
+    expect(stdout.match(/SELF_INVOKE_CTX_VARS=/g)).toHaveLength(1);
+    expect(stdout).toContain('SELF_INVOKE_CTX_VARS=["FOO"]');
+  });
+
+  it('multi-workflow module self-invoking a DIFFERENT workflow than WORKFLOW_ID: loud error, no second run', async () => {
+    const RUN_ID = '00000000-0000-4000-8000-000000000e03';
+    seedRun(RUN_ID);
+
+    const { stdout, stderr } = await driveSelfInvokingLauncher(
+      mockEnv(RUN_ID, {
+        WORKFLOW_ENTRY_FILE: fixturePath('launcher-self-invoke-mismatch.ts'),
+        WORKFLOW_ID: 'mismatch-beta',
+        WORKFLOW_INPUT: '{}',
+      }),
+    );
+
+    expect(stdout.match(/MISMATCH_ALPHA_RAN/g)).toHaveLength(1);
+    expect(stdout).not.toContain('MISMATCH_BETA_RAN');
+    expect(stderr).toMatch(/self-invoked workflow 'mismatch-alpha'.*'mismatch-beta'/s);
+  });
+
+  it('pure-descriptor module is unaffected: launcher runs it exactly once', async () => {
+    // launcher-alias.ts is never imported by any other test in this file, so
+    // this is its first (and only) import — no registry collision risk. It
+    // registers ONE workflow and self-invokes nothing, so __getStartedOneShotRun()
+    // is null right after import — the guard must see that and no-op, letting
+    // the launcher's own (normal, non-deferring) SolidActions.run() call proceed.
+    __clearRegistry();
+    expect(__getStartedOneShotRun()).toBeNull();
+    const RUN_ID = '00000000-0000-4000-8000-000000000e04';
+    seedRun(RUN_ID);
+
+    const exit = await expectProcessExit(
+      () => launcherMain(),
+      mockEnv(RUN_ID, {
+        WORKFLOW_ENTRY_FILE: fixturePath('launcher-alias.ts'),
+        WORKFLOW_ID: 'irrelevant-for-the-single-registration-alias-case',
+        WORKFLOW_INPUT: '{}',
+      }),
+    );
+
+    // The launcher's OWN SolidActions.run(descriptor) call — the normal
+    // path — is what (correctly) sets the flag; proof of single execution is
+    // the output PUT count, not the flag's post-hoc value.
+    expect(exit).toBe(0);
+    const outputPuts = srv.requestLog.filter((e) => e.method === 'PUT' && e.path.endsWith('/output'));
+    expect(outputPuts).toHaveLength(1);
   });
 });
