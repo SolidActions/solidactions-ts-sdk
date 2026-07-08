@@ -235,6 +235,26 @@ let __anyRunSkippedForNonEntrypoint = false;
 let __failLoudExitHandlerInstalled = false;
 
 /**
+ * Identity of the one-shot run this process has started via SolidActions.run(),
+ * or null. Set SYNCHRONOUSLY at the top of run()'s one-shot path — before the
+ * lazy invoke-chain require()s and before oneShotContextAdapter — so the SDK
+ * launcher (src/launcher.ts), which awaits the tenant module's import() and
+ * then checks this, can reliably detect a legacy self-invoking module and
+ * defer instead of starting a concurrent second run (issue solidactions-app#414).
+ * Internal (`__` convention): not re-exported from src/index.ts.
+ */
+let __startedOneShotRun: { workflowName: string } | null = null;
+
+export function __getStartedOneShotRun(): { workflowName: string } | null {
+  return __startedOneShotRun;
+}
+
+/** Test-only reset (mirrors the other guard-flag test hooks). */
+export function __resetStartedOneShotRunForTests(): void {
+  __startedOneShotRun = null;
+}
+
+/**
  * Test-only snapshots of the entrypoint-guard flags. Used by the guard suite to
  * assert flag transitions without driving the real `process.on('exit')`
  * handler. NOT part of the public API and intentionally NOT re-exported from
@@ -829,6 +849,32 @@ export class SolidActions {
       return;
     }
 
+    // Derive workflowName the way the legacy executor did
+    // (src/solidactions-executor.ts:374-375 `wfname = getRegisteredFunctionFullName(wf).name`;
+    // src/decorators.ts:566-575: registered → `fr.name`, else the function's own
+    // `.name`). The one-shot `workflow` arg is the SAME value legacy received
+    // (a registerWorkflow wrapper, a bare fn, or a { run } descriptor), so
+    // resolve it identically — from the registration's `.name` if registered,
+    // else the function's `.name`. A non-empty fallback is required: the real
+    // RunStatusController::store() validates `workflowName => required|string`
+    // and Laravel's `required` rejects an empty string.
+    //
+    // Hoisted above the lazy require()/await block below (moved up from its
+    // original spot right before `initRunStatusRow`) so the __startedOneShotRun
+    // record below can use it — see that record's own comment for why this
+    // whole prefix must stay synchronous.
+    const workflowReg = getFunctionRegistration(workflow as object);
+    const workflowName = workflowReg?.name || (workflow as { name?: string }).name || 'workflow';
+
+    // Record that this process started a one-shot run — BEFORE any lazy
+    // require()/await, so the launcher's post-import check is reliable even if
+    // later sync steps throw (issue solidactions-app#414; see __startedOneShotRun).
+    __startedOneShotRun = { workflowName };
+    // A workflow run is now executing in this process — the fail-loud exit
+    // handler must stay silent (a runIfEntrypoint tenant module under the
+    // launcher sets `skipped` but the launcher's own run() lands here).
+    __anyEntrypointRunExecuted = true;
+
     // --- one-shot path: ContextAdapter -> invoke() -> RuntimeAdapter ---------
     // Lazy require(): see the import-block comment — a STATIC import of the
     // invoke chain creates a module-load cycle through http_system_database
@@ -845,18 +891,6 @@ export class SolidActions {
 
     const descriptor = SolidActions.#toWorkflowDescriptor<T, R>(workflow, options?.input);
     const ctx = await oneShotContextAdapter(process.env as Record<string, string>);
-
-    // Derive workflowName the way the legacy executor did
-    // (src/solidactions-executor.ts:374-375 `wfname = getRegisteredFunctionFullName(wf).name`;
-    // src/decorators.ts:566-575: registered → `fr.name`, else the function's own
-    // `.name`). The one-shot `workflow` arg is the SAME value legacy received
-    // (a registerWorkflow wrapper, a bare fn, or a { run } descriptor), so
-    // resolve it identically — from the registration's `.name` if registered,
-    // else the function's `.name`. A non-empty fallback is required: the real
-    // RunStatusController::store() validates `workflowName => required|string`
-    // and Laravel's `required` rejects an empty string.
-    const workflowReg = getFunctionRegistration(workflow as object);
-    const workflowName = workflowReg?.name || (workflow as { name?: string }).name || 'workflow';
 
     // Reproduce the legacy backend status-row lifecycle. Legacy run() persisted
     // it via the executor's THREE-step sequence (src/solidactions-executor.ts
@@ -1903,7 +1937,11 @@ export class SolidActions {
    * body. With respond(), you override body plus optional status and headers.
    * respond() is the only way to return a non-200 status or custom headers.
    *
-   * This method is idempotent — if called multiple times, the last write wins.
+   * Calling respond() more than once is discouraged. The persisted
+   * webhook_output column is last-write-wins, but a webhook caller waiting in
+   * `response: wait` mode receives the FIRST respond() payload (the platform
+   * delivers wait-mode responses through a queue, not the stored column).
+   * Call respond() exactly once per run.
    * It does NOT create a durable checkpoint (no functionIDGetIncrement).
    *
    * Must be called between steps (not inside a step or transaction).

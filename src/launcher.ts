@@ -49,7 +49,7 @@
  */
 import * as nodePath from 'node:path';
 
-import { SolidActions } from './solidactions';
+import { SolidActions, __getStartedOneShotRun } from './solidactions';
 import { defineWorkflow } from './invoke/define-workflow';
 import { __getRegisteredWorkflow, __getRegisteredWorkflows } from './invoke/registry';
 
@@ -189,10 +189,37 @@ export async function main(): Promise<void> {
 
   // Dynamic-import the target. The post-codemod, pure module ONLY populates
   // the registry on import — no side effects (T1 guarantee). A pre-codemod
-  // self-invoking file would fire its top-level `SolidActions.run()` here and
-  // process.exit before we reach selectWorkflow — that is detected by T4's
-  // deploy-time gate (rg against dist/), not by the launcher.
+  // self-invoking file fires its top-level `SolidActions.run()` here instead
+  // — detected below via `__getStartedOneShotRun()` and deferred to, rather
+  // than raced by a second launcher-initiated run.
   await import(resolveEntryFilePath(entryFile));
+
+  // Issue solidactions-app#414: if the imported module already self-invoked
+  // SolidActions.run() at top level (legacy pre-codemod style), a second
+  // launcher-initiated run would execute the SAME trigger twice concurrently in
+  // this process — and the second run's context adapter would see the manifest
+  // with already-scrubbed values (empty ctx.vars). NEVER start a second run.
+  const started = __getStartedOneShotRun();
+  if (started) {
+    const registered = __getRegisteredWorkflows();
+    const selected = registered.length > 0 ? selectWorkflow(workflowId).descriptor : null;
+    const matchesDispatch = registered.length <= 1 || (selected !== null && selected.name === started.workflowName);
+    if (matchesDispatch) {
+      console.error(
+        'solidactions-launch: legacy self-invoking module detected — deferring to its ' +
+          'top-level SolidActions.run(); migrate to a pure defineWorkflow export ' +
+          '(remove the top-level run call). See docs/sdk-reference.md.',
+      );
+    } else {
+      console.error(
+        `solidactions-launch: ERROR — module self-invoked workflow '${started.workflowName}' ` +
+          `but WORKFLOW_ID '${workflowId}' selects '${selected?.name ?? '<none>'}'. Deferring to ` +
+          'the self-invoked run to avoid a concurrent double execution; fix the module to ' +
+          'export descriptors without a top-level SolidActions.run() call.',
+      );
+    }
+    return; // the in-flight self-invoked run owns terminal state + process.exit
+  }
 
   // Selection failures route through SolidActions.run(syntheticDescriptor) so
   // the failure flows through oneShotContextAdapter → status row create →
