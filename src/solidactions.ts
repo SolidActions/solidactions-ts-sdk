@@ -1937,7 +1937,11 @@ export class SolidActions {
    * body. With respond(), you override body plus optional status and headers.
    * respond() is the only way to return a non-200 status or custom headers.
    *
-   * This method is idempotent — if called multiple times, the last write wins.
+   * Calling respond() more than once is discouraged. The persisted
+   * webhook_output column is last-write-wins, but a webhook caller waiting in
+   * `response: wait` mode receives the FIRST respond() payload (the platform
+   * delivers wait-mode responses through a queue, not the stored column).
+   * Call respond() exactly once per run.
    * It does NOT create a durable checkpoint (no functionIDGetIncrement).
    *
    * Must be called between steps (not inside a step or transaction).

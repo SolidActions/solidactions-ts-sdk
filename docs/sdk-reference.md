@@ -1071,6 +1071,13 @@ The `ctx` contract (this document's primary API) replaced an earlier static-entr
 | Tenant vars read from `process.env`                                                  | `ctx.vars` (single source of truth; `process.env` no longer carries them) |
 | `@SolidActions.workflow()` / `@SolidActions.step()` decorators, `ConfiguredInstance` | `defineWorkflow` with plain functions                                     |
 
+> **Deployed modules must not self-invoke.** A top-level `SolidActions.run(...)`
+> in a deployed workflow module used to cause the platform launcher to execute
+> the workflow twice concurrently (second execution saw empty `ctx.vars`) —
+> solidactions-app#414. Current SDKs detect this and run the workflow once, with
+> a deprecation warning in the run logs. Remove the top-level call and export
+> the `defineWorkflow` descriptor instead.
+
 `SolidActions.run()` itself still works — internally it now adapts the process environment into a `ctx` and routes through the same `invoke()` engine — but exporting a `defineWorkflow` descriptor is the supported pattern.
 
 The class-based API (`@SolidActions.workflow()`, `@SolidActions.step()`, `@SolidActions.className()`, and `ConfiguredInstance`) remains available for advanced cases needing instance-level configuration, but plain functions wrapped by `defineWorkflow` are preferred.
