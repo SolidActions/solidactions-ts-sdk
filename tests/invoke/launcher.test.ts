@@ -45,7 +45,12 @@ import {
   makeSelectionFailureDescriptor,
   LAUNCHER_MISCONFIG_EXIT_CODE,
 } from '../../src/launcher';
-import { __getStartedOneShotRun, __resetStartedOneShotRunForTests } from '../../src/solidactions';
+import {
+  __getStartedOneShotRun,
+  __resetStartedOneShotRunForTests,
+  __entrypointGuardFlags,
+  __shouldFailLoudOnExit,
+} from '../../src/solidactions';
 
 let srv: MockHttpServer;
 
@@ -795,5 +800,56 @@ describe('self-invoking modules (issue solidactions-app#414)', () => {
     expect(exit).toBe(0);
     const outputPuts = srv.requestLog.filter((e) => e.method === 'PUT' && e.path.endsWith('/output'));
     expect(outputPuts).toHaveLength(1);
+  });
+
+  it('runIfEntrypoint module under the launcher: runs once via launcher, fail-loud handler stays silent', async () => {
+    // Regression test for Task 1's `__anyEntrypointRunExecuted = true` line
+    // inside run() (src/solidactions.ts). This fixture uses the CURRENT
+    // recommended pattern — `SolidActions.runIfEntrypoint(wf, callerUrl)` —
+    // rather than the legacy bare `SolidActions.run(wf)` the other fixtures
+    // in this describe block use. Under launcherMain(), process.argv[1] is
+    // NOT the fixture, so the module's own runIfEntrypoint() call is a SKIP
+    // (records __anyRunSkippedForNonEntrypoint, never calls run()). The
+    // launcher then selects and runs the descriptor itself via
+    // SolidActions.run() — the ONLY place that records executed=true for
+    // this scenario (Task 1's fix). Without that line, the fail-loud
+    // process-exit handler's flag combination (skipped=true, executed=false)
+    // would be armed to (mis)fire on a perfectly successful run.
+    const RUN_ID = '00000000-0000-4000-8000-000000000e05';
+    seedRun(RUN_ID);
+
+    const capture = captureStreams();
+    let exit: number | undefined;
+    let stdout = '';
+    let stderr = '';
+    try {
+      exit = await expectProcessExit(
+        () => launcherMain(),
+        mockEnv(RUN_ID, {
+          WORKFLOW_ENTRY_FILE: fixturePath('launcher-run-if-entrypoint.ts'),
+          WORKFLOW_ID: 'rie-under-launcher',
+          WORKFLOW_INPUT: '{}',
+        }),
+      );
+    } finally {
+      ({ stdout, stderr } = capture.stop());
+    }
+
+    // Under launcherMain(), process.argv[1] is NOT the fixture, so the
+    // module's own runIfEntrypoint() call is a skip; the launcher then runs
+    // the descriptor itself — the workflow body runs exactly ONCE.
+    expect(stdout.match(/RIE_UNDER_LAUNCHER_RAN/g)).toHaveLength(1);
+    expect(stderr).not.toContain('FATAL: the dispatched one-shot module');
+    // Exit code must come from the run, not a misfired fail-loud handler.
+    expect(exit).toBe(0);
+
+    // Prove the flag combination cannot fire the fail-loud handler: the
+    // fixture's own runIfEntrypoint() call recorded a skip, and the
+    // launcher's SolidActions.run(descriptor) call recorded executed=true —
+    // that second fact is exactly what Task 1's line guards.
+    const { executed, skipped } = __entrypointGuardFlags();
+    expect(skipped).toBe(true);
+    expect(executed).toBe(true);
+    expect(__shouldFailLoudOnExit(true, executed, skipped)).toBe(false);
   });
 });
