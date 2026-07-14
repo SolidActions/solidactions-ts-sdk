@@ -5,6 +5,9 @@
 
 Lightweight durable workflows for TypeScript.
 
+Requires Node.js 24 or newer. For hosted-platform setup and deployment, see
+[www.solidactions.com/docs](https://www.solidactions.com/docs).
+
 ## What is SolidActions?
 
 SolidActions provides lightweight durable workflows built on top of an HTTP API backend.
@@ -191,14 +194,37 @@ Use the [`@solidactions/cli`](https://www.npmjs.com/package/@solidactions/cli) t
 ```bash
 npm install -g @solidactions/cli
 
-# Authenticate
-solidactions init <api-key>
+# Authenticate with the API key entered in a masked prompt
+solidactions login --global
 
-# Deploy your project
-solidactions deploy <project-name> <path>
+# Scaffold a workflow project and local AI skills
+solidactions init my-workflow --claude
+# Or: solidactions init my-workflow --agents
+
+cd my-workflow
+npm install
+solidactions project deploy my-workflow -e production
+solidactions run start my-workflow hello -e production -i '{"name":"Ada"}' --wait
 ```
 
-The CLI handles project creation, source upload, Docker builds, environment variables, and scheduling. See the [CLI repo](https://github.com/SolidActions/solidactions-cli) for full documentation.
+The generated `hello` workflow requires no third-party credentials or OAuth
+connections. A successful run returns `Hello, Ada!` plus its recorded
+processing time.
+
+`solidactions init` also installs five current skills
+(`solidactions-getting-started`, `solidactions-workflow-coding`,
+`solidactions-deploy-and-config`, `solidactions-oauth-actions`, and
+`solidactions-crew-skills`) in `.claude/skills/` or `.agents/skills/`, plus
+`.solidactions/sdk-reference.md`. Restart the coding-agent session after
+installation, then ask which installed skill it should use to deploy; it
+should select `solidactions-deploy-and-config`. For an existing project, use
+`solidactions ai init --claude` or `solidactions ai init --agents`.
+
+The CLI handles project creation, source upload, Docker builds, environment
+variables, and scheduling. See the
+[public docs](https://www.solidactions.com/docs) and
+[CLI repo](https://github.com/SolidActions/solidactions-cli) for the complete
+setup contract.
 
 ## Documentation
 
