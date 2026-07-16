@@ -556,6 +556,7 @@ static getSignalUrls(topic?: string): {
 
 - Must be called from within a workflow `run` function.
 - Returns URLs that send signals to the current workflow via the platform's signal API.
+- Every returned URL includes the current run's per-run credential. Treat these URLs as secrets: do not log them or forward them beyond the intended recipient.
 
 ```typescript
 export const approvalUrls = defineWorkflow<{ id: string }, void>({

@@ -44,6 +44,8 @@ export interface RuntimeParams {
    * carries. Threaded here, ctx-sourced, so getSignalUrls stays env-free.
    */
   readonly apiUrl: string;
+  /** Per-run credential for public signal URLs (from ctx.run.runSecret). */
+  readonly runSecret: string;
   /**
    * Monotonic durable function-id counter for this run. Each durable operation
    * (step/sleep/recv/send) consumes the next id; mutated in place so a single

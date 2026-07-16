@@ -1019,14 +1019,26 @@ export class SolidActions {
       throw new SolidActionsError('getSignalUrls() must be called from within a workflow');
     }
 
+    let runSecret: string;
+    if (scope) {
+      runSecret = scope.runtimeParams.runSecret;
+    } else {
+      const legacyApiKey = process.env.SOLIDACTIONS_API_KEY ?? '';
+      const credentialSeparator = legacyApiKey.indexOf(':');
+      runSecret = credentialSeparator === -1 ? '' : legacyApiKey.slice(credentialSeparator + 1);
+    }
+    if (!runSecret) {
+      throw new SolidActionsError('getSignalUrls() requires a per-run secret');
+    }
+
     const topicParam = topic ? `&topic=${encodeURIComponent(topic)}` : '';
-    const base = `${baseApiUrl}/api/signal/${workflowId}`;
+    const base = `${baseApiUrl}/api/signal/${workflowId}?secret=${encodeURIComponent(runSecret)}`;
 
     return {
       base,
-      approve: `${base}?choice=approve${topicParam}`,
-      reject: `${base}?choice=reject${topicParam}`,
-      custom: (action: string) => `${base}?choice=${encodeURIComponent(action)}${topicParam}`,
+      approve: `${base}&choice=approve${topicParam}`,
+      reject: `${base}&choice=reject${topicParam}`,
+      custom: (action: string) => `${base}&choice=${encodeURIComponent(action)}${topicParam}`,
     };
   }
 
