@@ -20,9 +20,9 @@
  * for respond, signal URLs from ctx.api.url) and that NO launch / within-
  * workflow error was raised.
  *
- * The NON-invoke-scope legacy path (the bridge MUST no-op when not in an
- * invoke scope) is guarded by the existing 19 jsapi/workflow_input legacy
- * tests; this file does not duplicate that.
+ * The NON-invoke-scope legacy bridge is generally guarded by the existing
+ * jsapi/workflow_input tests. getSignalUrls is also covered here because its
+ * per-run credential has distinct invoke-context and legacy-env sources.
  */
 /* eslint-disable @typescript-eslint/require-await --
  * The workflow fixtures are intentionally `async` (matching the one-shot
@@ -33,6 +33,8 @@ import { setUpSolidActionsTestServer } from '../helpers';
 import { SolidActions } from '../../src';
 import { MockHttpServer } from '../../src/testing/mock_server';
 import { SolidActionsJSON } from '../../src/serialization';
+import { runWithTopContext } from '../../src/context';
+import { SolidActionsError } from '../../src/error';
 
 let srv: MockHttpServer;
 
@@ -196,11 +198,18 @@ it('workflowID getter resolves from the invoke scope (legacy-API body sees ctx.r
   expect(seenIsWithin).toBe(true);
 });
 
-it('getSignalUrls builds URLs from ctx.api.url (invoke scope), not process.env', async () => {
+it('getSignalUrls builds credentialed URLs from invoke ctx, not process.env', async () => {
   let urls: { base: string; approve: string; reject: string; custom: (a: string) => string } | undefined;
+  const runSecret = 'invoke secret/+?&=';
+  const encodedSecret = encodeURIComponent(runSecret);
+  const topic = 'approval /+?&=';
+  const encodedTopic = encodeURIComponent(topic);
   const wf = SolidActions.registerWorkflow(
     async () => {
-      urls = SolidActions.getSignalUrls('approval');
+      // The adapter has already captured ctx.run.runSecret. A conflicting
+      // process env value must not influence getSignalUrls inside invoke scope.
+      process.env.SOLIDACTIONS_API_KEY = 'wrong-trigger:wrong-secret';
+      urls = SolidActions.getSignalUrls(topic);
       return 'ok';
     },
     { name: 'primitive-bridge-signalUrls' },
@@ -209,19 +218,85 @@ it('getSignalUrls builds URLs from ctx.api.url (invoke scope), not process.env',
     () => SolidActions.run(wf),
     // Deliberately set the legacy env to a DIFFERENT host: the bridged
     // getSignalUrls must use ctx.api.url (srv.baseUrl), not these env vars.
-    mockEnv({ WORKFLOW_INPUT: '{}', APP_URL: 'http://legacy-should-not-be-used.invalid' }),
+    mockEnv({
+      WORKFLOW_INPUT: '{}',
+      APP_URL: 'http://legacy-should-not-be-used.invalid',
+      SOLIDACTIONS_API_KEY: `test-trigger:${runSecret}`,
+    }),
   );
 
   expect(code).toBe(0);
   expect(urls).toBeTruthy();
-  expect(urls!.base).toBe(`${srv.baseUrl}/api/signal/${RUN_ID}`);
-  expect(urls!.approve).toBe(`${srv.baseUrl}/api/signal/${RUN_ID}?choice=approve&topic=approval`);
-  expect(urls!.reject).toBe(`${srv.baseUrl}/api/signal/${RUN_ID}?choice=reject&topic=approval`);
-  expect(urls!.custom('escalate')).toBe(
-    `${srv.baseUrl}/api/signal/${RUN_ID}?choice=escalate&topic=approval`,
-  );
+  const base = `${srv.baseUrl}/api/signal/${RUN_ID}?secret=${encodedSecret}`;
+  expect(urls!.base).toBe(base);
+  expect(urls!.approve).toBe(`${base}&choice=approve&topic=${encodedTopic}`);
+  expect(urls!.reject).toBe(`${base}&choice=reject&topic=${encodedTopic}`);
+  expect(urls!.custom('escalate')).toBe(`${base}&choice=escalate&topic=${encodedTopic}`);
   expect(urls!.base).not.toContain('legacy-should-not-be-used');
 });
+
+it('getSignalUrls fails instead of emitting a secretless URL in invoke scope', async () => {
+  const wf = SolidActions.registerWorkflow(async () => SolidActions.getSignalUrls(), {
+    name: 'primitive-bridge-signalUrls-missing-secret',
+  });
+
+  const code = await expectProcessExit(
+    () => SolidActions.run(wf),
+    mockEnv({ WORKFLOW_INPUT: '{}', SOLIDACTIONS_API_KEY: 'test-trigger:' }),
+  );
+
+  expect(code).toBe(1);
+  expect(srv.lastWorkflowComplete()).toMatchObject({
+    status: 'failed',
+    error: 'getSignalUrls() requires a per-run secret',
+  });
+});
+
+it('getSignalUrls builds credentialed URLs from the legacy triggerId:runSecret credential', async () => {
+  const priorApiUrl = process.env.SOLIDACTIONS_API_URL;
+  const priorApiKey = process.env.SOLIDACTIONS_API_KEY;
+  const runSecret = 'legacy:secret /+?&=';
+  const encodedSecret = encodeURIComponent(runSecret);
+
+  process.env.SOLIDACTIONS_API_URL = `${srv.baseUrl}/api/internal`;
+  process.env.SOLIDACTIONS_API_KEY = `legacy-trigger:${runSecret}`;
+
+  try {
+    await runWithTopContext({ workflowId: RUN_ID }, async () => {
+      const urls = SolidActions.getSignalUrls('approval');
+      const base = `${srv.baseUrl}/api/signal/${RUN_ID}?secret=${encodedSecret}`;
+
+      expect(urls.base).toBe(base);
+      expect(urls.approve).toBe(`${base}&choice=approve&topic=approval`);
+      expect(urls.reject).toBe(`${base}&choice=reject&topic=approval`);
+      expect(urls.custom('escalate /+?&=')).toBe(`${base}&choice=escalate%20%2F%2B%3F%26%3D&topic=approval`);
+    });
+  } finally {
+    if (priorApiUrl === undefined) delete process.env.SOLIDACTIONS_API_URL;
+    else process.env.SOLIDACTIONS_API_URL = priorApiUrl;
+    if (priorApiKey === undefined) delete process.env.SOLIDACTIONS_API_KEY;
+    else process.env.SOLIDACTIONS_API_KEY = priorApiKey;
+  }
+});
+
+it.each([undefined, 'legacy-trigger', 'legacy-trigger:'])(
+  'getSignalUrls rejects a missing legacy run secret (%s)',
+  async (apiKey) => {
+    const priorApiKey = process.env.SOLIDACTIONS_API_KEY;
+    if (apiKey === undefined) delete process.env.SOLIDACTIONS_API_KEY;
+    else process.env.SOLIDACTIONS_API_KEY = apiKey;
+
+    try {
+      await runWithTopContext({ workflowId: RUN_ID }, async () => {
+        expect(() => SolidActions.getSignalUrls()).toThrow(SolidActionsError);
+        expect(() => SolidActions.getSignalUrls()).toThrow('getSignalUrls() requires a per-run secret');
+      });
+    } finally {
+      if (priorApiKey === undefined) delete process.env.SOLIDACTIONS_API_KEY;
+      else process.env.SOLIDACTIONS_API_KEY = priorApiKey;
+    }
+  },
+);
 
 it('recv bridges to the invoke-scoped engine: no message → suspends (exit 0, /wait posted, timeout preserved)', async () => {
   const wf = SolidActions.registerWorkflow(
