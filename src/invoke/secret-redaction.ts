@@ -51,13 +51,22 @@
  * un-leak past ones.
  */
 
-import type { ConnectionVar, VarValue } from './types';
+import type { ConnectionVar, DatabaseVar, VarValue } from './types';
 
 /**
  * Stable marker indicating that a snapshot entry is a reference to a
  * secret-bearing connection var rather than the plaintext value.
  */
 const REDACTED_MARKER = '__redactedConnectionVar' as const;
+
+/**
+ * Stable marker indicating that a snapshot entry is a reference to a
+ * secret-bearing database var (issue #1127, spec §4A). Wire literal is a
+ * protocol constant, mirroring {@link REDACTED_MARKER} exactly:
+ * `{"__redactedDatabaseVar": true, "varName": "<env name>"}` — emitted and
+ * recognized by exact key on both the SDK and Laravel sides.
+ */
+const DB_REDACTED_MARKER = '__redactedDatabaseVar' as const;
 
 /**
  * Public placeholder substituted for any plaintext secret string that would
@@ -79,6 +88,17 @@ export interface RedactedConnectionVarRef {
 }
 
 /**
+ * Persisted shape of a `DatabaseVar` after snapshot redaction. Carries ONLY
+ * the var name — no `proxyUrl`-style non-secret field is preserved, since
+ * §4A's rehydration substitutes the entire live var (url, token, readOnly,
+ * name), not just its secret fields.
+ */
+export interface RedactedDatabaseVarRef {
+  readonly [DB_REDACTED_MARKER]: true;
+  readonly varName: string;
+}
+
+/**
  * Returns true iff `v` is a `ConnectionVar` (object with `key`+`proxyUrl`+
  * `proxyToken` string fields). This is the same shape predicate the rest of
  * the SDK uses to distinguish ConnectionVar from a plain string var.
@@ -94,10 +114,34 @@ export function isConnectionVar(v: unknown): v is ConnectionVar {
 }
 
 /**
+ * Returns true iff `v` is a `DatabaseVar` (object with `name`+`url`+`token`
+ * string fields and a `readOnly` boolean field). The same deterministic shape
+ * predicate the rest of the SDK uses to distinguish `DatabaseVar` from a
+ * plain string var.
+ */
+export function isDatabaseVar(v: unknown): v is DatabaseVar {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof (v as { name?: unknown }).name === 'string' &&
+    typeof (v as { url?: unknown }).url === 'string' &&
+    typeof (v as { token?: unknown }).token === 'string' &&
+    typeof (v as { readOnly?: unknown }).readOnly === 'boolean'
+  );
+}
+
+/**
  * Returns true iff `v` carries the redacted-reference marker.
  */
 export function isRedactedConnectionVarRef(v: unknown): v is RedactedConnectionVarRef {
   return typeof v === 'object' && v !== null && (v as { [REDACTED_MARKER]?: unknown })[REDACTED_MARKER] === true;
+}
+
+/**
+ * Returns true iff `v` carries the database-redacted-reference marker.
+ */
+export function isRedactedDatabaseVarRef(v: unknown): v is RedactedDatabaseVarRef {
+  return typeof v === 'object' && v !== null && (v as { [DB_REDACTED_MARKER]?: unknown })[DB_REDACTED_MARKER] === true;
 }
 
 /**
@@ -107,14 +151,19 @@ export function isRedactedConnectionVarRef(v: unknown): v is RedactedConnectionV
  */
 export function redactVarsForSnapshot(
   vars: Readonly<Record<string, VarValue>>,
-): Record<string, string | RedactedConnectionVarRef> {
-  const out: Record<string, string | RedactedConnectionVarRef> = {};
+): Record<string, string | RedactedConnectionVarRef | RedactedDatabaseVarRef> {
+  const out: Record<string, string | RedactedConnectionVarRef | RedactedDatabaseVarRef> = {};
   for (const [name, value] of Object.entries(vars)) {
     if (isConnectionVar(value)) {
       out[name] = {
         [REDACTED_MARKER]: true,
         varName: name,
         proxyUrl: value.proxyUrl,
+      };
+    } else if (isDatabaseVar(value)) {
+      out[name] = {
+        [DB_REDACTED_MARKER]: true,
+        varName: name,
       };
     } else {
       out[name] = value;
@@ -172,7 +221,21 @@ export function rehydrateVarsFromSnapshot(
         // surface the absence in its own way; this layer does not throw.
         out[name] = value as unknown as VarValue;
       }
-    } else if (typeof value === 'string' || isConnectionVar(value)) {
+    } else if (isRedactedDatabaseVarRef(value)) {
+      // Deliberate divergence from ConnectionVar (spec §4A): substitute the
+      // ENTIRE live var — url, token, readOnly, name all live — never merge
+      // with anything from the snapshot. A database's endpoint changes on
+      // restore and its readOnly changes on fuse transitions, so a
+      // snapshot-pinned value would be wrong on replay.
+      const live = liveVars[name];
+      if (isDatabaseVar(live)) {
+        out[name] = live;
+      } else {
+        // Live var missing (mapping removed between dispatches) — leave the
+        // redacted ref in place, same degraded-mode failure as ConnectionVar.
+        out[name] = value as unknown as VarValue;
+      }
+    } else if (typeof value === 'string' || isConnectionVar(value) || isDatabaseVar(value)) {
       out[name] = value as VarValue;
     } else {
       // Defensive: unknown shape (legacy / corrupt) → coerce to a string
@@ -200,6 +263,8 @@ export function collectSecretStrings(vars: Readonly<Record<string, VarValue>>): 
     if (isConnectionVar(value)) {
       if (value.key.length > 0) set.add(value.key);
       if (value.proxyToken.length > 0) set.add(value.proxyToken);
+    } else if (isDatabaseVar(value)) {
+      if (value.token.length > 0) set.add(value.token);
     }
   }
   // Sort longest-first so containing-substring replacements happen before

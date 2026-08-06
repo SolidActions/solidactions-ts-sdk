@@ -66,11 +66,17 @@ export type {
   // Supporting types a user-facing type-annotation would reference
   DurablePrimitives,
   ConnectionVar,
+  DatabaseVar,
   VarValue,
   // Augmentation hook — generated .d.ts files extend this interface
   // via `declare module '@solidactions/sdk' { interface InvokeCtxVarsAugment { ... } }`
   InvokeCtxVarsAugment,
 } from './invoke/types';
+
+// Workspace databases (issue #1127): thin, vendor-neutral SQL-passthrough
+// helper wrapping a DatabaseVar (ctx.vars.MYDB).
+export { createDatabaseClient } from './invoke/database-client';
+export type { DatabaseClient, DatabaseExecuteResult, DatabaseValue } from './invoke/database-client';
 
 // Errors a user may catch at runtime
 export { WorkflowAlreadyRegisteredError, WorkflowNotRegisteredError } from './error';
