@@ -110,12 +110,67 @@ describe('createDatabaseClient: request shape', () => {
       const client = createDatabaseClient(v);
       await client.execute('INSERT INTO t VALUES (?, ?, ?, ?)', ['hello', null, 1.5, true]);
       const body = capturedBody as { requests: Array<{ type: string; stmt?: { args: unknown[] } }> };
+      // Float value is a raw NUMBER (Hrana wire contract); integers (incl.
+      // the boolean-as-integer coercion) are STRINGS for i64 precision safety.
       expect(body.requests[0]?.stmt?.args).toEqual([
         { type: 'text', value: 'hello' },
         { type: 'null' },
-        { type: 'float', value: '1.5' },
+        { type: 'float', value: 1.5 },
         { type: 'integer', value: '1' },
       ]);
+    } finally {
+      await stop();
+    }
+  });
+
+  // --- Wire-format regression: a real Turso pipeline endpoint rejects/misreads
+  // a stringified float — the Hrana protocol requires a raw JSON number for
+  // `float` cells, matching the Laravel-side TursoDataClient counterpart. ---
+  it('serializes a float arg as a raw JSON number, never a quoted string, in the actual request bytes', async () => {
+    let capturedRawBody = '';
+    const { url, stop } = await startServer((req, res, body) => {
+      capturedRawBody = body;
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          results: [
+            { type: 'ok', response: { type: 'execute', result: { cols: [], rows: [] } } },
+            { type: 'ok', response: { type: 'close' } },
+          ],
+        }),
+      );
+    });
+    try {
+      const v: DatabaseVar = { name: 'a', url, token: 'tok', readOnly: false };
+      const client = createDatabaseClient(v);
+      await client.execute('INSERT INTO t (price) VALUES (?)', [19.99]);
+      // Raw bytes: `"value":19.99` (unquoted number), never `"value":"19.99"`.
+      expect(capturedRawBody).toContain('"value":19.99');
+      expect(capturedRawBody).not.toContain('"value":"19.99"');
+    } finally {
+      await stop();
+    }
+  });
+
+  it('serializes an integer arg as a quoted string in the actual request bytes (i64 precision safety)', async () => {
+    let capturedRawBody = '';
+    const { url, stop } = await startServer((req, res, body) => {
+      capturedRawBody = body;
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          results: [
+            { type: 'ok', response: { type: 'execute', result: { cols: [], rows: [] } } },
+            { type: 'ok', response: { type: 'close' } },
+          ],
+        }),
+      );
+    });
+    try {
+      const v: DatabaseVar = { name: 'a', url, token: 'tok', readOnly: false };
+      const client = createDatabaseClient(v);
+      await client.execute('INSERT INTO t (id) VALUES (?)', [42]);
+      expect(capturedRawBody).toContain('"value":"42"');
     } finally {
       await stop();
     }
@@ -145,6 +200,96 @@ describe('createDatabaseClient: request shape', () => {
       const result = await client.execute("INSERT INTO t (name) VALUES ('x')");
       expect(result.rowsAffected).toBe(1);
       expect(result.lastInsertRowid).toBe('42');
+    } finally {
+      await stop();
+    }
+  });
+
+  it('decodes a small integer row cell (within Number.MAX_SAFE_INTEGER) as a number', async () => {
+    const { url, stop } = await startServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          results: [
+            {
+              type: 'ok',
+              response: {
+                type: 'execute',
+                result: { cols: [{ name: 'id' }], rows: [[{ type: 'integer', value: '42' }]] },
+              },
+            },
+            { type: 'ok', response: { type: 'close' } },
+          ],
+        }),
+      );
+    });
+    try {
+      const v: DatabaseVar = { name: 'a', url, token: 'tok', readOnly: false };
+      const client = createDatabaseClient(v);
+      const result = await client.execute('SELECT id FROM t');
+      expect(result.rows).toEqual([[42]]);
+      expect(typeof result.rows[0]?.[0]).toBe('number');
+    } finally {
+      await stop();
+    }
+  });
+
+  // --- Precision regression: an integer cell beyond Number.MAX_SAFE_INTEGER
+  // must not be silently rounded through a lossy Number() cast — decode it as
+  // its original string instead (mirrors the lastInsertRowid rationale). ---
+  it('decodes an integer row cell beyond Number.MAX_SAFE_INTEGER as its original string, never a rounded number', async () => {
+    const huge = '9223372036854775807'; // i64 max — well beyond 2^53
+    const { url, stop } = await startServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          results: [
+            {
+              type: 'ok',
+              response: {
+                type: 'execute',
+                result: { cols: [{ name: 'id' }], rows: [[{ type: 'integer', value: huge }]] },
+              },
+            },
+            { type: 'ok', response: { type: 'close' } },
+          ],
+        }),
+      );
+    });
+    try {
+      const v: DatabaseVar = { name: 'a', url, token: 'tok', readOnly: false };
+      const client = createDatabaseClient(v);
+      const result = await client.execute('SELECT id FROM t');
+      expect(result.rows).toEqual([[huge]]);
+      expect(typeof result.rows[0]?.[0]).toBe('string');
+    } finally {
+      await stop();
+    }
+  });
+
+  it('decodes a float row cell (raw JSON number in the response) as a number', async () => {
+    const { url, stop } = await startServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          results: [
+            {
+              type: 'ok',
+              response: {
+                type: 'execute',
+                result: { cols: [{ name: 'price' }], rows: [[{ type: 'float', value: 19.99 }]] },
+              },
+            },
+            { type: 'ok', response: { type: 'close' } },
+          ],
+        }),
+      );
+    });
+    try {
+      const v: DatabaseVar = { name: 'a', url, token: 'tok', readOnly: false };
+      const client = createDatabaseClient(v);
+      const result = await client.execute('SELECT price FROM t');
+      expect(result.rows).toEqual([[19.99]]);
     } finally {
       await stop();
     }

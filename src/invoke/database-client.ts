@@ -14,7 +14,12 @@
 
 import type { DatabaseVar } from './types';
 
-/** A single decoded Hrana value, as returned in a row. */
+/**
+ * A single decoded Hrana value, as returned in a row. Integer cells beyond
+ * `Number.MAX_SAFE_INTEGER` are returned as their original decimal STRING
+ * (never silently rounded) — the same precision-preserving rationale as
+ * {@link DatabaseExecuteResult.lastInsertRowid}.
+ */
 export type DatabaseValue = string | number | boolean | Buffer | null;
 
 /** Result of a single SQL statement executed via {@link createDatabaseClient}. */
@@ -41,7 +46,13 @@ export interface DatabaseClient {
 
 interface HranaValue {
   type: string;
-  value?: string;
+  /**
+   * Hrana wire encoding: integers are a STRING (i64 precision safety —
+   * SQLite integers exceed what a JS/JSON `number` can represent exactly);
+   * floats are a raw JSON `number`. Mixing these up produces a malformed
+   * request the real Turso pipeline endpoint rejects or misreads.
+   */
+  value?: string | number;
   base64?: string;
 }
 
@@ -56,7 +67,9 @@ function toHranaValue(v: unknown): HranaValue {
     return { type: 'integer', value: v.toString() };
   }
   if (typeof v === 'number') {
-    return Number.isInteger(v) ? { type: 'integer', value: String(v) } : { type: 'float', value: String(v) };
+    // Integer → string (i64 precision safety); float → raw JSON number
+    // (Hrana wire contract — see HranaValue.value doc).
+    return Number.isInteger(v) ? { type: 'integer', value: String(v) } : { type: 'float', value: v };
   }
   if (typeof v === 'boolean') {
     return { type: 'integer', value: v ? '1' : '0' };
@@ -73,10 +86,21 @@ function fromHranaValue(v: HranaValue | null | undefined): DatabaseValue {
   }
   switch (v.type) {
     case 'text':
-      return v.value ?? null;
-    case 'integer':
+      return typeof v.value === 'string' ? v.value : null;
+    case 'integer': {
+      // Wire value is always a decimal STRING (i64 precision safety). Decode
+      // to a number only when it round-trips exactly through a JS double;
+      // beyond Number.MAX_SAFE_INTEGER, preserve the original string rather
+      // than silently rounding (same rationale as lastInsertRowid).
+      if (typeof v.value !== 'string') {
+        return null;
+      }
+      const n = Number(v.value);
+      return Number.isSafeInteger(n) ? n : v.value;
+    }
     case 'float':
-      return v.value !== undefined ? Number(v.value) : null;
+      // Wire value is a raw JSON number already.
+      return typeof v.value === 'number' ? v.value : v.value !== undefined ? Number(v.value) : null;
     case 'blob':
       return v.base64 !== undefined ? Buffer.from(v.base64, 'base64') : null;
     default:
