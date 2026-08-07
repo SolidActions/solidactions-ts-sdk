@@ -37,7 +37,26 @@ export interface ConnectionVar {
    */
   readonly broker?: ConnectionBroker;
 }
-export type VarValue = string | ConnectionVar;
+
+/**
+ * A workspace database var: a dispatch-time-minted libSQL endpoint + token
+ * (issue #1127, spec §4A). Classified deterministically from the
+ * `SOLIDACTIONS__DB_KEYS` manifest — never by value-shape heuristic.
+ *
+ * Rehydration on replay substitutes the ENTIRE var from the live
+ * adapter-supplied env (url + token + readOnly + name), not just the secret
+ * fields — a deliberate divergence from `ConnectionVar`'s `proxyUrl`-preserving
+ * semantics: a database's endpoint changes on restore (new physical) and its
+ * `readOnly` changes on fuse transitions, so a snapshot-pinned url/readOnly
+ * would be wrong on replay.
+ */
+export interface DatabaseVar {
+  readonly name: string;
+  readonly url: string;
+  readonly token: string;
+  readonly readOnly: boolean;
+}
+export type VarValue = string | ConnectionVar | DatabaseVar;
 /**
  * Open augmentation hook for generated `ctx.vars` types (Task 4.1).
  *

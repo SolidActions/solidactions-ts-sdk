@@ -245,6 +245,81 @@ Inside a `run(ctx)` body, call the durable operations through the **`SolidAction
 
 ---
 
+## Workspace Databases
+
+A project can declare a workspace database in `solidactions.yaml` and read it through `ctx.vars`, alongside plain vars and `ConnectionVar`s:
+
+```yaml
+env:
+  - MYDB:
+      database: 'analytics' # workspace database name
+```
+
+This surfaces as a `DatabaseVar` at `ctx.vars.MYDB`:
+
+```typescript
+interface DatabaseVar {
+  readonly name: string; // the declared database name
+  readonly url: string; // a dispatch-time-minted endpoint, e.g. libsql://<hostname>
+  readonly token: string; // bearer token for this run — treat as a secret
+  readonly readOnly: boolean; // true once the workspace's write fuse has tripped
+}
+```
+
+- Like `ConnectionVar`, the token is minted per-dispatch and scoped to the run — you never manage a long-lived credential yourself.
+- **`readOnly`**: if a workspace's write budget trips (the write fuse), new tokens are minted read-only and writes fail — reads keep working. Check `ctx.vars.MYDB.readOnly` if you want to fail fast instead of surfacing the database's own rejection.
+- `url`/`token`/`readOnly` are not stable across a durable sleep: on resume the entire var is rehydrated fresh from the live dispatch (current endpoint, current fuse state), not replayed from a stored snapshot. The token is redacted before any durable snapshot is written, so plaintext credentials never persist — this is automatic and needs no handling in workflow code.
+
+### `createDatabaseClient()`
+
+`createDatabaseClient(v: DatabaseVar)` wraps a `DatabaseVar` in a client that executes raw SQL:
+
+```typescript
+interface DatabaseClient {
+  execute(sql: string, args?: unknown[]): Promise<DatabaseExecuteResult>;
+}
+
+interface DatabaseExecuteResult {
+  columns: string[];
+  rows: (string | number | boolean | Buffer | null)[][];
+  rowsAffected?: number;
+  lastInsertRowid?: string; // a string — rowids can exceed Number.MAX_SAFE_INTEGER
+}
+```
+
+`execute()` is **raw SQL passthrough** — no query builder, no dialect filtering. Anything the workspace database accepts works verbatim, including full-text search and vector search. Wrap calls in `SolidActions.runStep()` for checkpointing, same as any other side effect:
+
+```typescript
+import { SolidActions, defineWorkflow, createDatabaseClient, type DatabaseVar } from '@solidactions/sdk';
+
+export const analyticsWorkflow = defineWorkflow<{ userId: string }, { count: number }>({
+  name: 'analytics-workflow',
+  async run(ctx) {
+    const db = createDatabaseClient(ctx.vars.MYDB as DatabaseVar);
+
+    await SolidActions.runStep(() => db.execute('CREATE TABLE IF NOT EXISTS events (id TEXT, user_id TEXT)'), {
+      name: 'ensure-table',
+    });
+
+    await SolidActions.runStep(
+      () => db.execute('INSERT INTO events (id, user_id) VALUES (?, ?)', [SolidActions.randomUUID(), ctx.input.userId]),
+      { name: 'insert-event' },
+    );
+
+    const result = await SolidActions.runStep(
+      () => db.execute('SELECT COUNT(*) as count FROM events WHERE user_id = ?', [ctx.input.userId]),
+      { name: 'count-events' },
+    );
+
+    return { count: Number(result.rows[0][0]) };
+  },
+});
+```
+
+With `InvokeCtxVarsAugment` generated for this project (see [Typed `ctx.vars`](#typed-ctxvars)), `ctx.vars.MYDB` is `DatabaseVar` directly — no cast needed.
+
+---
+
 ## Steps
 
 Steps are the building blocks of workflows. They wrap ordinary functions and provide checkpointing — if a workflow is interrupted, it resumes from the last completed step. The function passed to a step is **not** re-executed on resume; its recorded result is replayed.

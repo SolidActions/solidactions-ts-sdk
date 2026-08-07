@@ -12,6 +12,7 @@ import {
   defineWorkflow,
   WorkflowAlreadyRegisteredError,
   WorkflowNotRegisteredError,
+  createDatabaseClient,
 } from '../../src/index';
 import type {
   WorkflowDescriptor,
@@ -19,6 +20,7 @@ import type {
   InvokeResult,
   DurablePrimitives,
   ConnectionVar,
+  DatabaseVar,
   VarValue,
 } from '../../src/index';
 import { __clearRegistry } from '../../src/invoke/registry';
@@ -40,15 +42,16 @@ describe('public API: defineWorkflow exported from package root', () => {
   });
 
   it('defineWorkflow infers name from named function', () => {
-    async function namedRun() { return true; }
+    async function namedRun() {
+      return true;
+    }
     const wf = defineWorkflow({ run: namedRun });
     expect(wf.name).toBe('namedRun');
   });
 
   it('defineWorkflow throws on duplicate registration of a different descriptor', () => {
     defineWorkflow({ name: 'duplicate', run: async () => 1 });
-    expect(() => defineWorkflow({ name: 'duplicate', run: async () => 2 }))
-      .toThrow(WorkflowAlreadyRegisteredError);
+    expect(() => defineWorkflow({ name: 'duplicate', run: async () => 2 })).toThrow(WorkflowAlreadyRegisteredError);
   });
 
   it('WorkflowAlreadyRegisteredError is exported from the package root', () => {
@@ -95,5 +98,19 @@ describe('public API: defineWorkflow exported from package root', () => {
     expect(cv.key).toBe('k');
     expect(strVar).toBe('plain-string');
     expect((connVar as ConnectionVar).proxyToken).toBe('tok');
+  });
+
+  // --- Issue #1127: DatabaseVar + createDatabaseClient exported from the package root ---
+
+  it('type-check: DatabaseVar is usable as a VarValue annotation', () => {
+    const dv: DatabaseVar = { name: 'analytics', url: 'libsql://a', token: 'tok', readOnly: false };
+    const dbVar: VarValue = dv;
+    expect(dv.name).toBe('analytics');
+    expect((dbVar as DatabaseVar).readOnly).toBe(false);
+  });
+
+  it('createDatabaseClient is importable from the package root and returns a client with execute()', () => {
+    const client = createDatabaseClient({ name: 'analytics', url: 'libsql://a', token: 'tok', readOnly: false });
+    expect(typeof client.execute).toBe('function');
   });
 });
