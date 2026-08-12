@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const readme = await readFile(path.join(root, 'README.md'), 'utf8');
+const sdkReference = await readFile(path.join(root, 'docs/sdk-reference.md'), 'utf8');
 const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const packageLock = JSON.parse(await readFile(path.join(root, 'package-lock.json'), 'utf8'));
 const skillNames = [
@@ -17,7 +18,19 @@ const skillNames = [
 
 assert.equal(packageJson.engines?.node, '>=24', 'SDK package must require Node.js 24');
 assert.equal(packageLock.version, packageJson.version, 'SDK package and lockfile versions must match');
-assert.equal(packageLock.packages?.['']?.version, packageJson.version, 'SDK lockfile root version must match the package');
+assert.equal(
+  packageLock.packages?.['']?.version,
+  packageJson.version,
+  'SDK lockfile root version must match the package',
+);
+assert(
+  /workspace database bindings require `@solidactions\/sdk >=0\.8\.0`/i.test(sdkReference),
+  'SDK reference must state the minimum version for workspace database bindings',
+);
+assert(
+  /wire[^.\n]*`read_only`[^.\n]*hydration[^.\n]*`DatabaseVar\.readOnly`/i.test(sdkReference),
+  'SDK reference must explain read_only wire hydration to DatabaseVar.readOnly',
+);
 for (const command of [
   'solidactions login --global',
   'solidactions init my-workflow --claude',

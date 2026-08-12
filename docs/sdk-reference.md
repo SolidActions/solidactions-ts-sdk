@@ -247,6 +247,8 @@ Inside a `run(ctx)` body, call the durable operations through the **`SolidAction
 
 ## Workspace Databases
 
+Workspace database bindings require `@solidactions/sdk >=0.8.0`.
+
 A project can declare a workspace database in `solidactions.yaml` and read it through `ctx.vars`, alongside plain vars and `ConnectionVar`s:
 
 ```yaml
@@ -265,6 +267,8 @@ interface DatabaseVar {
   readonly readOnly: boolean; // true once the workspace's write fuse has tripped
 }
 ```
+
+On the wire, the private JSON payload uses `read_only`; SDK hydration exposes that field as the public `DatabaseVar.readOnly` property. Workflow code should consume the typed SDK object instead of parsing the transport string.
 
 - Like `ConnectionVar`, the token is minted per-dispatch and scoped to the run — you never manage a long-lived credential yourself.
 - **`readOnly`**: if a workspace's write budget trips (the write fuse), new tokens are minted read-only and writes fail — reads keep working. Check `ctx.vars.MYDB.readOnly` if you want to fail fast instead of surfacing the database's own rejection.
