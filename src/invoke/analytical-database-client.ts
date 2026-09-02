@@ -377,7 +377,7 @@ export function createAnalyticalDatabaseClient(
     const payload = `${head},\"rows\":${rowsBytes}}`;
     if (Buffer.byteLength(payload, 'utf8') > INLINE_BATCH_MAX_BYTES) {
       throw new AnalyticalIngestError(
-        'Inline analytical ingest exceeds inline_batch_max_bytes=5,242,880 bytes (5 MiB)',
+        'Inline analytical ingest exceeds limit: inline_batch_max_bytes is 5 MiB (5,242,880 bytes)',
         {
           code: 'inline_batch_too_large',
           batchId: id,

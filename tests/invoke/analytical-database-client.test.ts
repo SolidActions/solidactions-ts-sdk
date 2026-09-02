@@ -1014,7 +1014,7 @@ describe('analytical database client', () => {
     }
   });
 
-  it('accepts exactly inline_batch_max_bytes=5,242,880 bytes (5 MiB) and rejects one byte over', async () => {
+  it('accepts exactly inline_batch_max_bytes is 5 MiB (5,242,880 bytes) and rejects one byte over', async () => {
     const limit = 5_242_880;
     let calls = 0;
     let received = 0;
@@ -1035,7 +1035,7 @@ describe('analytical database client', () => {
         createAnalyticalDatabaseClient(DATABASE).append('t', [{ x: `${atLimit}x` }], { batchId: 'b' }),
       ).rejects.toMatchObject({
         code: 'inline_batch_too_large',
-        message: 'Inline analytical ingest exceeds inline_batch_max_bytes=5,242,880 bytes (5 MiB)',
+        message: 'Inline analytical ingest exceeds limit: inline_batch_max_bytes is 5 MiB (5,242,880 bytes)',
       });
       expect(calls).toBe(1);
     } finally {
