@@ -50,14 +50,14 @@ export function generateVarsTypes(declarations: VarsDeclarations): string {
     lines.push(`  ${name}: ConnectionVar;`);
   }
   for (const name of databases) {
-    lines.push(`  ${name}: DatabaseVar;`);
+    lines.push(`  ${name}: DatabaseVar | AnalyticalDatabaseBinding;`);
   }
 
   const interfaceBody = lines.length > 0 ? '\n' + lines.join('\n') + '\n' : '';
 
   const importedTypes: string[] = [];
   if (connections.length > 0) importedTypes.push('ConnectionVar');
-  if (databases.length > 0) importedTypes.push('DatabaseVar');
+  if (databases.length > 0) importedTypes.push('DatabaseVar', 'AnalyticalDatabaseBinding');
   const importLine =
     importedTypes.length > 0 ? `import type { ${importedTypes.join(', ')} } from '@solidactions/sdk';\n\n` : '';
 

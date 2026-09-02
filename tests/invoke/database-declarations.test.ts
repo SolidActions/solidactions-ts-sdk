@@ -52,15 +52,15 @@ env:
 });
 
 describe('generateVarsTypes: database form', () => {
-  it('emits `VarName: DatabaseVar;` for a database declaration', () => {
+  it('emits the cross-kind database union for a database declaration', () => {
     const dts = generateVarsTypes({ vars: [], connections: [], databases: ['MYDB'] });
-    expect(dts).toContain('MYDB: DatabaseVar;');
+    expect(dts).toContain('MYDB: DatabaseVar | AnalyticalDatabaseBinding;');
     expect(dts).toContain('interface GeneratedVars');
   });
 
   it('imports DatabaseVar from @solidactions/sdk when a database declaration is present', () => {
     const dts = generateVarsTypes({ vars: [], connections: [], databases: ['MYDB'] });
-    expect(dts).toContain("import type { DatabaseVar } from '@solidactions/sdk'");
+    expect(dts).toContain("import type { DatabaseVar, AnalyticalDatabaseBinding } from '@solidactions/sdk'");
   });
 
   it('imports both ConnectionVar and DatabaseVar when both kinds are present', () => {
@@ -91,6 +91,6 @@ env:
     const decls = parseDeclarations(yaml);
     const dts = generateVarsTypes(decls);
     expect(dts).toContain('PLAIN_VAR: string;');
-    expect(dts).toContain('MYDB: DatabaseVar;');
+    expect(dts).toContain('MYDB: DatabaseVar | AnalyticalDatabaseBinding;');
   });
 });

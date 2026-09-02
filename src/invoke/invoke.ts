@@ -254,6 +254,7 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
     // bridged SolidActions.getSignalUrls can build signal URLs on the invoke
     // path without reading SOLIDACTIONS_API_URL/APP_URL.
     apiUrl: ctx.api.url,
+    apiKey: ctx.api.key,
     runSecret: ctx.run.runSecret,
     functionIDCounter: 0,
   };

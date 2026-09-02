@@ -67,6 +67,7 @@ export type {
   DurablePrimitives,
   ConnectionVar,
   DatabaseVar,
+  AnalyticalDatabaseBinding,
   VarValue,
   // Augmentation hook — generated .d.ts files extend this interface
   // via `declare module '@solidactions/sdk' { interface InvokeCtxVarsAugment { ... } }`
@@ -77,6 +78,15 @@ export type {
 // helper wrapping a DatabaseVar (ctx.vars.MYDB).
 export { createDatabaseClient } from './invoke/database-client';
 export type { DatabaseClient, DatabaseExecuteResult, DatabaseValue } from './invoke/database-client';
+export { createAnalyticalDatabaseClient, AnalyticalIngestError } from './invoke/analytical-database-client';
+export type {
+  AnalyticalDatabaseClient,
+  AnalyticalIngestMode,
+  AnalyticalFileFormat,
+  AnalyticalIngestOptions,
+  AnalyticalFileIngestOptions,
+  AnalyticalIngestResult,
+} from './invoke/analytical-database-client';
 
 // Errors a user may catch at runtime
 export { WorkflowAlreadyRegisteredError, WorkflowNotRegisteredError } from './error';

@@ -322,6 +322,35 @@ export const analyticsWorkflow = defineWorkflow<{ userId: string }, { count: num
 
 With `InvokeCtxVarsAugment` generated for this project (see [Typed `ctx.vars`](#typed-ctxvars)), `ctx.vars.MYDB` is `DatabaseVar` directly — no cast needed.
 
+### `createAnalyticalDatabaseClient()`
+
+Analytical database ingest requires `@solidactions/sdk >=0.9.0`. A `database:` mapping may resolve to either a libSQL `DatabaseVar` or an analytical database UUID. Generated vars therefore allow both kinds; each factory gives a teaching error if the server-resolved kind is passed to the wrong one.
+
+```typescript
+import {
+  SolidActions,
+  defineWorkflow,
+  createAnalyticalDatabaseClient,
+  type AnalyticalDatabaseBinding,
+} from '@solidactions/sdk';
+
+export const ingest = defineWorkflow<{ rows: Record<string, unknown>[] }, void>({
+  name: 'analytical-ingest',
+  async run(ctx) {
+    const db = createAnalyticalDatabaseClient(ctx.vars.WAREHOUSE as AnalyticalDatabaseBinding);
+    await SolidActions.runStep(() => db.append('events', ctx.input.rows), { name: 'append-events' });
+    await SolidActions.runStep(() => db.replace('daily_rollup', ctx.input.rows), { name: 'replace-rollup' });
+    await SolidActions.runStep(() => db.ingestFile('events', './events.parquet'), { name: 'ingest-events-file' });
+  },
+});
+```
+
+With generated `InvokeCtxVarsAugment` types, the cast is unnecessary. `append` adds rows and `replace` atomically replaces the table contents. `ingestFile` streams `.parquet`, `.csv`, or `.jsonl` through staged storage without buffering the file; use `format` for an extensionless path.
+
+The helper derives a stable `batchId` from the database, normalized table, mode, format, and canonical content digest. An identical durable-step retry safely resumes or replays the server ledger. If you supply `batchId`, derive it deterministically from workflow input—never use the current time or a fresh random UUID outside the step.
+
+Calls wait for a durable acknowledgement (two-minute inline and 45-minute file defaults). A timeout throws `AnalyticalIngestError` with `code === 'ingest_pending'`, `batchId`, and `lastState`; it does not mean the batch failed, so retry the identical call. Structured server errors retain their code, status, and details. `insufficient_credit` is not retried. `AbortSignal` cancels local hashing, upload, API calls, and polling, but cannot roll back an already submitted batch and is not restored across durable resume.
+
 ---
 
 ## Steps
