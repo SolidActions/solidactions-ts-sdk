@@ -12,7 +12,7 @@
  * dependency — just `fetch`.
  */
 
-import type { DatabaseVar } from './types';
+import type { AnalyticalDatabaseBinding, DatabaseVar } from './types';
 
 /**
  * A single decoded Hrana value, as returned in a row. Integer cells beyond
@@ -140,7 +140,12 @@ interface HranaPipelineResponse {
  * `{url, token}` pair works with any libSQL-compatible client; this helper is
  * pure convenience, never blessed as the only way to reach the database.
  */
-export function createDatabaseClient(v: DatabaseVar): DatabaseClient {
+export function createDatabaseClient(v: DatabaseVar | AnalyticalDatabaseBinding): DatabaseClient {
+  if (typeof v === 'string') {
+    throw new Error(
+      '[createDatabaseClient] received an analytical database binding; use createAnalyticalDatabaseClient instead',
+    );
+  }
   const base = httpBaseUrl(v.url);
   return {
     async execute(sql: string, args: unknown[] = []): Promise<DatabaseExecuteResult> {

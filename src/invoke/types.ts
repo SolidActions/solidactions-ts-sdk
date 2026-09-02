@@ -56,6 +56,7 @@ export interface DatabaseVar {
   readonly token: string;
   readonly readOnly: boolean;
 }
+export type AnalyticalDatabaseBinding = string;
 export type VarValue = string | ConnectionVar | DatabaseVar;
 /**
  * Open augmentation hook for generated `ctx.vars` types (Task 4.1).
@@ -74,7 +75,7 @@ export type VarValue = string | ConnectionVar | DatabaseVar;
  *     }
  *   }
  */
-// eslint-disable-next-line @typescript-eslint/no-empty-interface
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- declaration-merging hook intentionally starts empty
 export interface InvokeCtxVarsAugment {}
 
 export interface InvokeCtx<I = unknown> {
