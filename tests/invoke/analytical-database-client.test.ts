@@ -37,6 +37,18 @@ function field(value: Record<string, unknown>, key: string): string {
   return found;
 }
 
+function ackReply(batchId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    batch_id: batchId,
+    state: 'acked',
+    rows: 0,
+    durable: true,
+    live_bytes: 0,
+    acked_at: '2026-09-02T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
 async function server(handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>) {
   const srv = createServer(handler);
   srv.listen(0, '127.0.0.1');
@@ -79,7 +91,7 @@ describe('analytical database client', () => {
       authorizations.push(req.headers.authorization);
       const sent = jsonObject(await body(req));
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(field(sent, 'batch_id'))));
     });
     env(url);
     const runtimeParams = {
@@ -123,7 +135,7 @@ describe('analytical database client', () => {
       if (seen++ === 0) firstId = sentId;
       else expect(sentId).toBe(firstId);
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ batch_id: sentId, state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(sentId)));
     });
     env(url);
     try {
@@ -154,7 +166,7 @@ describe('analytical database client', () => {
         return;
       }
       const sent = jsonObject(bodies[1]);
-      res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(field(sent, 'batch_id'))));
     });
     env(url);
     try {
@@ -177,7 +189,7 @@ describe('analytical database client', () => {
         return;
       }
       const sent = jsonObject(bodies[0]);
-      res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', rows: 1, durable: true }));
+      res.end(JSON.stringify(ackReply(field(sent, 'batch_id'), { rows: 1 })));
     });
     env(url);
     try {
@@ -189,7 +201,7 @@ describe('analytical database client', () => {
     }
   });
 
-  it('reissues a lost inline operation once with the exact body when status is absent', async () => {
+  it('does not invent a recovery code when status returns an HTTP error', async () => {
     const operations: string[] = [];
     const bodies: string[] = [];
     const { srv, url } = await server(async (req, res) => {
@@ -200,20 +212,15 @@ describe('analytical database client', () => {
         res.destroy();
         return;
       }
-      if (operations.length === 2) {
-        res.statusCode = 404;
-        res.end(JSON.stringify({ code: 'batch_not_found' }));
-        return;
-      }
-      const sent = jsonObject(bodies[2]);
-      res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', durable: true }));
+      res.statusCode = 404;
+      res.end(JSON.stringify({ code: 'batch_not_found' }));
     });
     env(url);
     try {
-      await createAnalyticalDatabaseClient(DATABASE).replace(' Events ', [{ z: 1, a: 2 }]);
-      expect(operations).toEqual(['ingest', 'ingest_status', 'ingest']);
-      expect(bodies[2]).toBe(bodies[0]);
-      expect(Object.keys(jsonObject(bodies[2])).sort()).toEqual(['batch_id', 'mode', 'rows', 'table']);
+      await expect(
+        createAnalyticalDatabaseClient(DATABASE).replace(' Events ', [{ z: 1, a: 2 }]),
+      ).rejects.toMatchObject({ code: 'batch_not_found', status: 404 });
+      expect(operations).toEqual(['ingest', 'ingest_status']);
     } finally {
       srv.close();
     }
@@ -242,7 +249,7 @@ describe('analytical database client', () => {
       if (operation === 'ingest_status') res.end(JSON.stringify({ batch_id: id, state: 'prepared' }));
       else if (operation === 'ingest_prepare')
         res.end(JSON.stringify({ batch_id: id, upload_url: `${upload.url}/put`, upload_headers: {} }));
-      else res.end(JSON.stringify({ batch_id: id, state: 'acked', durable: true }));
+      else res.end(JSON.stringify(ackReply(id)));
     });
     env(api.url);
     const dir = await mkdtemp(join(tmpdir(), 'sa-recovery-'));
@@ -273,11 +280,11 @@ describe('analytical database client', () => {
       }
       statusCalls++;
       res.end(
-        JSON.stringify({
-          batch_id: field(sent, 'batch_id'),
-          state: statusCalls === 1 ? 'copying' : 'acked',
-          durable: true,
-        }),
+        JSON.stringify(
+          statusCalls === 1
+            ? { batch_id: field(sent, 'batch_id'), state: 'copying' }
+            : ackReply(field(sent, 'batch_id')),
+        ),
       );
     });
     env(url);
@@ -325,21 +332,16 @@ describe('analytical database client', () => {
         }
         if (operation === 'ingest_status') {
           statusCalls++;
-          res.end(
-            JSON.stringify({
-              batch_id: id,
-              state:
-                scenario === 'later prepared status' && statusCalls === 1
-                  ? 'prepared'
-                  : scenario === 'lost commit reply'
-                    ? 'prepared'
-                    : 'acked',
-              durable: true,
-            }),
-          );
+          const state =
+            scenario === 'later prepared status' && statusCalls === 1
+              ? 'prepared'
+              : scenario === 'lost commit reply'
+                ? 'prepared'
+                : 'acked';
+          res.end(JSON.stringify(state === 'acked' ? ackReply(id) : { batch_id: id, state }));
           return;
         }
-        res.end(JSON.stringify({ batch_id: id, state: 'acked', durable: true }));
+        res.end(JSON.stringify(ackReply(id)));
       });
       env(api.url);
       const dir = await mkdtemp(join(tmpdir(), 'sa-recovery-'));
@@ -358,6 +360,48 @@ describe('analytical database client', () => {
     },
   );
 
+  it('backs off and bounds repeated prepared commit replies by the overall deadline', async () => {
+    const operations: string[] = [];
+    const commitTimes: number[] = [];
+    const upload = await server(async (req, res) => {
+      await body(req);
+      res.end();
+    });
+    const api = await server(async (req, res) => {
+      const operation = req.url!.split('/').pop()!;
+      operations.push(operation);
+      if (operation === 'ingest_commit') commitTimes.push(performance.now());
+      const sent = jsonObject(await body(req));
+      res.setHeader('content-type', 'application/json');
+      if (operation === 'ingest_prepare') {
+        res.end(
+          JSON.stringify({ batch_id: field(sent, 'batch_id'), upload_url: `${upload.url}/put`, upload_headers: {} }),
+        );
+      } else {
+        res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'prepared' }));
+      }
+    });
+    env(api.url);
+    const dir = await mkdtemp(join(tmpdir(), 'sa-prepared-deadline-'));
+    const path = join(dir, 'events.csv');
+    await writeFile(path, 'id\n1\n');
+    const random = jest.spyOn(Math, 'random').mockReturnValue(1);
+    try {
+      await expect(
+        createAnalyticalDatabaseClient(DATABASE).ingestFile('events', path, { timeoutMs: 850 }),
+      ).rejects.toMatchObject({ code: 'ingest_pending', lastState: 'prepared' });
+      const commits = operations.filter((operation) => operation === 'ingest_commit');
+      expect(commits.length).toBeGreaterThanOrEqual(3);
+      expect(commits.length).toBeLessThanOrEqual(4);
+      expect(commitTimes[1] - commitTimes[0]).toBeGreaterThanOrEqual(200);
+      expect(commitTimes[2] - commitTimes[1]).toBeGreaterThanOrEqual(400);
+    } finally {
+      random.mockRestore();
+      api.srv.close();
+      upload.srv.close();
+    }
+  });
+
   it.each([
     ['acked', 'resolve'],
     ['failed', 'reject'],
@@ -368,17 +412,18 @@ describe('analytical database client', () => {
       const sent = jsonObject(await body(req));
       res.setHeader('content-type', 'application/json');
       if (req.url!.endsWith('/ingest')) {
+        const id = field(sent, 'batch_id');
         res.end(
-          JSON.stringify({
-            batch_id: field(sent, 'batch_id'),
-            state,
-            ...(state === 'failed' ? { error_code: 'schema_mismatch' } : {}),
-          }),
+          JSON.stringify(
+            state === 'acked'
+              ? ackReply(id)
+              : { batch_id: id, state, ...(state === 'failed' ? { error_code: 'schema_mismatch' } : {}) },
+          ),
         );
         return;
       }
       statusCalls++;
-      res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(field(sent, 'batch_id'))));
     });
     env(url);
     try {
@@ -462,7 +507,7 @@ describe('analytical database client', () => {
       const id = field(jsonObject(raw), 'batch_id');
       if (operation === 'ingest_prepare')
         res.end(JSON.stringify({ batch_id: id, upload_url: `${upload.url}/put`, upload_headers: {} }));
-      else res.end(JSON.stringify({ batch_id: id, state: 'acked', durable: true }));
+      else res.end(JSON.stringify(ackReply(id)));
     });
     env(api.url);
     const dir = await mkdtemp(join(tmpdir(), 'sa-recovery-'));
@@ -787,6 +832,45 @@ describe('analytical database client', () => {
     }
   });
 
+  it('pins the ingest_prepare wire body and staged-file digest batch id', async () => {
+    let prepare: Record<string, unknown> = {};
+    const upload = await server(async (req, res) => {
+      await body(req);
+      res.end();
+    });
+    const api = await server(async (req, res) => {
+      const sent = jsonObject(await body(req));
+      res.setHeader('content-type', 'application/json');
+      if (req.url!.endsWith('/ingest_prepare')) {
+        prepare = sent;
+        res.end(
+          JSON.stringify({ batch_id: field(sent, 'batch_id'), upload_url: `${upload.url}/put`, upload_headers: {} }),
+        );
+      } else {
+        res.end(JSON.stringify(ackReply(field(sent, 'batch_id'))));
+      }
+    });
+    env(api.url);
+    const dir = await mkdtemp(join(tmpdir(), 'sa-prepare-golden-'));
+    const path = join(dir, 'events.csv');
+    await writeFile(path, 'id\n1\n');
+    try {
+      const result = await createAnalyticalDatabaseClient(DATABASE).ingestFile(' Events ', path);
+      expect(prepare).toEqual({
+        table: 'events',
+        mode: 'append',
+        batch_id: '4cdc8e1d110ecbd7e08e88de8444f9ff',
+        format: 'csv',
+        declared_bytes: 5,
+        content_sha256: '7cde7fb64fd82bd152710cf238e017b9ab46c0592483edc067ba4f6c75fac108',
+      });
+      expect(result.batchId).toBe('4cdc8e1d110ecbd7e08e88de8444f9ff');
+    } finally {
+      api.srv.close();
+      upload.srv.close();
+    }
+  });
+
   it('uploads a 200 MiB sparse file in a constrained-heap subprocess without whole buffering', async () => {
     const fileSize = 200 * 1024 * 1024;
     let uploadedBytes = 0;
@@ -806,7 +890,7 @@ describe('analytical database client', () => {
           JSON.stringify({ batch_id: field(sent, 'batch_id'), upload_url: `${upload.url}/sparse`, upload_headers: {} }),
         );
       } else {
-        res.end(JSON.stringify({ batch_id: field(sent, 'batch_id'), state: 'acked', durable: true }));
+        res.end(JSON.stringify(ackReply(field(sent, 'batch_id'))));
       }
     });
     const dir = await mkdtemp(join(tmpdir(), 'sa-constrained-'));
@@ -845,6 +929,55 @@ describe('analytical database client', () => {
   });
 
   it.each([
+    ['kind_mismatch', 409, 'This database is Standard · SQLite; use createDatabaseClient instead.'],
+    ['read_only', 403, 'Analytical databases are read-only over SQL; load data with ingest.'],
+    ['storage_exhausted', 403, 'This analytical database has reached its storage limit.'],
+    ['schema_mismatch', 422, 'Column total is DOUBLE, but the incoming value is VARCHAR.'],
+    ['insufficient_credit', 402, 'Add credits or wait for the next billing period before waking this database.'],
+  ])('preserves the %s rejection as a typed teaching error', async (code, status, message) => {
+    const { srv, url } = await server((_req, res) => {
+      res.statusCode = status;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ code, message }));
+    });
+    env(url);
+    try {
+      const error: unknown = await createAnalyticalDatabaseClient(DATABASE)
+        .append('t', [])
+        .catch((reason: unknown) => reason);
+      expect(error).toBeInstanceOf(AnalyticalIngestError);
+      expect(error).toMatchObject({ code, status, message });
+    } finally {
+      srv.close();
+    }
+  });
+
+  it.each([
+    ['missing batch_id', { state: 'acked', rows: 1, durable: true, live_bytes: 2, acked_at: 'now' }],
+    ['wrong batch_id', ackReply('different-batch')],
+    ['missing rows', { batch_id: 'b', state: 'acked', durable: true, live_bytes: 2, acked_at: 'now' }],
+    ['non-numeric rows', ackReply('b', { rows: '1' })],
+    ['durable false', ackReply('b', { durable: false })],
+    ['missing live_bytes', { batch_id: 'b', state: 'acked', rows: 1, durable: true, acked_at: 'now' }],
+    ['missing acked_at', { batch_id: 'b', state: 'acked', rows: 1, durable: true, live_bytes: 2 }],
+  ])('fails closed on an acked response with %s', async (_case, response) => {
+    const { srv, url } = await server((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(response));
+    });
+    env(url);
+    try {
+      const error: unknown = await createAnalyticalDatabaseClient(DATABASE)
+        .append('t', [], { batchId: 'b' })
+        .catch((reason: unknown) => reason);
+      expect(error).toBeInstanceOf(AnalyticalIngestError);
+      expect(error).toMatchObject({ code: 'invalid_ingest_response', batchId: 'b' });
+    } finally {
+      srv.close();
+    }
+  });
+
+  it.each([
     [
       'RFC 8785 numbers, Unicode, and negative zero',
       [{ numbers: [333333333.33333329, 1e30, 4.5, 0.002, 1e-27], unicode: '€$\u000f\nA\'B"\\"', z: -0 }],
@@ -868,7 +1001,7 @@ describe('analytical database client', () => {
     const { srv, url } = await server(async (req, res) => {
       raw = await body(req);
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ batch_id: expectedId, state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(expectedId)));
     });
     env(url);
     try {
@@ -890,7 +1023,7 @@ describe('analytical database client', () => {
       const raw = await body(req);
       received = Buffer.byteLength(raw);
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ batch_id: field(jsonObject(raw), 'batch_id'), state: 'acked', durable: true }));
+      res.end(JSON.stringify(ackReply(field(jsonObject(raw), 'batch_id'))));
     });
     env(url);
     const emptyBody = '{"table":"t","mode":"append","batch_id":"b","rows":[{"x":""}]}';

@@ -347,6 +347,21 @@ export const ingest = defineWorkflow<{ rows: Record<string, unknown>[] }, void>(
 
 With generated `InvokeCtxVarsAugment` types, the cast is unnecessary. `append` adds rows and `replace` atomically replaces the table contents. `ingestFile` streams `.parquet`, `.csv`, or `.jsonl` through staged storage without buffering the file; use `format` for an extensionless path.
 
+In 0.9.0, generated `database:` mappings migrate from `DatabaseVar` to the `DatabaseVar | AnalyticalDatabaseBinding` union because the project declaration does not know which database kind the server will resolve. Existing code may keep passing the binding directly to `createDatabaseClient`, whose runtime guard gives a teaching error if it receives an analytical UUID. Code that handles both kinds can narrow the union by its wire shape:
+
+```typescript
+import {
+  createAnalyticalDatabaseClient,
+  createDatabaseClient,
+  type AnalyticalDatabaseBinding,
+  type DatabaseVar,
+} from '@solidactions/sdk';
+
+function clientFor(binding: DatabaseVar | AnalyticalDatabaseBinding) {
+  return typeof binding === 'string' ? createAnalyticalDatabaseClient(binding) : createDatabaseClient(binding);
+}
+```
+
 The helper derives a stable `batchId` from the database, normalized table, mode, format, and canonical content digest. An identical durable-step retry safely resumes or replays the server ledger. If you supply `batchId`, derive it deterministically from workflow input—never use the current time or a fresh random UUID outside the step.
 
 Calls wait for a durable acknowledgement (two-minute inline and 45-minute file defaults). A timeout throws `AnalyticalIngestError` with `code === 'ingest_pending'`, `batchId`, and `lastState`; it does not mean the batch failed, so retry the identical call. Structured server errors retain their code, status, and details. `insufficient_credit` is not retried. `AbortSignal` cancels local hashing, upload, API calls, and polling, but cannot roll back an already submitted batch and is not restored across durable resume.

@@ -64,6 +64,8 @@ type Reply = Record<string, unknown>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BATCH = /^(?!sa-)[A-Za-z0-9._-]{1,128}$/;
 const RETRYABLE = new Set(['waking', 'overloaded', 'too_many_batches']);
+// Must match #1700's ANALYTICAL_INLINE_BATCH_MAX_BYTES default exactly.
+const INLINE_BATCH_MAX_BYTES = 5 * 1024 * 1024;
 
 function jsonValue(value: unknown, path = '$'): Json {
   if (value instanceof Date) return value.toJSON();
@@ -188,13 +190,33 @@ function unwrap(body: unknown): Reply {
   return value;
 }
 function ack(body: Reply, id: string): AnalyticalIngestResult {
+  if (
+    body.batch_id !== id ||
+    body.state !== 'acked' ||
+    typeof body.rows !== 'number' ||
+    !Number.isSafeInteger(body.rows) ||
+    body.rows < 0 ||
+    body.durable !== true ||
+    typeof body.live_bytes !== 'number' ||
+    !Number.isFinite(body.live_bytes) ||
+    body.live_bytes < 0 ||
+    typeof body.acked_at !== 'string' ||
+    body.acked_at.length === 0
+  ) {
+    throw new AnalyticalIngestError('Analytical ingest returned an invalid acked response', {
+      code: 'invalid_ingest_response',
+      batchId: id,
+      lastState: 'acked',
+      details: body,
+    });
+  }
   return {
-    batchId: textValue(body.batch_id, id),
+    batchId: body.batch_id,
     state: 'acked',
-    rows: Number(body.rows ?? body.row_count ?? 0),
+    rows: body.rows,
     durable: true,
-    liveBytes: Number(body.live_bytes ?? 0),
-    ackedAt: textValue(body.acked_at),
+    liveBytes: body.live_bytes,
+    ackedAt: body.acked_at,
   };
 }
 
@@ -283,11 +305,6 @@ export function createAnalyticalDatabaseClient(
     for (;;) {
       if (state === 'acked') return ack(reply, id);
       if (state === 'failed') throw errorFrom(reply, undefined, id, state);
-      if (state === 'prepared' && onPrepared) {
-        reply = await onPrepared();
-        state = textValue(reply.state);
-        continue;
-      }
       if (performance.now() >= deadline)
         throw new AnalyticalIngestError('Analytical ingest remains pending; retry the identical call', {
           code: 'ingest_pending',
@@ -295,6 +312,31 @@ export function createAnalyticalDatabaseClient(
           lastState: state,
         });
       await delay(Math.min(deadline - performance.now(), Math.floor(Math.random() * interval)), signal);
+      if (performance.now() >= deadline)
+        throw new AnalyticalIngestError('Analytical ingest remains pending; retry the identical call', {
+          code: 'ingest_pending',
+          batchId: id,
+          lastState: state,
+        });
+      if (state === 'prepared' && onPrepared) {
+        try {
+          reply = await onPrepared();
+        } catch (error) {
+          if (error instanceof AnalyticalIngestError && error.code === 'ingest_pending' && !error.lastState) {
+            throw new AnalyticalIngestError(error.message, {
+              code: error.code,
+              batchId: error.batchId ?? id,
+              lastState: state,
+              status: error.status,
+              details: error.details,
+            });
+          }
+          throw error;
+        }
+        state = textValue(reply.state);
+        interval = Math.min(5000, interval * 2);
+        continue;
+      }
       try {
         reply = await operation('ingest_status', { batch_id: id }, id, signal, deadline);
       } catch (error) {
@@ -314,24 +356,8 @@ export function createAnalyticalDatabaseClient(
     }
   }
 
-  async function recoverLost(
-    name: string,
-    payload: Reply | string,
-    id: string,
-    deadline: number,
-    signal?: AbortSignal,
-  ): Promise<Reply> {
-    try {
-      return await operation('ingest_status', { batch_id: id }, id, signal, deadline);
-    } catch (error) {
-      if (
-        error instanceof AnalyticalIngestError &&
-        ['batch_not_found', 'not_found', 'unknown_batch'].includes(error.code)
-      ) {
-        return operation(name, payload, id, signal, deadline);
-      }
-      throw error;
-    }
+  async function recoverLost(id: string, deadline: number, signal?: AbortSignal): Promise<Reply> {
+    return operation('ingest_status', { batch_id: id }, id, signal, deadline);
   }
 
   async function inline(
@@ -350,8 +376,8 @@ export function createAnalyticalDatabaseClient(
     const deadline = performance.now() + timeout(options.timeoutMs, 120_000);
     const head = JSON.stringify({ table, mode, batch_id: id }).slice(0, -1);
     const payload = `${head},\"rows\":${rowsBytes}}`;
-    if (Buffer.byteLength(payload, 'utf8') > 5 * 1024 * 1024) {
-      throw new AnalyticalIngestError('Inline analytical ingest request exceeds the 5 MiB limit', {
+    if (Buffer.byteLength(payload, 'utf8') > INLINE_BATCH_MAX_BYTES) {
+      throw new AnalyticalIngestError('Inline analytical ingest request exceeds the 5 MiB (5,242,880 byte) limit', {
         code: 'inline_batch_too_large',
         batchId: id,
       });
@@ -361,7 +387,7 @@ export function createAnalyticalDatabaseClient(
       reply = await operation('ingest', payload, id, signal, deadline);
     } catch (error) {
       if (!(error instanceof AnalyticalIngestError) || error.code !== 'network_error') throw error;
-      reply = await recoverLost('ingest', payload, id, deadline, signal);
+      reply = await recoverLost(id, deadline, signal);
     }
     return wait(reply, id, deadline, signal);
   }
@@ -400,7 +426,7 @@ export function createAnalyticalDatabaseClient(
       prepared = await operation('ingest_prepare', preparePayload, id, signal, deadline);
     } catch (error) {
       if (!(error instanceof AnalyticalIngestError) || error.code !== 'network_error') throw error;
-      prepared = await recoverLost('ingest_prepare', preparePayload, id, deadline, signal);
+      prepared = await recoverLost(id, deadline, signal);
     }
     if (!prepared.upload_url && prepared.state === 'prepared') {
       prepared = await operation('ingest_prepare', preparePayload, id, signal, deadline);
@@ -481,7 +507,7 @@ export function createAnalyticalDatabaseClient(
       committed = await operation('ingest_commit', { batch_id: id }, id, signal, deadline);
     } catch (error) {
       if (!(error instanceof AnalyticalIngestError) || error.code !== 'network_error') throw error;
-      committed = await recoverLost('ingest_commit', { batch_id: id }, id, deadline, signal);
+      committed = await recoverLost(id, deadline, signal);
       if (committed.state === 'prepared')
         committed = await operation('ingest_commit', { batch_id: id }, id, signal, deadline);
     }
