@@ -1014,8 +1014,8 @@ describe('analytical database client', () => {
     }
   });
 
-  it('accepts an exact 5 MiB inline body and rejects one byte over before network I/O', async () => {
-    const limit = 5 * 1024 * 1024;
+  it('accepts exactly inline_batch_max_bytes=5,242,880 bytes (5 MiB) and rejects one byte over', async () => {
+    const limit = 5_242_880;
     let calls = 0;
     let received = 0;
     const { srv, url } = await server(async (req, res) => {
@@ -1033,7 +1033,10 @@ describe('analytical database client', () => {
       expect(received).toBe(limit);
       await expect(
         createAnalyticalDatabaseClient(DATABASE).append('t', [{ x: `${atLimit}x` }], { batchId: 'b' }),
-      ).rejects.toMatchObject({ code: 'inline_batch_too_large' });
+      ).rejects.toMatchObject({
+        code: 'inline_batch_too_large',
+        message: 'Inline analytical ingest exceeds inline_batch_max_bytes=5,242,880 bytes (5 MiB)',
+      });
       expect(calls).toBe(1);
     } finally {
       srv.close();

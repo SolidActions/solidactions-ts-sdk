@@ -64,8 +64,7 @@ type Reply = Record<string, unknown>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BATCH = /^(?!sa-)[A-Za-z0-9._-]{1,128}$/;
 const RETRYABLE = new Set(['waking', 'overloaded', 'too_many_batches']);
-// Must match #1700's ANALYTICAL_INLINE_BATCH_MAX_BYTES default exactly.
-const INLINE_BATCH_MAX_BYTES = 5 * 1024 * 1024;
+const INLINE_BATCH_MAX_BYTES = 5_242_880;
 
 function jsonValue(value: unknown, path = '$'): Json {
   if (value instanceof Date) return value.toJSON();
@@ -377,10 +376,13 @@ export function createAnalyticalDatabaseClient(
     const head = JSON.stringify({ table, mode, batch_id: id }).slice(0, -1);
     const payload = `${head},\"rows\":${rowsBytes}}`;
     if (Buffer.byteLength(payload, 'utf8') > INLINE_BATCH_MAX_BYTES) {
-      throw new AnalyticalIngestError('Inline analytical ingest request exceeds the 5 MiB (5,242,880 byte) limit', {
-        code: 'inline_batch_too_large',
-        batchId: id,
-      });
+      throw new AnalyticalIngestError(
+        'Inline analytical ingest exceeds inline_batch_max_bytes=5,242,880 bytes (5 MiB)',
+        {
+          code: 'inline_batch_too_large',
+          batchId: id,
+        },
+      );
     }
     let reply: Reply;
     try {
