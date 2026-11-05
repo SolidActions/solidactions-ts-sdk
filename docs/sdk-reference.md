@@ -436,7 +436,7 @@ export const publish = defineWorkflow<{ title: string }, number>({
 | `restore(id, kind)`                                     | edit on every node in the subtree | `{ restored: true }`                                                     |
 | `createFolder(parent, name)`                            | edit on the parent                | the folder                                                               |
 
-A doc is `{ id, title, folder_id, type, properties, body, revision, updated_at }` and a folder is `{ id, name, parent_id }`. `revision` is the doc's current revision id: pass it as `baseRevision` to `write` to fail with `doc_stale` instead of overwriting a newer edit.
+A doc is `{ id, title, folder_id, type, properties, body, revision, updated_at, redacted_keys }` and a folder is `{ id, name, parent_id }`. `folder_id` is `null` for a doc at the workspace root. A key in `redacted_keys` holds something the app can't see, and it keeps its stored value on `write` and `updateProperties`, whatever was sent. `revision` is the doc's current revision id: pass it as `baseRevision` to `write` to fail with `doc_stale` instead of overwriting a newer edit.
 
 - **Kind.** A `DocsVar` carries its own `kind`. For a bare numeric id on `trash` or `move`, pass `{ kind: 'doc' | 'folder' }`; a path with no kind must name exactly one node the app can see, or the call fails with `invalid_request`. There is no root form: an app cannot create or move at the workspace root.
 - **Canvas and visual docs** cannot be written by an app yet (`doc_kind_unsupported`); they can be read, renamed, moved, trashed and restored.

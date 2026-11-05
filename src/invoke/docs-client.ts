@@ -21,7 +21,8 @@ export type DocsKind = 'doc' | 'folder';
 export interface DocsDoc {
   id: number;
   title: string;
-  folder_id: number;
+  /** The folder holding the doc, or null for a doc at the workspace root. */
+  folder_id: number | null;
   /** The doc type's slug, or null. */
   type: string | null;
   properties: Record<string, unknown>;
@@ -29,6 +30,11 @@ export interface DocsDoc {
   /** The current revision id; pass it as `baseRevision` to guard a write. */
   revision: number;
   updated_at: string;
+  /**
+   * Property keys that hold something this app can't see. A listed key keeps its
+   * stored value on `write` and `updateProperties`, whatever was sent.
+   */
+  redacted_keys: string[];
 }
 
 /** A doc as `list` and `search` return it: no body. */
@@ -123,7 +129,7 @@ function toRef(ref: DocRef, kind?: DocsKind): WireRef {
   const withKind = (r: { id: number } | { path: string }, k?: DocsKind): WireRef => (k ? { ...r, kind: k } : r);
   if (typeof ref === 'number') return withKind({ id: ref }, kind);
   if (typeof ref === 'string') return withKind({ path: ref }, kind);
-  return withKind(ref.id !== null ? { id: ref.id } : { path: ref.path }, ref.kind);
+  return withKind(typeof ref.id === 'number' ? { id: ref.id } : { path: ref.path }, ref.kind);
 }
 
 function errorFrom(status: number, text: string): SolidActionsDocsError {

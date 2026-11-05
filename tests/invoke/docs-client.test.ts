@@ -12,6 +12,7 @@ import * as http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createDocsClient } from '../../src/invoke/docs-client';
+import type { DocsDoc } from '../../src/invoke/docs-client';
 import type { DocsVar } from '../../src/invoke/types';
 import { SolidActionsError, SolidActionsDocsError } from '../../src/error';
 
@@ -71,6 +72,7 @@ const DOC = {
   body: 'hi',
   revision: 9,
   updated_at: '2026-11-05T00:00:00Z',
+  redacted_keys: [] as string[],
 };
 
 const FOLDER_VAR: DocsVar = { name: 'POSTS', path: 'Content/Posts', kind: 'folder', id: 12, level: 'edit' };
@@ -109,6 +111,12 @@ describe('createDocsClient: request shape per verb', () => {
     await client().read({ name: 'NOTE', path: 'Notes/n.md', kind: 'doc', id: 31, level: 'view' });
 
     expect(last().body).toEqual({ ref: { id: 31, kind: 'doc' } });
+  });
+
+  it('read of an object with a path and no id at all (not even null) sends the path, never an empty ref', async () => {
+    await client().read({ path: 'Content/a.md', kind: 'doc' } as unknown as DocsVar);
+
+    expect(last().body).toEqual({ ref: { path: 'Content/a.md', kind: 'doc' } });
   });
 
   it('strips a trailing slash from apiUrl', async () => {
@@ -285,6 +293,45 @@ describe('createDocsClient: success unwrapping', () => {
       expect(await c.move(FOLDER_VAR, 'Other')).toEqual({ id: 3, name: 'Drafts', parent_id: 13 });
       expect(await c.trash(3)).toEqual({ trashed: true });
       expect(await c.restore(3, 'folder')).toEqual({ restored: true });
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
+describe('createDocsClient: the doc shape', () => {
+  it('a root doc keeps folder_id null and redacted_keys names the keys the app cannot see', async () => {
+    const rootDoc = { ...DOC, folder_id: null, properties: { status: 'ok' }, redacted_keys: ['owner'] };
+    const server = await startServer(() => ({ status: 200, body: { doc: rootDoc } }));
+    const c = createDocsClient({ apiUrl: server.url, apiKey: API_KEY, runId: RUN_ID });
+    try {
+      const doc: DocsDoc = await c.read('Root.md');
+
+      expect(doc.folder_id).toBeNull();
+      expect(doc.redacted_keys).toEqual(['owner']);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('list and search rows carry redacted_keys too', async () => {
+    const row = {
+      id: 1,
+      title: 'a',
+      folder_id: null,
+      type: null,
+      properties: {},
+      revision: 2,
+      updated_at: 'x',
+      redacted_keys: ['k'],
+    };
+    const server = await startServer(() => ({ status: 200, body: { docs: [row], next_cursor: null } }));
+    const c = createDocsClient({ apiUrl: server.url, apiKey: API_KEY, runId: RUN_ID });
+    try {
+      const page = await c.list(FOLDER_VAR);
+
+      expect(page.docs[0].redacted_keys).toEqual(['k']);
+      expect(page.docs[0].folder_id).toBeNull();
     } finally {
       await server.stop();
     }

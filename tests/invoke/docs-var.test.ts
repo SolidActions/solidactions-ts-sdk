@@ -101,6 +101,38 @@ describe('context-adapter: SA_VIEWER_* are reserved', () => {
   });
 });
 
+const POSTS_VAR: DocsVar = { name: 'POSTS', path: 'Content/Posts', kind: 'folder', id: 12, level: 'edit' };
+
+/** Registers the run row a real dispatch has already created, so `invoke` takes its normal vars-snapshot path. */
+function seedRun(
+  srv: MockHttpServer,
+  runUuid: string,
+): { triggerId: string; runUuid: string; runSecret: string; workerSessionId: string } {
+  srv.store.workflows.set(runUuid, {
+    workflowUUID: runUuid,
+    status: 'PENDING',
+    workflowName: '',
+    workflowClassName: '',
+    workflowConfigName: '',
+    authenticatedUser: '',
+    assumedRole: '',
+    authenticatedRoles: [],
+    request: {},
+    executorId: 'test-trigger',
+    applicationVersion: '',
+    applicationID: 'test-app',
+    input: null,
+    output: null,
+    error: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    recoveryAttempts: 0,
+    priority: 0,
+  });
+  srv.store.operations.set(runUuid, []);
+  return { triggerId: 'test-trigger', runUuid, runSecret: 'test-run-secret', workerSessionId: 'test-worker-session' };
+}
+
 describe('invoke: ctx.docs', () => {
   let srv: MockHttpServer;
 
@@ -126,7 +158,9 @@ describe('invoke: ctx.docs', () => {
       },
     });
 
-    const r = await invoke(wf, makeCtx(srv, { input: {} }));
+    const run = seedRun(srv, '00000000-0000-4000-8000-00000000d0c1');
+
+    const r = await invoke(wf, makeCtx(srv, { input: {}, run }));
 
     expect(r).toEqual({ status: 'completed', output: { primitives: true, docs: true } });
   });
@@ -142,24 +176,23 @@ describe('invoke: ctx.docs', () => {
         }
       },
     });
+    const run = seedRun(srv, '00000000-0000-4000-8000-00000000d0c2');
     const before = srv.requestLog.length;
 
-    const r = await invoke(wf, makeCtx(srv, { input: {} }));
+    const r = await invoke(wf, makeCtx(srv, { input: {}, run }));
 
     const docsCalls = srv.requestLog.slice(before).filter((q) => q.path.includes('/docs/'));
     expect(r).toEqual({ status: 'completed', output: 'docs-error' });
     expect(docsCalls.map((q) => ({ method: q.method, path: q.path, body: q.body }))).toEqual([
       {
         method: 'POST',
-        path: '/runs/00000000-0000-4000-8000-000000000001/docs/read',
+        path: '/runs/00000000-0000-4000-8000-00000000d0c2/docs/read',
         body: { ref: { path: 'Content/a.md' } },
       },
     ]);
     expect(docsCalls[0].headers['authorization']).toBe('Bearer test-api-key');
   });
 });
-
-const POSTS_VAR: DocsVar = { name: 'POSTS', path: 'Content/Posts', kind: 'folder', id: 12, level: 'edit' };
 
 describe('secret-redaction: a DocsVar holds no secret and survives the snapshot', () => {
   it('isDocsVar accepts a DocsVar and rejects a string, a ConnectionVar, a DatabaseVar and a bad level or kind', () => {
@@ -232,35 +265,7 @@ describe('invoke: a DocsVar survives suspend and replay', () => {
       },
     });
     const RUN_ID = '00000000-0000-4000-8000-00000000d0c5';
-    srv.store.workflows.set(RUN_ID, {
-      workflowUUID: RUN_ID,
-      status: 'PENDING',
-      workflowName: '',
-      workflowClassName: '',
-      workflowConfigName: '',
-      authenticatedUser: '',
-      assumedRole: '',
-      authenticatedRoles: [],
-      request: {},
-      executorId: 'test-trigger',
-      applicationVersion: '',
-      applicationID: 'test-app',
-      input: null,
-      output: null,
-      error: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      recoveryAttempts: 0,
-      priority: 0,
-    });
-    srv.store.operations.set(RUN_ID, []);
-    const run = {
-      triggerId: 'test-trigger',
-      runUuid: RUN_ID,
-      runSecret: 'test-run-secret',
-      workerSessionId: 'test-worker-session',
-    };
-
+    const run = seedRun(srv, RUN_ID);
     const first = await invoke(wf, makeCtx<unknown>(srv, { input: {}, vars: { POSTS: POSTS_VAR }, run }));
     srv.store.operations.get(RUN_ID)!.push({
       workflowUUID: RUN_ID,
