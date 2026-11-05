@@ -158,7 +158,7 @@ export const wf = defineWorkflow<{ userId: string }, void>({
 Each value is a `VarValue`:
 
 ```typescript
-type VarValue = string | ConnectionVar;
+type VarValue = string | ConnectionVar | DatabaseVar | DocsVar;
 
 interface ConnectionVar {
   readonly key: string; // opaque connection key
@@ -169,6 +169,7 @@ interface ConnectionVar {
 ```
 
 - **Plain string vars** (env values, secrets mapped from globals) arrive as `string`.
+- **Docs mappings** arrive as a `DocsVar` (see [Workspace Docs](#workspace-docs-ctxdocs)).
 - **OAuth / API connections** arrive as a `ConnectionVar`. You make authenticated requests through `proxyUrl` using `proxyToken` — the broker injects credentials so the workflow never handles the underlying secret. The `pica` proxy is the supported contract; `composio` is deprecated.
 
 ```typescript
@@ -367,6 +368,109 @@ function clientFor(binding: DatabaseVar | AnalyticalDatabaseBinding) {
 The helper derives a stable `batchId` from the database, normalized table, mode, format, and canonical content digest. An identical durable-step retry safely resumes or replays the server ledger. If you supply `batchId`, derive it deterministically from workflow input—never use the current time or a fresh random UUID outside the step.
 
 Calls wait for a durable acknowledgement (two-minute inline and 45-minute file defaults). A timeout throws `AnalyticalIngestError` with `code === 'ingest_pending'`, `batchId`, and `lastState`; it does not mean the batch failed, so retry the identical call. Structured server errors retain their code, status, and details. `insufficient_credit` is not retried. `AbortSignal` cancels local hashing, upload, API calls, and polling, but cannot roll back an already submitted batch and is not restored across durable resume.
+
+---
+
+## Workspace Docs (`ctx.docs`)
+
+`ctx.docs` requires `@solidactions/sdk >=0.10.0`, a SolidActions app release that ships docs access for apps, and a CLI release that sends the docs mapping on deploy (`yaml_default_docs_path`). The docs mapping is refused or ignored by older ones, so upgrade all three together.
+
+A workflow reads and writes the workspace's docs as its **project** (the app), not as a person. What it can reach is exactly what someone shared with that app: view or edit on a folder or doc, set through the docs access API or the MCP access tool (`workflows_guide` topic `docs-access`). A project is never granted `manage`, and a restricted folder needs its own share for the app; an ordinary folder inside a shared folder is reached as before.
+
+Declare the folders or docs the workflow uses in `solidactions.yaml`, beside `oauth` and `database` entries:
+
+```yaml
+env:
+  - POSTS:
+      docs: 'Content/Posts' # workspace-relative path to a folder or doc
+```
+
+This surfaces as a `DocsVar` at `ctx.vars.POSTS`:
+
+```typescript
+interface DocsVar {
+  readonly name: string; // the declared env name, e.g. 'POSTS'
+  readonly path: string; // the declared path
+  readonly kind: 'folder' | 'doc';
+  readonly id: number | null; // null when the app has no access
+  readonly level: 'view' | 'edit' | 'none'; // the app's effective level at dispatch
+}
+```
+
+A `DocsVar` holds no secret. `level: 'none'` (with `id: null`) means the path is declared but the app has no access: any `ctx.docs` call on it fails with `not_granted`. A `DocsVar` is kept whole in the durable vars snapshot and returned unchanged on replay; the server re-checks the app's access on every call, so a stale `level` never widens what the app can do. A value that is not valid `DocsVar` JSON stays a plain string.
+
+With the typed-vars file (see [Typed `ctx.vars`](#typed-ctxvars)) generated from `solidactions.yaml`, `ctx.vars.POSTS` is typed `DocsVar` with no cast.
+
+### The `ctx.docs` client
+
+A **ref** is a path string (workspace-relative; its last segment is a doc title, with or without a trailing `.md`, or a folder name), a numeric id, or a `DocsVar`.
+
+```typescript
+export const publish = defineWorkflow<{ title: string }, number>({
+  name: 'publish-post',
+  async run(ctx) {
+    const posts = ctx.vars.POSTS as DocsVar;
+    const doc = await SolidActions.runStep(
+      () => ctx.docs.create(posts, { title: ctx.input.title, body: '# Draft', properties: { status: 'draft' } }),
+      { name: 'create-post' },
+    );
+    return doc.revision;
+  },
+});
+```
+
+| Verb                                                    | Needs                             | Resolves                                                                 |
+| ------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------ |
+| `read(ref)`                                             | view                              | the doc                                                                  |
+| `list(folder, { type, where, limit, cursor })`          | view                              | `{ docs, next_cursor }` (no bodies; `limit` 1-100, default 100)          |
+| `search(q, { within, type, limit, cursor })`            | view                              | `{ docs, next_cursor }`                                                  |
+| `create(folder, { title, body, properties, type })`     | edit on the folder                | the doc                                                                  |
+| `write(ref, { title, body, properties, baseRevision })` | edit                              | the doc                                                                  |
+| `append(ref, text)` / `prepend(ref, text)`              | edit                              | the doc                                                                  |
+| `updateProperties(ref, patch)`                          | edit                              | the doc                                                                  |
+| `setType(ref, type)`                                    | edit                              | the doc (`type` is a slug or `null`)                                     |
+| `rename(ref, title)`                                    | edit                              | the doc                                                                  |
+| `move(ref, folder, { kind })`                           | edit on every node touched        | the doc, or the folder when `ref` is a folder                            |
+| `copy(ref, folder, { title })`                          | edit on source and destination    | the new doc (one doc; a folder ref fails with `copy_folder_unsupported`) |
+| `trash(ref, { kind })`                                  | edit on every node in the subtree | `{ trashed: true }`                                                      |
+| `restore(id, kind)`                                     | edit on every node in the subtree | `{ restored: true }`                                                     |
+| `createFolder(parent, name)`                            | edit on the parent                | the folder                                                               |
+
+A doc is `{ id, title, folder_id, type, properties, body, revision, updated_at }` and a folder is `{ id, name, parent_id }`. `revision` is the doc's current revision id: pass it as `baseRevision` to `write` to fail with `doc_stale` instead of overwriting a newer edit.
+
+- **Kind.** A `DocsVar` carries its own `kind`. For a bare numeric id on `trash` or `move`, pass `{ kind: 'doc' | 'folder' }`; a path with no kind must name exactly one node the app can see, or the call fails with `invalid_request`. There is no root form: an app cannot create or move at the workspace root.
+- **Canvas and visual docs** cannot be written by an app yet (`doc_kind_unsupported`); they can be read, renamed, moved, trashed and restored.
+- **`ctx.docs` is typed on the run context.** It lives on `DocsContext`, intersected into the `ctx` that `defineWorkflow`'s `run` receives, so `ctx.docs` is typed inside a workflow body. The shared `InvokeCtx` (what a context adapter builds) does not carry it, and `invoke()` attaches the client beside the durable primitives.
+- **Outside a run**, `SolidActions.docs.create` stays: it takes an explicit workspace API key, workspace id and base URL. `ctx.docs` is run-scoped, needs none of them, and acts as the project.
+
+### Errors
+
+Every failure throws `SolidActionsDocsError` (a `SolidActionsError`, exported from the package root):
+
+```typescript
+try {
+  await ctx.docs.write(doc.id, { body: next, baseRevision: doc.revision });
+} catch (e) {
+  if (e instanceof SolidActionsDocsError && e.code === 'doc_stale') {
+    const current = e.details?.current_revision; // retry against the newer head
+  }
+  throw e;
+}
+```
+
+| Property  | Meaning                                                                                                                                                                                                      |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `code`    | the server's stable code, e.g. `not_granted`, `not_found`, `level_required`, `doc_stale`, `title_taken`, `rate_limited`, `invalid_request`, `run_not_live`, or `'unknown'` when the reply had no JSON `code` |
+| `status`  | the HTTP status                                                                                                                                                                                              |
+| `path`    | the ref the server named, when it did                                                                                                                                                                        |
+| `message` | the server's message                                                                                                                                                                                         |
+| `details` | every other field of the reply body (`current_revision` on `doc_stale`, `retry_after_seconds` on `rate_limited`, `errors` on `invalid_request`), or `undefined`                                              |
+
+The client never retries and never resends a request, so a write is not repeated by the SDK. `not_found` and `not_granted` never reveal whether a node you cannot see exists.
+
+### Replay
+
+A `ctx.docs` call is a plain HTTP request, not a durable step. If the workflow can suspend (a `sleep`, a `recv`, a child workflow) after a doc write, **wrap the write in `ctx.step(...)` or `SolidActions.runStep(...)`** so a replay reads the cached result instead of writing again. A read can stay unwrapped, but its answer may differ between dispatches.
 
 ---
 
@@ -1161,27 +1265,28 @@ import { Error } from '@solidactions/sdk';
 // Use as Error.SolidActionsError, Error.SolidActionsWorkflowConflictError, etc.
 ```
 
-| Error Class                                    | When Thrown                                                   |
-| ---------------------------------------------- | ------------------------------------------------------------- |
-| `SolidActionsWorkflowConflictError`            | Workflow ID already exists with different code                |
-| `SolidActionsMaxStepRetriesError`              | Step exceeded maximum retry attempts (has `.errors: Error[]`) |
-| `SolidActionsWorkflowCancelledError`           | Workflow was cancelled (has `.workflowID: string`)            |
-| `SolidActionsMaxRecoveryAttemptsExceededError` | Workflow exceeded max recovery attempts                       |
-| `SolidActionsNotRegisteredError`               | Referenced workflow/step not registered                       |
-| `SolidActionsInitializationError`              | SDK failed to initialize                                      |
-| `SolidActionsNonExistentWorkflowError`         | Workflow ID not found                                         |
-| `SolidActionsConflictingRegistrationError`     | Duplicate workflow/step name                                  |
-| `SolidActionsUnexpectedStepError`              | Step executed in wrong order during recovery                  |
-| `SolidActionsAwaitedWorkflowCancelledError`    | Awaited child workflow was cancelled                          |
-| `WorkflowAlreadyRegisteredError`               | `defineWorkflow` called twice with the same name              |
-| `WorkflowNotRegisteredError`                   | A workflow name was dispatched but never registered           |
-| `SolidActionsHttpError`                        | HTTP communication error (base class)                         |
-| `SolidActionsUnauthorizedError`                | 401 response                                                  |
-| `SolidActionsForbiddenError`                   | 403 response                                                  |
-| `SolidActionsNotFoundError`                    | 404 response                                                  |
-| `SolidActionsRateLimitedError`                 | 429 response (has `.retryAfterSeconds?: number`)              |
-| `SolidActionsServerError`                      | 5xx response                                                  |
-| `SolidActionsNetworkError`                     | Network connectivity failure                                  |
+| Error Class                                    | When Thrown                                                                   |
+| ---------------------------------------------- | ----------------------------------------------------------------------------- |
+| `SolidActionsWorkflowConflictError`            | Workflow ID already exists with different code                                |
+| `SolidActionsMaxStepRetriesError`              | Step exceeded maximum retry attempts (has `.errors: Error[]`)                 |
+| `SolidActionsWorkflowCancelledError`           | Workflow was cancelled (has `.workflowID: string`)                            |
+| `SolidActionsMaxRecoveryAttemptsExceededError` | Workflow exceeded max recovery attempts                                       |
+| `SolidActionsNotRegisteredError`               | Referenced workflow/step not registered                                       |
+| `SolidActionsInitializationError`              | SDK failed to initialize                                                      |
+| `SolidActionsNonExistentWorkflowError`         | Workflow ID not found                                                         |
+| `SolidActionsConflictingRegistrationError`     | Duplicate workflow/step name                                                  |
+| `SolidActionsUnexpectedStepError`              | Step executed in wrong order during recovery                                  |
+| `SolidActionsAwaitedWorkflowCancelledError`    | Awaited child workflow was cancelled                                          |
+| `WorkflowAlreadyRegisteredError`               | `defineWorkflow` called twice with the same name                              |
+| `WorkflowNotRegisteredError`                   | A workflow name was dispatched but never registered                           |
+| `SolidActionsHttpError`                        | HTTP communication error (base class)                                         |
+| `SolidActionsUnauthorizedError`                | 401 response                                                                  |
+| `SolidActionsForbiddenError`                   | 403 response                                                                  |
+| `SolidActionsNotFoundError`                    | 404 response                                                                  |
+| `SolidActionsRateLimitedError`                 | 429 response (has `.retryAfterSeconds?: number`)                              |
+| `SolidActionsServerError`                      | 5xx response                                                                  |
+| `SolidActionsNetworkError`                     | Network connectivity failure                                                  |
+| `SolidActionsDocsError`                        | `ctx.docs` call refused or failed (`.code`, `.status`, `.path?`, `.details?`) |
 
 ---
 

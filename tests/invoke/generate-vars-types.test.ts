@@ -171,3 +171,44 @@ env:
   expect(dts).toContain('PLAIN_VAR: string;');
   expect(dts).toContain('MY_CONNECTION: ConnectionVar;');
 });
+
+// ---------------------------------------------------------------------------
+// docs-access-w1 (sdk#23): docs mappings → `NAME: DocsVar`
+// ---------------------------------------------------------------------------
+it('docs declarations produce a DocsVar-typed property and import DocsVar from the SDK', () => {
+  const dts = generateVarsTypes({ vars: [], connections: [], docs: ['POSTS'] });
+
+  expect(dts).toContain('POSTS: DocsVar;');
+  expect(dts).toContain("import type { DocsVar } from '@solidactions/sdk';");
+});
+
+it('docs mix with other kinds and import only the types in use', () => {
+  const dts = generateVarsTypes({ vars: ['MY_FLAG'], connections: ['GCAL'], docs: ['POSTS'] });
+
+  expect(dts).toContain('MY_FLAG: string;');
+  expect(dts).toContain('GCAL: ConnectionVar;');
+  expect(dts).toContain('POSTS: DocsVar;');
+  expect(dts).toContain("import type { ConnectionVar, DocsVar } from '@solidactions/sdk';");
+});
+
+it('declarations without docs emit no DocsVar import', () => {
+  const dts = generateVarsTypes({ vars: ['MY_FLAG'], connections: ['GCAL'] });
+
+  expect(dts).not.toContain('DocsVar');
+});
+
+it('a { docs: "..." } env entry in solidactions.yaml flows through the parser into a DocsVar-typed property', () => {
+  const yaml = `
+env:
+  - PLAIN_VAR
+  - POSTS:
+      docs: "Content/Posts"
+`;
+
+  const dts = generateVarsTypes(parseDeclarations(yaml));
+
+  expect(dts).toContain('PLAIN_VAR: string;');
+  expect(dts).toContain('POSTS: DocsVar;');
+  expect(dts).not.toContain('POSTS: string;');
+  expect(dts).toContain("import type { DocsVar } from '@solidactions/sdk';");
+});

@@ -49,6 +49,7 @@ import {
   scrubSecretsFromString,
 } from './secret-redaction';
 import { serializeErrorWithCause } from './serialize-error-with-cause';
+import { createDocsClient } from './docs-client';
 import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } from './types';
 
 /**
@@ -271,7 +272,13 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
   const scope: RuntimeScope = { executor: engine, runtimeParams, primitives };
 
   try {
-    const ctxWithPrimitives = Object.assign(ctx, primitives);
+    const docs = createDocsClient({
+      apiUrl: ctx.api.url,
+      apiKey: ctx.api.key,
+      runId: ctx.run.runUuid,
+      workerSessionId: ctx.run.workerSessionId || undefined,
+    });
+    const ctxWithPrimitives = Object.assign(ctx, primitives, { docs });
     const output = await runInScope(scope, () => workflow.run(ctxWithPrimitives));
     return { status: 'completed', output };
   } catch (error) {

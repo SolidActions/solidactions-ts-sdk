@@ -68,6 +68,8 @@ export type {
   ConnectionVar,
   DatabaseVar,
   AnalyticalDatabaseBinding,
+  DocsVar,
+  DocsContext,
   VarValue,
   // Augmentation hook — generated .d.ts files extend this interface
   // via `declare module '@solidactions/sdk' { interface InvokeCtxVarsAugment { ... } }`
@@ -78,6 +80,23 @@ export type {
 // helper wrapping a DatabaseVar (ctx.vars.MYDB).
 export { createDatabaseClient } from './invoke/database-client';
 export type { DatabaseClient, DatabaseExecuteResult, DatabaseValue } from './invoke/database-client';
+// ctx.docs (docs-access-w1): the run-scoped docs client and its types.
+export { createDocsClient } from './invoke/docs-client';
+export type {
+  DocsClient,
+  DocsClientConfig,
+  DocRef,
+  DocsKind,
+  DocsDoc,
+  DocsListedDoc,
+  DocsFolder,
+  DocsPage,
+  DocsListOptions,
+  DocsSearchOptions,
+  DocsCreateOptions,
+  DocsWriteOptions,
+  DocsKindOption,
+} from './invoke/docs-client';
 export { createAnalyticalDatabaseClient, AnalyticalIngestError } from './invoke/analytical-database-client';
 export type {
   AnalyticalDatabaseClient,
@@ -89,4 +108,4 @@ export type {
 } from './invoke/analytical-database-client';
 
 // Errors a user may catch at runtime
-export { WorkflowAlreadyRegisteredError, WorkflowNotRegisteredError } from './error';
+export { WorkflowAlreadyRegisteredError, WorkflowNotRegisteredError, SolidActionsDocsError } from './error';
