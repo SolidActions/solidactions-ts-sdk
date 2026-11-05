@@ -445,7 +445,7 @@ A doc is `{ id, title, folder_id, type, properties, body, revision, updated_at }
 
 ### Errors
 
-Every failure throws `SolidActionsDocsError` (a `SolidActionsError`, exported from the package root):
+An error answer from the server throws `SolidActionsDocsError` (a `SolidActionsError`, exported from the package root), and a timeout or refused connection propagates as the runtime's own error:
 
 ```typescript
 try {
