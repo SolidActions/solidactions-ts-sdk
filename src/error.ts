@@ -357,3 +357,40 @@ export class SolidActionsInvalidContextError extends SolidActionsError {
     this.name = 'SolidActionsInvalidContextError';
   }
 }
+
+const DocsErrorCode = 40;
+/**
+ * Thrown by `ctx.docs` when the docs route answers with an error. `code` is the
+ * server's stable string code (e.g. `not_granted`, `doc_stale`, `rate_limited`),
+ * or `'unknown'` when the response had no JSON `code` (a proxy error page, a 500).
+ * `status` is the HTTP status. `path` is the ref the server named, when it did.
+ * `details` holds whatever else the server sent, such as `current_revision` on a
+ * `doc_stale` (needed to retry the write), `retry_after_seconds` on a
+ * `rate_limited` or `errors` on an `invalid_request`; it is undefined when there
+ * was nothing else.
+ */
+export class SolidActionsDocsError extends SolidActionsError {
+  readonly code: string;
+  readonly status: number;
+  readonly path?: string;
+  readonly details?: Record<string, unknown>;
+
+  constructor(details: {
+    code: string;
+    status: number;
+    message: string;
+    path?: string;
+    details?: Record<string, unknown>;
+  }) {
+    super(details.message, DocsErrorCode);
+    this.name = 'SolidActionsDocsError';
+    this.code = details.code;
+    this.status = details.status;
+    if (details.path !== undefined) {
+      this.path = details.path;
+    }
+    if (details.details !== undefined) {
+      this.details = details.details;
+    }
+  }
+}

@@ -13,7 +13,11 @@ import {
   WorkflowAlreadyRegisteredError,
   WorkflowNotRegisteredError,
   createDatabaseClient,
+  createDocsClient,
+  SolidActionsDocsError,
+  Error as SdkErrors,
 } from '../../src/index';
+import type { DocsVar, DocsClient } from '../../src/index';
 import type {
   WorkflowDescriptor,
   InvokeCtx,
@@ -112,5 +116,29 @@ describe('public API: defineWorkflow exported from package root', () => {
   it('createDatabaseClient is importable from the package root and returns a client with execute()', () => {
     const client = createDatabaseClient({ name: 'analytics', url: 'libsql://a', token: 'tok', readOnly: false });
     expect(typeof client.execute).toBe('function');
+  });
+});
+
+describe('public API: ctx.docs surface exported from the package root', () => {
+  it('createDocsClient is importable from the package root', () => {
+    expect(typeof createDocsClient).toBe('function');
+  });
+
+  it('SolidActionsDocsError is exported from the package root under the Error namespace', () => {
+    const err = new SdkErrors.SolidActionsDocsError({ code: 'not_granted', status: 403, message: 'm', path: 'p' });
+    expect(err).toBeInstanceOf(SdkErrors.SolidActionsError);
+    expect(err.code).toBe('not_granted');
+  });
+
+  it('SolidActionsDocsError is also a named root export', () => {
+    expect(typeof SolidActionsDocsError).toBe('function');
+  });
+
+  it('DocsVar is a VarValue and DocsClient is typed (compile-time)', () => {
+    const v: DocsVar = { name: 'POSTS', path: 'Content', kind: 'folder', id: null, level: 'none' };
+    const asVar: VarValue = v;
+    const c: DocsClient | undefined = undefined;
+    expect(asVar).toBe(v);
+    expect(c).toBeUndefined();
   });
 });

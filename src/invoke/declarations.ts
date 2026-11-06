@@ -10,6 +10,7 @@
  *   - `- VAR_NAME: GLOBAL_NAME`             mapped to a global variable (still plain string)
  *   - `- VAR_NAME:\n    oauth: "Name"`      OAuth connection mapping → ConnectionVar at runtime
  *   - `- VAR_NAME:\n    database: "Name"`   workspace database mapping → DatabaseVar at runtime (#1127)
+ *   - `- VAR_NAME:\n    docs: "Folder/Path"` docs mapping → DocsVar at runtime (docs-access-w1)
  *
  * This module does NOT parse the full yaml schema — it only extracts the
  * information needed to type-generate `ctx.vars`. No new yaml keys are invented;
@@ -30,12 +31,17 @@ export interface VarsDeclarations {
    * pre-#1127 tests/callers) remain valid without a `databases` field.
    */
   databases?: string[];
+  /**
+   * Names of docs mappings (DocsVar at runtime; docs-access-w1). Optional for
+   * the same reason as `databases`: hand-constructed literals stay valid.
+   */
+  docs?: string[];
 }
 
 /**
  * Parse a solidactions.yaml string and extract env declarations.
  *
- * Returns `{ vars: [], connections: [], databases: [] }` for any yaml that has
+ * Returns `{ vars: [], connections: [], databases: [], docs: [] }` for any yaml that has
  * no `env:` key or an empty/non-array `env:` value — safe to call on any yaml
  * without crashing or throwing (except for invalid yaml syntax, which is
  * bubbled up).
@@ -43,17 +49,18 @@ export interface VarsDeclarations {
 export function parseDeclarations(yamlContent: string): VarsDeclarations {
   const doc = parse(yamlContent) as Record<string, unknown> | null;
   if (!doc || typeof doc !== 'object') {
-    return { vars: [], connections: [], databases: [] };
+    return { vars: [], connections: [], databases: [], docs: [] };
   }
 
   const env = doc['env'];
   if (!Array.isArray(env)) {
-    return { vars: [], connections: [], databases: [] };
+    return { vars: [], connections: [], databases: [], docs: [] };
   }
 
   const vars: string[] = [];
   const connections: string[] = [];
   const databases: string[] = [];
+  const docs: string[] = [];
 
   for (const item of env) {
     if (typeof item === 'string') {
@@ -81,6 +88,13 @@ export function parseDeclarations(yamlContent: string): VarsDeclarations {
       ) {
         // `{ database: "Database Name" }` → DatabaseVar at runtime (#1127)
         databases.push(varName);
+      } else if (
+        value !== null &&
+        typeof value === 'object' &&
+        typeof (value as { docs?: unknown }).docs === 'string'
+      ) {
+        // `{ docs: "Folder/Path" }` → DocsVar at runtime (docs-access-w1)
+        docs.push(varName);
       } else {
         // `GLOBAL_NAME` (string) or any other mapping → plain string var
         vars.push(varName);
@@ -89,5 +103,5 @@ export function parseDeclarations(yamlContent: string): VarsDeclarations {
     // null items or other primitives are skipped
   }
 
-  return { vars, connections, databases };
+  return { vars, connections, databases, docs };
 }

@@ -1,5 +1,5 @@
 import { SolidActionsJSON } from '../serialization';
-import type { InvokeCtx, VarValue, ConnectionVar, ConnectionBroker, DatabaseVar } from './types';
+import type { InvokeCtx, VarValue, ConnectionVar, ConnectionBroker, DatabaseVar, DocsVar } from './types';
 
 /**
  * Broker typing for connection vars (Task 6.2).
@@ -38,6 +38,9 @@ const RESERVED_KEYS = new Set([
   'SA_PROXY_TOKEN',
   'WORKFLOW_SLUG',
   'SOLIDACTIONS__DB_KEYS',
+  'SA_VIEWER_ID',
+  'SA_VIEWER_TYPE',
+  'SA_VIEWER_NAME',
 ]);
 
 /** Returns true if the key is reserved (used as a first-class ctx field, not a var). */
@@ -80,6 +83,14 @@ const VAR_KEYS_MANIFEST = 'SOLIDACTIONS__VAR_KEYS';
 const DB_KEYS_MANIFEST = 'SOLIDACTIONS__DB_KEYS';
 
 /**
+ * Reserved key carrying a comma-separated allowlist of the env names that are
+ * docs mappings (`env: - POSTS: { docs: "Content/Posts" }`), emitted by Laravel's
+ * `RuntimeEnvBuilder`. Like {@link DB_KEYS_MANIFEST} it classifies
+ * deterministically: a listed key's JSON value becomes a {@link DocsVar}.
+ */
+const DOC_KEYS_MANIFEST = 'SOLIDACTIONS__DOC_KEYS';
+
+/**
  * Resolve which transport keys are tenant vars: the {@link VAR_KEYS_MANIFEST}
  * allowlist when present (filtered to keys actually present and non-reserved),
  * otherwise every non-reserved key (legacy fallback).
@@ -101,7 +112,10 @@ function resolveVarKeys(transport: Record<string, string>): string[] {
  * database vars — legacy/local transports never classify by shape).
  */
 function resolveDbKeys(transport: Record<string, string>): Set<string> {
-  const manifest = transport[DB_KEYS_MANIFEST];
+  return resolveManifestSet(transport[DB_KEYS_MANIFEST]);
+}
+
+function resolveManifestSet(manifest: string | undefined): Set<string> {
   if (manifest === undefined) {
     return new Set();
   }
@@ -111,6 +125,11 @@ function resolveDbKeys(transport: Record<string, string>): Set<string> {
       .map((key) => key.trim())
       .filter((key) => key.length > 0),
   );
+}
+
+/** Resolve the set of transport keys that are docs mappings, from {@link DOC_KEYS_MANIFEST}. */
+function resolveDocKeys(transport: Record<string, string>): Set<string> {
+  return resolveManifestSet(transport[DOC_KEYS_MANIFEST]);
 }
 
 /**
@@ -142,12 +161,45 @@ function parseDatabaseVar(value: string): DatabaseVar | string {
 }
 
 /**
+ * Parse a docs mapping's env JSON (`{path, kind, id, level}`) into a
+ * {@link DocsVar} carrying the env `name`. Malformed JSON, or JSON that doesn't
+ * match the shape, is left as the raw string, like {@link parseDatabaseVar}.
+ */
+function parseDocsVar(name: string, value: string): DocsVar | string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return value;
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (
+    typeof obj['path'] === 'string' &&
+    (obj['kind'] === 'folder' || obj['kind'] === 'doc') &&
+    (obj['id'] === null || typeof obj['id'] === 'number') &&
+    (obj['level'] === 'view' || obj['level'] === 'edit' || obj['level'] === 'none')
+  ) {
+    return { name, path: obj['path'], kind: obj['kind'], id: obj['id'], level: obj['level'] };
+  }
+  return value;
+}
+
+/**
  * Build `ctx.vars` from the resolved key list, classifying each value as a
  * {@link DatabaseVar} (manifest-driven, {@link DB_KEYS_MANIFEST}), a
+ * {@link DocsVar} (manifest-driven, {@link DOC_KEYS_MANIFEST}), a
  * {@link ConnectionVar} (when `SA_PROXY_URL`/`SA_PROXY_TOKEN` are present and
  * the value looks like a connection key), or a scalar string.
  */
-function buildVars(transport: Record<string, string>, keys: string[], dbKeys: Set<string>): Record<string, VarValue> {
+function buildVars(
+  transport: Record<string, string>,
+  keys: string[],
+  dbKeys: Set<string>,
+  docKeys: Set<string>,
+): Record<string, VarValue> {
   const proxyUrl = transport['SA_PROXY_URL'];
   const proxyToken = transport['SA_PROXY_TOKEN'];
   const hasProxy = proxyUrl !== undefined && proxyToken !== undefined;
@@ -157,6 +209,8 @@ function buildVars(transport: Record<string, string>, keys: string[], dbKeys: Se
     const value = transport[key];
     if (dbKeys.has(key)) {
       vars[key] = parseDatabaseVar(value);
+    } else if (docKeys.has(key)) {
+      vars[key] = parseDocsVar(key, value);
     } else if (hasProxy && isConnectionValue(value)) {
       // No broker signal in the flat transport → broker omitted (the returned
       // shape stays `{ key, proxyUrl, proxyToken }`, runtime-identical to the
@@ -345,7 +399,7 @@ export async function oneShotContextAdapter(transport: Record<string, string>): 
 
   // --- vars ---
   const varKeys = resolveVarKeys(transport);
-  const vars = buildVars(transport, varKeys, resolveDbKeys(transport));
+  const vars = buildVars(transport, varKeys, resolveDbKeys(transport), resolveDocKeys(transport));
 
   // Single source of truth: when the manifest is present, scrub the tenant var
   // keys from the transport (process.env) so workflow code can only reach them
@@ -435,7 +489,7 @@ export async function residentContextAdapter(body: ResidentRunBody): Promise<Inv
   // helpers: manifest allowlist when present, else scan non-reserved keys).
   // No scrub here — the resident adapter reads a per-run request body, not the
   // shared process.env, so there is nothing to de-duplicate. ---
-  const vars = buildVars(env, resolveVarKeys(env), resolveDbKeys(env));
+  const vars = buildVars(env, resolveVarKeys(env), resolveDbKeys(env), resolveDocKeys(env));
 
   return {
     input,

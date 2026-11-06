@@ -1,3 +1,5 @@
+import type { DocsClient } from './docs-client';
+
 export interface InvokeCtxRun {
   triggerId: string | number;
   runUuid: string;
@@ -57,7 +59,22 @@ export interface DatabaseVar {
   readonly readOnly: boolean;
 }
 export type AnalyticalDatabaseBinding = string;
-export type VarValue = string | ConnectionVar | DatabaseVar;
+/**
+ * A docs mapping (`env: - POSTS: { docs: "Content/Posts" }`): the folder or doc
+ * the project's app was shared on, resolved at dispatch. `level` is the app's
+ * effective level on it; `none` (with `id: null`) means the path exists in the
+ * mapping but the app has no access, so any `ctx.docs` call on it fails with
+ * `not_granted`. Classified from the `SOLIDACTIONS__DOC_KEYS` manifest. Pass it
+ * to any `ctx.docs` verb as a ref.
+ */
+export interface DocsVar {
+  readonly name: string;
+  readonly path: string;
+  readonly kind: 'folder' | 'doc';
+  readonly id: number | null;
+  readonly level: 'view' | 'edit' | 'none';
+}
+export type VarValue = string | ConnectionVar | DatabaseVar | DocsVar;
 /**
  * Open augmentation hook for generated `ctx.vars` types (Task 4.1).
  *
@@ -108,7 +125,7 @@ export type InvokeResult<O = unknown> =
   | { status: 'cancelled' }
   | { status: 'failed'; error: unknown; phase?: 'init' | 'run' };
 export interface WorkflowDescriptor<I = unknown, O = unknown> {
-  run: (ctx: InvokeCtx<I> & DurablePrimitives) => Promise<O>;
+  run: (ctx: InvokeCtx<I> & DurablePrimitives & DocsContext) => Promise<O>;
   /**
    * Resolved registration name. T1 launcher rework: `defineWorkflow` (and the
    * legacy `SolidActions.registerWorkflow` shim) annotate the returned
@@ -118,6 +135,14 @@ export interface WorkflowDescriptor<I = unknown, O = unknown> {
    * may supply an explicit `name`, or rely on the `run` function's `.name`.
    */
   name?: string;
+}
+/**
+ * `ctx.docs`: the run-scoped docs client, attached by `invoke()` beside the
+ * durable primitives (docs-access-w1). A doc write is not durable by itself:
+ * wrap it in `ctx.step(...)` when the workflow can suspend after it.
+ */
+export interface DocsContext {
+  docs: DocsClient;
 }
 export interface DurablePrimitives {
   step: <T>(fn: () => T | Promise<T>, cfg?: { name?: string }) => Promise<T>;

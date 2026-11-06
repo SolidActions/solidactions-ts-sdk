@@ -51,7 +51,7 @@
  * un-leak past ones.
  */
 
-import type { ConnectionVar, DatabaseVar, VarValue } from './types';
+import type { ConnectionVar, DatabaseVar, DocsVar, VarValue } from './types';
 
 /**
  * Stable marker indicating that a snapshot entry is a reference to a
@@ -131,6 +131,24 @@ export function isDatabaseVar(v: unknown): v is DatabaseVar {
 }
 
 /**
+ * Returns true iff `v` is a `DocsVar` (docs-access-w1): `name`+`path` strings,
+ * a `kind` of `folder`|`doc`, an `id` that is a number or null, and a `level`
+ * of `view`|`edit`|`none`. A `DocsVar` holds no secret, so it is never
+ * redacted; this predicate only lets it pass the snapshot round trip.
+ */
+export function isDocsVar(v: unknown): v is DocsVar {
+  if (typeof v !== 'object' || v === null) return false;
+  const d = v as Record<string, unknown>;
+  return (
+    typeof d['name'] === 'string' &&
+    typeof d['path'] === 'string' &&
+    (d['kind'] === 'folder' || d['kind'] === 'doc') &&
+    (d['id'] === null || typeof d['id'] === 'number') &&
+    (d['level'] === 'view' || d['level'] === 'edit' || d['level'] === 'none')
+  );
+}
+
+/**
  * Returns true iff `v` carries the redacted-reference marker.
  */
 export function isRedactedConnectionVarRef(v: unknown): v is RedactedConnectionVarRef {
@@ -146,13 +164,13 @@ export function isRedactedDatabaseVarRef(v: unknown): v is RedactedDatabaseVarRe
 
 /**
  * Replace each `ConnectionVar` in `vars` with a `RedactedConnectionVarRef`.
- * Plain string vars are left untouched. The returned object is plain
+ * Plain string vars and `DocsVar`s (no secret in them) are left untouched. The returned object is plain
  * (NOT frozen) so it round-trips cleanly through `SolidActionsJSON.stringify`.
  */
 export function redactVarsForSnapshot(
   vars: Readonly<Record<string, VarValue>>,
-): Record<string, string | RedactedConnectionVarRef | RedactedDatabaseVarRef> {
-  const out: Record<string, string | RedactedConnectionVarRef | RedactedDatabaseVarRef> = {};
+): Record<string, string | DocsVar | RedactedConnectionVarRef | RedactedDatabaseVarRef> {
+  const out: Record<string, string | DocsVar | RedactedConnectionVarRef | RedactedDatabaseVarRef> = {};
   for (const [name, value] of Object.entries(vars)) {
     if (isConnectionVar(value)) {
       out[name] = {
@@ -235,7 +253,10 @@ export function rehydrateVarsFromSnapshot(
         // redacted ref in place, same degraded-mode failure as ConnectionVar.
         out[name] = value as unknown as VarValue;
       }
-    } else if (typeof value === 'string' || isConnectionVar(value) || isDatabaseVar(value)) {
+    } else if (typeof value === 'string' || isConnectionVar(value) || isDatabaseVar(value) || isDocsVar(value)) {
+      // A DocsVar holds no secret and is stored whole: the snapshot's value wins,
+      // like a plain string var. The server re-checks the app's grant on every
+      // `ctx.docs` call, so a stale `level` here cannot widen access.
       out[name] = value as VarValue;
     } else {
       // Defensive: unknown shape (legacy / corrupt) → coerce to a string
