@@ -15,9 +15,17 @@ import {
   createDatabaseClient,
   createDocsClient,
   SolidActionsDocsError,
+  openAnalytics,
+  AnalyticsError,
   Error as SdkErrors,
 } from '../../src/index';
-import type { DocsVar, DocsClient } from '../../src/index';
+import type {
+  DocsVar,
+  DocsClient,
+  AnalyticsDatabase,
+  AnalyticsPublishResult,
+  OpenAnalyticsOptions,
+} from '../../src/index';
 import type {
   WorkflowDescriptor,
   InvokeCtx,
@@ -140,5 +148,25 @@ describe('public API: ctx.docs surface exported from the package root', () => {
     const c: DocsClient | undefined = undefined;
     expect(asVar).toBe(v);
     expect(c).toBeUndefined();
+  });
+});
+
+describe('public API: openAnalytics surface exported from the package root', () => {
+  it('openAnalytics is importable from the package root', () => {
+    expect(typeof openAnalytics).toBe('function');
+  });
+
+  it('AnalyticsError is exported and carries code, status and details', () => {
+    const err = new AnalyticsError('lease_held', 'held', { status: 409, details: { retryAfterSeconds: 3 } });
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(AnalyticsError);
+    expect([err.code, err.status, err.details]).toEqual(['lease_held', 409, { retryAfterSeconds: 3 }]);
+  });
+
+  it('the handle, options and publish result types are exported (compile-time)', () => {
+    const options: OpenAnalyticsOptions = { readOnly: false, directory: '/tmp/x', leaseWaitSeconds: 0 };
+    const result: AnalyticsPublishResult = { version: 1, id: 'i', bytes: 1, storedBytes: 1 };
+    const handle: AnalyticsDatabase | undefined = undefined;
+    expect([options.readOnly, result.version, handle]).toEqual([false, 1, undefined]);
   });
 });

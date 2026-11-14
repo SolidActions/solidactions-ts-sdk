@@ -107,5 +107,9 @@ export type {
   AnalyticalIngestResult,
 } from './invoke/analytical-database-client';
 
+// DuckDB databases (ts-sdk#25): open, step, save and publish a database file held by the server.
+export { openAnalytics, AnalyticsError } from './invoke/analytics-client';
+export type { AnalyticsDatabase, AnalyticsPublishResult, OpenAnalyticsOptions } from './invoke/analytics-client';
+
 // Errors a user may catch at runtime
 export { WorkflowAlreadyRegisteredError, WorkflowNotRegisteredError, SolidActionsDocsError } from './error';

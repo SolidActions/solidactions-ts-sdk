@@ -369,6 +369,60 @@ The helper derives a stable `batchId` from the database, normalized table, mode,
 
 Calls wait for a durable acknowledgement (two-minute inline and 45-minute file defaults). A timeout throws `AnalyticalIngestError` with `code === 'ingest_pending'`, `batchId`, and `lastState`; it does not mean the batch failed, so retry the identical call. Structured server errors retain their code, status, and details. `insufficient_credit` is not retried. `AbortSignal` cancels local hashing, upload, API calls, and polling, but cannot roll back an already submitted batch and is not restored across durable resume.
 
+### DuckDB databases: `openAnalytics()`
+
+`openAnalytics` requires `@solidactions/sdk >=0.11.0` and a SolidActions server that has DuckDB databases switched on. It opens a DuckDB database that SolidActions keeps for you: the SDK restores the newest version into a work folder as an ordinary `<name>.duckdb` file, you work on it with DuckDB (any DuckDB client, such as `@duckdb/node-api`), and `publish()` makes your changes the next version. Pass the database binding from `ctx.vars` (a database id string):
+
+```typescript
+import { openAnalytics } from '@solidactions/sdk';
+
+const db = await openAnalytics(ctx.vars.SALES); // write mode: holds the write lease
+await db.step('load', async () => {
+  // open db.path with DuckDB, load the data, then close the connection (or run CHECKPOINT)
+});
+const { version } = await db.publish();
+```
+
+| Member              | Meaning                                                                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `db.path`           | Absolute path of the database file in the work folder                                                                              |
+| `db.version`        | Seq of the version the file was restored from (`0` for a new database)                                                             |
+| `db.readOnly`       | `true` when opened with `{ readOnly: true }`                                                                                       |
+| `db.step(name, fn)` | Durable step: runs `fn`, then uploads a save point of the file when `fn` succeeds. A replay skips `fn`                             |
+| `db.save()`         | Uploads a save point now (not durable by itself)                                                                                   |
+| `db.publish()`      | Publishes the file as the next version and returns `{ version, id, bytes, storedBytes }`. Throws `read_only` on a read-only handle |
+
+Options: `readOnly` (default `false`; a read-only open needs a published version, takes no lease and cannot save or publish), `directory` (work folder; default `<os.tmpdir()>/solidactions-analytics/<databaseId>`, created with mode `0700`) and `leaseWaitSeconds` (default `0`: how long to wait while another run holds the write lease).
+
+Rules to know:
+
+- **One writer at a time.** A write open takes a lease that the SDK renews in the background until `publish()`. While another run holds it, `openAnalytics` throws `AnalyticsError` with `code === 'lease_held'` and `details.retryAfterSeconds`, unless `leaseWaitSeconds` lets it wait.
+- **No lost updates.** The first thing a write open does is record, in a durable step named `analytics.base`, which version the run started from (it uses one step id on every execution). A publish never replaces a version the run was not built on: if another run published after this run started, `openAnalytics` or `publish()` throws `base_moved`; run the workflow again so it starts from the newest version.
+- **Keep the file quiescent.** Close your DuckDB connection, or run `CHECKPOINT`, before a step ends and before `save()` or `publish()`. A non-empty write-ahead log throws `wal_not_empty`. A throw inside a step is recorded permanently, like any other step.
+- **Resume.** A run that is re-dispatched in a new sandbox reopens from its own newest save point, and the steps it already completed are skipped.
+- **Limits.** A file above the database's size limit throws `over_cap` (`details.capBytes`); a file written with a newer DuckDB storage format than the server supports throws `storage_format_unsupported` (the message names the DuckDB version to use).
+- **Node.js 24 or newer** is needed: files are stored zstd-compressed with `node:zlib`.
+
+Errors are `AnalyticsError` with `code`, `message`, optional `status` and `details`. A code the server sends is passed through unchanged: `lease_held`, `lease_lost`, `base_moved`, `no_published_version`, `over_cap`, `storage_format_unsupported`, `storage_full`, `upload_missing`, `upload_not_found`, `checksum_mismatch`, `length_mismatch`, `feature_disabled`, `database_not_found`, `invalid_request` and `read_only`. The SDK adds codes of its own:
+
+| Code               | Meaning                                                                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `not_in_workflow`  | `openAnalytics` was called outside a running workflow                                                                                  |
+| `database_invalid` | The binding is not a database id, the file is not a DuckDB file, or the server named the file in a way the SDK refuses                 |
+| `invalid_request`  | An option is invalid, such as a negative `leaseWaitSeconds` (the server uses the same code for a request it rejects)                   |
+| `wal_not_empty`    | The file still has pending changes in its write-ahead log; close the connection or run `CHECKPOINT`                                    |
+| `read_only`        | `save()` or `publish()` on a read-only handle (the server uses the same code for a read-only open)                                     |
+| `network_error`    | The request never reached the server                                                                                                   |
+| `request_failed`   | The server answered with an error that has no code of its own; `details.status` and `status` carry the HTTP status                     |
+| `invalid_response` | The server answered successfully with something that is not the expected shape                                                         |
+| `open_failed`      | The server did not answer the open call successfully after three attempts; `details.status` is the last status when there was one      |
+| `download_failed`  | The database file could not be restored, or what was restored does not match what the server stores (checksum, size or the size limit) |
+| `upload_failed`    | The file could not be prepared or uploaded; `details.status` is the HTTP status when the upload was refused                            |
+| `disk_full`        | There is no space left in the work folder                                                                                              |
+| `zstd_unsupported` | This Node.js version has no zstd support; use Node.js 24 or newer                                                                      |
+
+The SDK tries again, up to three times, only after a dropped connection or a 5xx answer that carries no code of its own (for example a 502), and only for the open call, the upload of the file and the commit. A 4xx answer without a code is not tried again, the call that prepares an upload is never tried again, and an answer that carries a code, such as `feature_disabled`, is the server's decision and is raised at once. A renew that is answered with anything but a dropped connection or such a 5xx stops the background renewing; from then on `save()` and `publish()` throw `lease_lost` (`details.renewStatus` is the HTTP status of that answer). No error message contains a signed link or a key.
+
 ---
 
 ## Workspace Docs (`ctx.docs`)
