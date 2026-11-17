@@ -22,6 +22,7 @@ This SDK uses HTTP API calls to communicate with a SolidActions backend server (
 - **📅 Durable Scheduling** - Schedule workflows with cron syntax or durable sleep
 - **📫 Durable Notifications** - Pause workflows until signals/notifications arrive
 - **⚙️ Workflow Management** - Query, cancel, resume, or restart workflows programmatically
+- **🦆 DuckDB Databases** - Open a DuckDB file SolidActions keeps, change it with DuckDB, and publish it as the next version
 
 ## Installation
 
@@ -186,6 +187,38 @@ const workflows = await client.listWorkflows({
 await client.cancelWorkflow(workflowId);
 await client.resumeWorkflow(workflowId);
 ```
+
+## DuckDB databases
+
+A workflow opens a DuckDB file that SolidActions keeps for you, changes it with DuckDB, and publishes the result as the next version. This needs `@solidactions/sdk` 0.11.0 or newer and Node.js 24.
+
+```typescript
+import { DuckDBInstance } from '@duckdb/node-api';
+import { openAnalytics } from '@solidactions/sdk';
+
+const db = await openAnalytics(ctx.vars.SALES); // write mode: holds the write lease
+await db.step('load', async () => {
+  const instance = await DuckDBInstance.create(db.path);
+  const connection = await instance.connect();
+  try {
+    await connection.run('CREATE TABLE IF NOT EXISTS events (id BIGINT, label VARCHAR)');
+    await connection.run("INSERT INTO events VALUES (1, 'first')");
+    await connection.run('CHECKPOINT'); // leave the file quiet before the step ends
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+});
+const { version } = await db.publish(); // this file becomes the next version
+```
+
+Add the DuckDB package as a normal dependency (`npm install @duckdb/node-api`, not `--save-dev`): a run installs production dependencies only, so a dev dependency is missing at run time.
+
+`db.path` is an ordinary `<name>.duckdb` file in a work folder; `db.version` is the version it was restored from (`0` for a new, empty database). `db.step(name, fn)` is a durable step that uploads a save point when `fn` succeeds, so a run re-dispatched in a new sandbox reopens from its own last save point and skips the steps it finished; `db.save()` uploads a save point now; it is not a durable step by itself. A run that fails or ends without `publish()` changes nothing anyone else can see.
+
+Pass `{ readOnly: true }` to read a published version: it needs a published version, takes no write lease, and cannot `save()` or `publish()`.
+
+Create the database with `solidactions database create <name> --kind duckdb_file` and bind it with `database: "<name>"` in `solidactions.yaml`. See the [SDK reference](docs/sdk-reference.md#duckdb-databases-openanalytics) for options and error codes.
 
 ## Deploying Workflows
 
