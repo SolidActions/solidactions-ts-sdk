@@ -194,7 +194,7 @@ export async function main(): Promise<void> {
   // than raced by a second launcher-initiated run.
   await import(resolveEntryFilePath(entryFile));
 
-  // Issue solidactions-app#414: if the imported module already self-invoked
+  // If the imported module already self-invoked
   // SolidActions.run() at top level (legacy pre-codemod style), a second
   // launcher-initiated run would execute the SAME trigger twice concurrently in
   // this process — and the second run's context adapter would see the manifest

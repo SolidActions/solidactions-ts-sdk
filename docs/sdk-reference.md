@@ -374,14 +374,30 @@ Calls wait for a durable acknowledgement (two-minute inline and 45-minute file d
 `openAnalytics` requires `@solidactions/sdk >=0.11.0` and a SolidActions server that has DuckDB databases switched on. It opens a DuckDB database that SolidActions keeps for you: the SDK restores the newest version into a work folder as an ordinary `<name>.duckdb` file, you work on it with DuckDB (any DuckDB client, such as `@duckdb/node-api`), and `publish()` makes your changes the next version. Pass the database binding from `ctx.vars` (a database id string):
 
 ```typescript
+import { DuckDBInstance } from '@duckdb/node-api';
 import { openAnalytics } from '@solidactions/sdk';
 
 const db = await openAnalytics(ctx.vars.SALES); // write mode: holds the write lease
 await db.step('load', async () => {
-  // open db.path with DuckDB, load the data, then close the connection (or run CHECKPOINT)
+  const instance = await DuckDBInstance.create(db.path);
+  const connection = await instance.connect();
+  try {
+    await connection.run('CREATE TABLE IF NOT EXISTS events (id BIGINT, label VARCHAR)');
+    await connection.run("INSERT INTO events VALUES (1, 'first')");
+    await connection.run('CHECKPOINT'); // leave the file quiet before the step ends
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
 });
-const { version } = await db.publish();
+const { version } = await db.publish(); // this file becomes the next version
 ```
+
+Add `@duckdb/node-api` as a normal dependency (`npm install @duckdb/node-api`, not `--save-dev`): a run installs production dependencies only, so a dev dependency is missing at run time.
+
+Create the database with `solidactions database create <name> --kind duckdb_file` and bind it with `database: "<name>"` in `solidactions.yaml`; the run env carries the same plain database id string as for an analytical database.
+
+The kind is off by default: a server that has not switched it on answers `feature_disabled` to create, to queries and to every run call. That means the kind is not switched on for this server yet: ask the workspace administrator or SolidActions support, and do not retry.
 
 | Member              | Meaning                                                                                                                            |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |

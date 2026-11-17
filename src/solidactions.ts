@@ -240,7 +240,7 @@ let __failLoudExitHandlerInstalled = false;
  * lazy invoke-chain require()s and before oneShotContextAdapter — so the SDK
  * launcher (src/launcher.ts), which awaits the tenant module's import() and
  * then checks this, can reliably detect a legacy self-invoking module and
- * defer instead of starting a concurrent second run (issue solidactions-app#414).
+ * defer instead of starting a concurrent second run.
  * Internal (`__` convention): not re-exported from src/index.ts.
  */
 let __startedOneShotRun: { workflowName: string } | null = null;
@@ -868,7 +868,7 @@ export class SolidActions {
 
     // Record that this process started a one-shot run — BEFORE any lazy
     // require()/await, so the launcher's post-import check is reliable even if
-    // later sync steps throw (issue solidactions-app#414; see __startedOneShotRun).
+    // later sync steps throw (see __startedOneShotRun).
     __startedOneShotRun = { workflowName };
     // A workflow run is now executing in this process — the fail-loud exit
     // handler must stay silent (a runIfEntrypoint tenant module under the
