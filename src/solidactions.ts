@@ -111,7 +111,7 @@ import { createDoc } from './docs';
 // `solidactions` (e.g. `invoke-system-database`'s `http_system_database`
 // dependency is made type-only / the shared HttpClient base is extracted) —
 // NOT merely when the legacy executor or globalParams is deleted.
-import { getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
+import { assertNotInRetriedStep, getCurrentPrimitives, getCurrentScope, nextFunctionID } from './invoke/runtime-scope';
 import { invokeStartChildWorkflow, invokeStartChildWorkflowByName } from './invoke/child-workflow';
 import type { WorkflowDescriptor, InvokeResult, InvokeCtx } from './invoke/types';
 // Task A.1 (Blaxel MVP): run-status-lifecycle extracted from SolidActions.run()
@@ -1779,6 +1779,7 @@ export class SolidActions {
    * Send `message` on optional `topic` to the workflow with `destinationID`
    *  This can be done from inside or outside of SolidActions workflow functions
    *  Use the optional `idempotencyKey` to guarantee that the message is sent exactly once
+   *  On a hosted run it throws inside a step that has retries enabled.
    * @see `SolidActions.recv`
    *
    * @param destinationID - ID of the workflow that will `recv` the message
@@ -1794,6 +1795,7 @@ export class SolidActions {
     // functionIDGetIncrement. Non-invoke path is byte-unchanged legacy below.
     const scope = getCurrentScope();
     if (scope) {
+      assertNotInRetriedStep('SolidActions.send');
       return scope.executor.send(
         scope.runtimeParams.workflowID,
         nextFunctionID(),
@@ -1832,6 +1834,7 @@ export class SolidActions {
    *  This must be called from within a workflow; this workflow's ID is used to check for messages sent by `SolidActions.send`
    *  This can be configured to time out.
    *  Messages are received in the order in which they are sent (per-sender / causal order).
+   *  On a hosted run it throws inside a step that has retries enabled.
    * @see `SolidActions.send`
    *
    * @param topic - Optional topic; if specified the `recv` command can specify the same topic to receive selectively
@@ -1859,6 +1862,7 @@ export class SolidActions {
     // timeout and suspends properly).
     const scope = getCurrentScope();
     if (scope) {
+      assertNotInRetriedStep('SolidActions.recv');
       const functionID = nextFunctionID();
       const timeoutFunctionID = nextFunctionID();
       const raw = await scope.executor.recv(
@@ -1897,6 +1901,7 @@ export class SolidActions {
    * Set an event, from within a SolidActions workflow.  This value can be retrieved with `SolidActions.getEvent`.
    * If the event `key` already exists, its `value` is updated.
    * This function can only be called from within a workflow.
+   * On a hosted run it throws inside a step that has retries enabled.
    * @see `SolidActions.getEvent`
    *
    * @param key - The key for the event; at most one value is associated with a key at any given time.
@@ -1912,6 +1917,7 @@ export class SolidActions {
     // NOT in an invoke scope, behavior is byte-unchanged legacy below.
     const scope = getCurrentScope();
     if (scope) {
+      assertNotInRetriedStep('SolidActions.setEvent');
       return scope.executor.setEvent(
         scope.runtimeParams.workflowID,
         nextFunctionID(),
@@ -2488,7 +2494,9 @@ export class SolidActions {
   /**
    * Run the enclosed `callback` as a checkpointed step within a SolidActions workflow
    * @param callback - function containing code to run
-   * @param config - Configuration information for the step, particularly the retry policy
+   * @param config - Configuration information for the step, particularly the retry policy. With `retriesAllowed`
+   *   on a hosted run, nested `runStep`, `now`, `randomUUID` and `sleep` calls are plain calls, and `send`, `recv`,
+   *   `setEvent` and `startWorkflow` throw.
    * @param config.name - The name of the step; if not provided, the function name will be used
    * @returns - result (either obtained from invoking function, or retrieved if run before)
    */
@@ -2506,7 +2514,7 @@ export class SolidActions {
     // intentionally skipped here.
     const invokePrimitives = getCurrentPrimitives();
     if (invokePrimitives) {
-      return invokePrimitives.step<Return>(func, { name });
+      return invokePrimitives.step<Return>(func, { ...config, name });
     }
 
     ensureSolidActionsIsLaunched('steps');

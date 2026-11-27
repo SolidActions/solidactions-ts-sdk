@@ -1,3 +1,4 @@
+import type { StepConfig } from '../step';
 import type { DocsClient } from './docs-client';
 
 export interface InvokeCtxRun {
@@ -145,7 +146,7 @@ export interface DocsContext {
   docs: DocsClient;
 }
 export interface DurablePrimitives {
-  step: <T>(fn: () => T | Promise<T>, cfg?: { name?: string }) => Promise<T>;
+  step: <T>(fn: () => T | Promise<T>, cfg?: StepConfig) => Promise<T>;
   sleep: (ms: number) => Promise<void>;
   recv: <T = unknown>(topic?: string) => Promise<T>;
   send: (topic: string, payload: unknown) => Promise<void>;

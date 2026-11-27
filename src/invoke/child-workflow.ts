@@ -36,7 +36,7 @@ import { SolidActionsJSON } from '../serialization';
 import type { WorkflowHandle, WorkflowStatus } from '../workflow';
 import type { InvokeSystemDatabase } from './invoke-system-database';
 import { SuspensionRequired } from './invoke-system-database';
-import { getCurrentScope, nextFunctionID } from './runtime-scope';
+import { assertNotInRetriedStep, getCurrentScope, nextFunctionID } from './runtime-scope';
 
 /**
  * The handle returned by `SolidActions.startWorkflow(child)(input)` on the
@@ -139,6 +139,7 @@ export class InvokeChildHandle<R> implements WorkflowHandle<R> {
  * `getCurrentScope()` before delegating, exactly like `invokeStartChildWorkflow`.
  */
 async function spawnChildByName(childName: string, args: unknown[]): Promise<InvokeChildHandle<unknown>> {
+  assertNotInRetriedStep('SolidActions.startWorkflow');
   const s = getCurrentScope();
   if (!s) {
     throw new Error('invoke scope lost before child spawn');
