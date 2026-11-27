@@ -2,8 +2,9 @@
  * Helpers for testing code that calls process.exit().
  *
  * The interceptor is installed once in jest.setup.ts. When armed via
- * `expectProcessExit`, calling process.exit(code) throws a ProcessExitSignal
- * instead of killing the worker, making exit codes observable in unit tests.
+ * `expectProcessExit`, calling process.exit(code) throws a ProcessExitSignal,
+ * making exit codes observable in unit tests. Unarmed, it throws a plain Error
+ * that fails the test: no test can end the Jest process.
  */
 
 /**

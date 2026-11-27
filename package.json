@@ -57,7 +57,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "lint": "eslint --ignore-pattern **/coverage/ .",
     "setversion": "npm run --workspaces setversion && grunt setversion",
-    "test": "npm run build && npm run --workspaces test  && jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles",
+    "test": "npm run build && npm run --workspaces test  && rm -f jest-results.json && jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles --json --outputFile=jest-results.json && node scripts/check-test-run.mjs jest-results.json",
     "prepare": "husky"
   },
   "bin": {
