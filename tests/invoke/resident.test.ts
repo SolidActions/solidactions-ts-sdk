@@ -6,9 +6,10 @@
  *
  * The load-bearing invariant asserted here: runResident RETURNS the InvokeResult
  * and NEVER calls process.exit, so a warm resident process can re-invoke on the
- * next dispatch. The jest.setup process.exit interceptor is left UNARMED so a
- * stray process.exit would actually kill the worker (failing the run) — and the
- * "warm re-invoke" test proves a second call on the same module succeeds.
+ * next dispatch. The jest.setup process.exit interceptor is left UNARMED, so a
+ * stray process.exit throws and fails the test, even when the caller swallows the
+ * throw (jest.teardown) — and the "warm re-invoke" test proves a second call on
+ * the same module succeeds.
  *
  * NOTE on fixtures: defineWorkflow requires a `{ run }` DESCRIPTOR (not a bare
  * function — see src/invoke/define-workflow.ts), and the run() body receives

@@ -1,21 +1,19 @@
-import { spawnSync } from 'child_process';
-
-// Mock API URL for subprocess tests - they don't actually connect
-const TEST_ENV = {
-  ...process.env,
-  SOLIDACTIONS_API_URL: 'http://localhost:9999',
-  SOLIDACTIONS_API_KEY: 'test-key',
-};
+import { MockHttpServer } from '../src/testing/mock_server';
+import { runTsScript, setUpSolidActionsTestServer } from './helpers';
 
 describe('bad-code-loads', () => {
+  let server: MockHttpServer;
+
+  beforeAll(async () => {
+    server = await setUpSolidActionsTestServer();
+  });
+
+  /** The programs read these; the mock server they point at runs in this process. */
+  const testEnv = () => ({ SOLIDACTIONS_API_URL: server.baseUrl, SOLIDACTIONS_API_KEY: 'test-key' });
+
   test('loadCodeTwice', async () => {
     // Run the TypeScript test script under ts-node
-    const result = spawnSync('npx', ['ts-node', './tests/codereloader.ts'], {
-      encoding: 'utf-8',
-      cwd: process.cwd(),
-      env: TEST_ENV,
-      stdio: ['inherit', 'pipe', 'pipe'], // Capture stdout and stderr
-    });
+    const result = await runTsScript('./tests/codereloader.ts', testEnv());
 
     // Uncomment to see what happened above...
     //console.log('STDOUT:', result.stdout);
@@ -23,17 +21,12 @@ describe('bad-code-loads', () => {
 
     // Check if the expected error appears in stderr
     expect(result.stderr).toContain('SolidActionsConflictingRegistrationError');
-    return Promise.resolve();
-  });
+    expect(result.status).toBe(0);
+  }, 90_000);
 
   test('loadCodeAfterLaunch', async () => {
     // Run the TypeScript test script under ts-node
-    const result = spawnSync('npx', ['ts-node', './tests/codelateloader.ts'], {
-      encoding: 'utf-8',
-      cwd: process.cwd(),
-      env: TEST_ENV,
-      stdio: ['inherit', 'pipe', 'pipe'], // Capture stdout and stderr
-    });
+    const result = await runTsScript('./tests/codelateloader.ts', testEnv());
 
     // Uncomment to see what happened above...
     //console.log('STDOUT:', result.stdout);
@@ -41,6 +34,8 @@ describe('bad-code-loads', () => {
 
     // Check if the expected error appears in stderr
     expect(result.stderr).toContain('SolidActionsConflictingRegistrationError');
-    return Promise.resolve();
-  });
+    expect(result.status).toBe(1);
+    // The late load is only late if launch() really connected first.
+    expect(server.requestLog).toContainEqual(expect.objectContaining({ method: 'GET', path: '/health' }));
+  }, 90_000);
 });

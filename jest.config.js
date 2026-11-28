@@ -3,7 +3,14 @@ module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
   testRegex: '((\\.|/)(test|spec))\\.(ts|js)?$',
-  testPathIgnorePatterns: ['packages/*', 'tests/bundler-test/node_modules', 'tests/bundler-test/dist'],
+  testPathIgnorePatterns: [
+    'packages/*',
+    'tests/bundler-test/node_modules',
+    'tests/bundler-test/dist',
+    // Excluded until rewritten (SolidActions/solidactions-ts-sdk#41): it needs Postgres, which CI does not provide,
+    // to test the database_url setup that the SDK no longer has.
+    '<rootDir>/tests/bundler\\.test\\.ts$',
+  ],
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
   modulePaths: ['./'],
   moduleNameMapper: {
