@@ -115,6 +115,9 @@ describe('invoke', () => {
     const r = await invoke(wf, ctx);
 
     expect(r).toMatchObject({ status: 'failed', phase: 'init' });
+    expect(String((r as { error?: unknown }).error)).toContain('ECONNREFUSED');
     expect(bodyRan).toBe(false);
-  });
+    // The invoke path retries a refused connection 10 times with backoff capped at 60 s: 303 to 308 s in all.
+    // The row waits for the whole policy, so no retry timer outlives it.
+  }, 360_000);
 });

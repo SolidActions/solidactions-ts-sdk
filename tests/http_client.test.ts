@@ -16,6 +16,7 @@ import {
 } from '../src/error';
 import { createServer, Server } from 'http';
 import { SolidActionsJSON } from '../src/serialization';
+import { expectProcessExit } from './invoke/helpers-exit';
 
 describe('HttpClient', () => {
   let mockServer: MockHttpServer;
@@ -664,7 +665,7 @@ describe('HttpSystemDatabase', () => {
       expect(msg).toBe('"hello"');
     });
 
-    test('recv returns null on timeout when no message', async () => {
+    test('recv with no message registers the wait with the server and exits with code 0', async () => {
       await sysDb.initWorkflowStatus(
         {
           workflowUUID: 'wf-msg-timeout',
@@ -687,8 +688,19 @@ describe('HttpSystemDatabase', () => {
         null,
       );
 
-      const msg = await sysDb.recv('wf-msg-timeout', 1, 2, 'notopic', 0.1);
-      expect(msg).toBeNull();
+      expect(mockServer.requestLog.filter((r) => r.path.endsWith('/wait'))).toEqual([]);
+
+      const exitCode = await expectProcessExit(() => sysDb.recv('wf-msg-timeout', 1, 2, 'notopic', 0.1));
+
+      expect(exitCode).toBe(0);
+      const waits = mockServer.requestLog.filter((r) => r.path.endsWith('/wait'));
+      expect(waits.map(({ method, path, body }) => ({ method, path, body }))).toEqual([
+        {
+          method: 'POST',
+          path: '/runs/status/wf-msg-timeout/wait',
+          body: { functionID: 1, topic: 'notopic', timeoutSeconds: 0.1 },
+        },
+      ]);
     });
   });
 

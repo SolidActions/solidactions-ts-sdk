@@ -57,7 +57,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "lint": "eslint --ignore-pattern **/coverage/ .",
     "setversion": "npm run --workspaces setversion && grunt setversion",
-    "test": "npm run build && npm run --workspaces test  && jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles",
+    "test": "npm run build && npm run --workspaces test  && rm -f jest-results.json && jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles --json --outputFile=jest-results.json && node scripts/check-test-run.mjs jest-results.json",
     "prepare": "husky"
   },
   "bin": {
@@ -67,6 +67,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.22.0",
+    "@koa/router": "^15.7.1",
     "@solidactions/otel": "packages/otel",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.19.1",
@@ -79,6 +80,7 @@
     "prettier": "^3.4.2",
     "supertest": "^7.0.0",
     "ts-jest": "^29.2.4",
+    "ts-node": "^10.9.2",
     "typescript": "^5.4.5",
     "typescript-eslint": "^8.26.1"
   },

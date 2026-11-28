@@ -1,5 +1,4 @@
-import { spawnSync } from 'child_process';
-import { setUpSolidActionsTestServer, tearDownSolidActionsTestServer, getMockServer } from './helpers';
+import { setUpSolidActionsTestServer, tearDownSolidActionsTestServer, runTsScript } from './helpers';
 
 describe('solidactions-logger', () => {
   beforeAll(async () => {
@@ -11,17 +10,11 @@ describe('solidactions-logger', () => {
   });
 
   test('logFromWf', async () => {
-    const mockServer = getMockServer();
+    const mockServer = await setUpSolidActionsTestServer(); // the one beforeAll started
     // Run the TypeScript test script under ts-node
-    const result = spawnSync('npx', ['ts-node', './tests/logtodboslogger.ts'], {
-      encoding: 'utf-8',
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        SOLIDACTIONS_API_URL: mockServer?.baseUrl || 'http://localhost:9999',
-        SOLIDACTIONS_API_KEY: 'test-key',
-      },
-      stdio: ['inherit', 'pipe', 'pipe'], // Capture stdout and stderr
+    const result = await runTsScript('./tests/logtodboslogger.ts', {
+      SOLIDACTIONS_API_URL: mockServer.baseUrl,
+      SOLIDACTIONS_API_KEY: 'test-key',
     });
 
     // Uncomment to see what happened above...
@@ -36,7 +29,7 @@ describe('solidactions-logger', () => {
       if (
         /Info: WFID should be logged/.test(l) &&
         /"operationType":"workflow"/.test(l) &&
-        /"operationName":"loggingWorkflow"/ &&
+        /"operationName":"loggingWorkflow"/.test(l) &&
         /"operationUUID":"loggerWorkflowId"/.test(l) &&
         /"authenticatedUser":""/.test(l) &&
         /"authenticatedRoles":\[\]/.test(l) &&
@@ -48,7 +41,7 @@ describe('solidactions-logger', () => {
       if (
         /Info: Step should be logged/.test(l) &&
         /"operationType":"step"/.test(l) &&
-        /"operationName":"loggingStep"/ &&
+        /"operationName":"loggingStep"/.test(l) &&
         /"operationUUID":"loggerWorkflowId"/.test(l) &&
         /"authenticatedUser":""/.test(l) &&
         /"authenticatedRoles":\[\]/.test(l) &&
@@ -71,7 +64,6 @@ The log was:\n${result.stdout}
 
     expect(foundWf).toBeTruthy();
     expect(foundStep).toBeTruthy();
-
-    return Promise.resolve();
-  });
+    expect(result.status).toBe(0);
+  }, 90_000);
 });

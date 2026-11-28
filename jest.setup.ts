@@ -4,11 +4,11 @@ process.env.BAR = 'bar';
 process.env.BAZ = 'baz';
 process.env.C = 'c';
 
-// Observable process.exit interceptor.
-// When (globalThis as any).__processExitArmed is truthy, calling process.exit(code)
-// throws a ProcessExitSignal instead of killing the process, making it observable
-// in tests. When not armed, it delegates to the real process.exit so all
-// non-durable tests behave exactly as before.
+// Observable process.exit interceptor. No test can end the Jest process:
+// process.exit(code) always throws. When (globalThis as any).__processExitArmed
+// is truthy (set by expectProcessExit) it throws a ProcessExitSignal, making the
+// exit code observable. When not armed it records the code and throws an Error.
+// A caller can swallow that throw, so jest.teardown.ts fails on the record.
 (function installProcessExitInterceptor() {
   // Guard: only install once (jest re-runs setupFiles across workers but each
   // worker is a fresh Node context so the symbol acts as a per-worker sentinel).
@@ -18,19 +18,21 @@ process.env.C = 'c';
   }
   (globalThis as Record<string, unknown>)[INSTALLED_KEY] = true;
 
-  const realExit = process.exit.bind(process);
-
-  // process.exit is typed as (code?: number) => never; the armed path satisfies
-  // `never` by throwing; the unarmed path delegates to the real exit (also never).
+  // process.exit is typed as (code?: number) => never; throwing satisfies `never`.
   (process as NodeJS.Process).exit = ((code?: number): never => {
+    const exitCode = code ?? 0;
     if ((globalThis as Record<string, unknown>).__processExitArmed) {
-      const exitCode = code ?? 0;
       const err: Error = new Error(`process.exit called with code ${exitCode}`);
       err.name = 'ProcessExitSignal';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (err as any).code = exitCode;
       throw err;
     }
-    return realExit(code);
+    const g = globalThis as { __unarmedProcessExits?: number[] };
+    (g.__unarmedProcessExits ??= []).push(exitCode);
+    throw new Error(
+      `process.exit(${exitCode}) was called outside expectProcessExit. A test must use expectProcessExit ` +
+        '(tests/invoke/helpers-exit.ts) to run code that exits the process.',
+    );
   }) as typeof process.exit;
 })();
