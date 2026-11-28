@@ -1,5 +1,5 @@
-// Fails unless Jest's JSON results account for every test file Jest lists, so a run that
-// ends early cannot pass (ts-sdk#38). Usage: node scripts/check-test-run.mjs <results.json>
+// Fails unless Jest's JSON results account for every test file Jest lists and say the run succeeded, so a
+// run that ends early or fails cannot pass (ts-sdk#38). Usage: node scripts/check-test-run.mjs <results.json>
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -18,9 +18,10 @@ if (!resultsPath) {
   fail('no results file given. Usage: node scripts/check-test-run.mjs <results.json>');
 }
 
+let results;
 let reported;
 try {
-  const results = JSON.parse(readFileSync(resultsPath, 'utf8'));
+  results = JSON.parse(readFileSync(resultsPath, 'utf8'));
   reported = new Set(results.testResults.map((result) => result.name));
 } catch (error) {
   fail(
@@ -45,6 +46,10 @@ if (missing.length > 0) {
         .sort()
         .join('\n'),
   );
+}
+
+if (results.success !== true) {
+  fail(`Jest did not report a successful run: success is ${JSON.stringify(results.success)} in ${resultsPath}`);
 }
 
 console.log(`check-test-run: all ${listed.length} test files have a result`);

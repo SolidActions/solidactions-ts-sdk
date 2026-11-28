@@ -4,6 +4,8 @@
  * Updated to support HTTP-based testing with mock server.
  */
 
+import { execFile } from 'node:child_process';
+import path from 'node:path';
 import { SolidActionsConfig, SolidActionsExecutor } from '../src/solidactions-executor';
 import { SolidActions, StatusString } from '../src';
 import { sleepms } from '../src/utils';
@@ -253,4 +255,31 @@ export function causeChaos(_db: string): Promise<void> {
   // No-op for HTTP-based tests
   console.warn('causeChaos() is deprecated in HTTP SDK');
   return Promise.resolve();
+}
+
+export interface ScriptRun {
+  /** The child's exit code, or null when it was killed for running past 60 s. */
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Runs a TypeScript program under ts-node. It must not block this process: the mock server lives here and has to
+ * answer the child.
+ */
+export function runTsScript(script: string, env: Record<string, string>): Promise<ScriptRun> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      process.execPath,
+      [require.resolve('ts-node/dist/bin.js'), script],
+      {
+        cwd: path.resolve(__dirname, '..'),
+        env: { ...process.env, ...env },
+        timeout: 60_000,
+        killSignal: 'SIGKILL',
+      },
+      (_error, stdout, stderr) => resolve({ status: child.exitCode, stdout, stderr }),
+    );
+  });
 }

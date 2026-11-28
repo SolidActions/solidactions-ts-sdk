@@ -7,7 +7,8 @@ process.env.C = 'c';
 // Observable process.exit interceptor. No test can end the Jest process:
 // process.exit(code) always throws. When (globalThis as any).__processExitArmed
 // is truthy (set by expectProcessExit) it throws a ProcessExitSignal, making the
-// exit code observable. When not armed it throws an Error that fails the test.
+// exit code observable. When not armed it records the code and throws an Error.
+// A caller can swallow that throw, so jest.teardown.ts fails on the record.
 (function installProcessExitInterceptor() {
   // Guard: only install once (jest re-runs setupFiles across workers but each
   // worker is a fresh Node context so the symbol acts as a per-worker sentinel).
@@ -27,6 +28,8 @@ process.env.C = 'c';
       (err as any).code = exitCode;
       throw err;
     }
+    const g = globalThis as { __unarmedProcessExits?: number[] };
+    (g.__unarmedProcessExits ??= []).push(exitCode);
     throw new Error(
       `process.exit(${exitCode}) was called outside expectProcessExit. A test must use expectProcessExit ` +
         '(tests/invoke/helpers-exit.ts) to run code that exits the process.',
