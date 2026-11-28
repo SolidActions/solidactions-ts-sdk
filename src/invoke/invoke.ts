@@ -31,8 +31,8 @@
  *   scoped InvokeSystemDatabase using an explicit workflow id (ctx.run.runUuid)
  *   and a per-invoke function-id counter held in the ALS scope (runtime-scope).
  *   sleep/recv go through InvokeSystemDatabase so they throw SuspensionRequired;
- *   step/send are correct minimal delegations (not exercised by Task 1.3's
- *   tests — see notes on each).
+ *   step records or replays one result (retrying first when the step allows it);
+ *   send is a minimal delegation (see its note).
  */
 
 import { deserializeError } from 'serialize-error';
@@ -41,7 +41,17 @@ import { GlobalLogger } from '../telemetry/logs';
 import { SolidActionsJSON } from '../serialization';
 import { SolidActionsHttpConfig } from '../config';
 import { InvokeSystemDatabase, SuspensionRequired } from './invoke-system-database';
-import { runInScope, nextFunctionID, RuntimeParams, RuntimeScope } from './runtime-scope';
+import {
+  runInScope,
+  nextFunctionID,
+  isInRetriedStep,
+  assertNotInRetriedStep,
+  RuntimeParams,
+  RuntimeScope,
+} from './runtime-scope';
+import { runWithRetries } from './step-retry';
+import { sleepms } from '../utils';
+import type { StepConfig } from '../step';
 import {
   collectSecretStrings,
   redactVarsForSnapshot,
@@ -59,10 +69,11 @@ import type { InvokeCtx, InvokeResult, WorkflowDescriptor, DurablePrimitives } f
  *
  * - sleep/recv route through InvokeSystemDatabase, which posts the schedule then
  *   throws SuspensionRequired (caught by invoke() and mapped to 'suspended').
- * - step: minimal delegation — record-or-replay the result via the engine's
- *   operation-result API so a re-invocation after suspension is idempotent. Not
- *   exercised by Task 1.3 tests; safe because it uses only public engine
- *   methods with explicit ids and never touches legacy context/globals.
+ * - step: record-or-replay the result via the engine's operation-result API so a
+ *   re-invocation after suspension is idempotent. A step with `retriesAllowed`
+ *   retries in process (step-retry) and records only the final outcome. Uses only
+ *   public engine methods with explicit ids and never touches legacy
+ *   context/globals.
  * - send: minimal delegation straight to the engine's send(). Not exercised by
  *   Task 1.3 tests; safe for the same reason.
  */
@@ -75,12 +86,20 @@ function buildPrimitives(
   // crosses the persistence boundary (POST /operations). Empty array → the
   // scrubber is a zero-cost no-op (no secret-bearing vars in this invoke).
   secretStrings: readonly string[],
+  logger: GlobalLogger,
 ): DurablePrimitives {
   const primitives: DurablePrimitives = {
-    // MINIMAL 1.3: sleep delegates directly to engine.durableSleepms; no retry/deadline policy yet.
-    sleep: (ms: number): Promise<void> => engine.durableSleepms(workflowID, nextFunctionID(), ms),
+    sleep: async (ms: number): Promise<void> => {
+      // Inside a retried step a sleep is a plain wait: no function id, no suspension.
+      if (isInRetriedStep()) {
+        await sleepms(ms);
+        return;
+      }
+      return engine.durableSleepms(workflowID, nextFunctionID(), ms);
+    },
 
     recv: async <T = unknown>(topic?: string): Promise<T> => {
+      assertNotInRetriedStep('ctx.recv');
       // MINIMAL 1.3: recv delegates to engine.recv; no timeout/cancellation handling beyond what the engine provides.
       const functionID = nextFunctionID();
       const timeoutFunctionID = nextFunctionID();
@@ -88,15 +107,19 @@ function buildPrimitives(
       return SolidActionsJSON.parse(raw) as T;
     },
 
-    send: (topic: string, payload: unknown): Promise<void> => {
+    send: async (topic: string, payload: unknown): Promise<void> => {
+      assertNotInRetriedStep('ctx.send');
       const functionID = nextFunctionID();
       // MINIMAL 1.3: destinationID == workflowID (self-send only). Task 2.x: thread real cross-workflow target from cfg.
       return engine.send(workflowID, functionID, workflowID, SolidActionsJSON.stringify(payload), topic);
     },
 
-    step: async <T>(fn: () => T | Promise<T>, cfg?: { name?: string }): Promise<T> => {
+    step: async <T>(fn: () => T | Promise<T>, cfg?: StepConfig): Promise<T> => {
+      // A step nested in a retried step is a plain call: no function id, nothing recorded, no retry of its own.
+      if (isInRetriedStep()) {
+        return await fn();
+      }
       const functionID = nextFunctionID();
-      // MINIMAL 1.3: step is minimal record-or-replay; full retry/timeout policy comes in Task 2.x.
       const stepName = cfg?.name || fn.name || '<step>';
 
       // Replay: if this step already recorded a result, return it instead of
@@ -111,8 +134,7 @@ function buildPrimitives(
       }
 
       const startTime = Date.now();
-      try {
-        const output = await fn();
+      const recordOutput = async (output: T): Promise<void> => {
         // Task 3.2: scrub every known secret string from the serialized
         // step output before it crosses the persistence boundary. A step
         // that legitimately consumes `ctx.vars.X.key` should derive a
@@ -123,8 +145,8 @@ function buildPrimitives(
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
           output: outputJson,
         });
-        return output;
-      } catch (err) {
+      };
+      const recordError = async (err: unknown): Promise<void> => {
         // Serialize with serialize-error so custom Error props survive suspend+replay.
         // Task 3.2: scrub the serialized error string too — a thrown error
         // could include a secret in its message (e.g. an HTTP client
@@ -136,6 +158,30 @@ function buildPrimitives(
         await engine.recordOperationResult(workflowID, functionID, stepName, true, startTime, {
           error: errorJson,
         });
+      };
+
+      if (cfg?.retriesAllowed) {
+        const outcome = await runWithRetries(fn, {
+          stepName,
+          config: cfg,
+          beforeAttempt: () => engine.checkIfCanceled(workflowID),
+          warn: (line) => logger.warn(scrubSecretsFromString(line, secretStrings)),
+        });
+        if (!outcome.ok) {
+          await recordError(outcome.error);
+          throw outcome.error;
+        }
+        // Outside the retry loop: a failure to record never runs fn again.
+        await recordOutput(outcome.output);
+        return outcome.output;
+      }
+
+      try {
+        const output = await fn();
+        await recordOutput(output);
+        return output;
+      } catch (err) {
+        await recordError(err);
         throw err;
       }
     },
@@ -162,6 +208,7 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
   // (ctx.run / ctx.app / ctx.api) — no globalParams, no SolidActionsExecutor
   // global instance, no process.env reads.
   let engine: InvokeSystemDatabase;
+  let logger: GlobalLogger;
   const workflowID = ctx.run.runUuid;
   try {
     const httpConfig: SolidActionsHttpConfig = {
@@ -172,7 +219,7 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
       // invoke path (HttpClient's env fallback is legacy boot-only).
       workerSessionId: ctx.run.workerSessionId,
     };
-    const logger = new GlobalLogger();
+    logger = new GlobalLogger();
     engine = new InvokeSystemDatabase(
       httpConfig,
       { executorID: String(ctx.run.triggerId), appVersion: ctx.app.appVersion },
@@ -268,7 +315,7 @@ export async function invoke<I, O>(workflow: WorkflowDescriptor<I, O>, ctx: Invo
   // serialized step outputs/errors before they cross the persistence
   // boundary.
   const secretStrings = collectSecretStrings(ctx.vars);
-  const primitives = buildPrimitives(engine, workflowID, secretStrings);
+  const primitives = buildPrimitives(engine, workflowID, secretStrings, logger);
   const scope: RuntimeScope = { executor: engine, runtimeParams, primitives };
 
   try {

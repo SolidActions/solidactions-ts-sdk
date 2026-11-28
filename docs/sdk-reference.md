@@ -242,7 +242,7 @@ interface InvokeCtxApp {
 
 Inside a `run(ctx)` body, call the durable operations through the **`SolidActions.*` static API** (`SolidActions.runStep`, `SolidActions.sleep`, `SolidActions.send`, `SolidActions.recv`, `SolidActions.setEvent`, `SolidActions.startWorkflow`, `SolidActions.logger`, `SolidActions.workflowID`, …). They are automatically bound to the current run via an async-local scope established by the engine — **no setup, no globals, no passing `ctx` around.** This is the pattern every example uses; see [Steps](#steps), [Durable Primitives](#durable-primitives), and [Communication](#communication).
 
-> `ctx` also carries minimal `step`/`sleep`/`recv`/`send` primitives (the `DurablePrimitives` shape) for advanced use, but the `SolidActions.*` API is the documented, fully-featured surface (e.g. step retries, `recv` timeouts) and is what you should use.
+> `ctx` also carries minimal `step`/`sleep`/`recv`/`send` primitives (the `DurablePrimitives` shape) for advanced use, but the `SolidActions.*` API is the documented, fully-featured surface (e.g. `recv` timeouts) and is what you should use.
 
 ---
 
@@ -591,13 +591,15 @@ const fetchStep = SolidActions.registerStep(fetchData, { name: 'fetchData' });
 
 ```typescript
 interface StepConfig {
-  retriesAllowed?: boolean; // Enable automatic retries (default: false)
-  intervalSeconds?: number; // Seconds before first retry (default: 1)
-  maxAttempts?: number; // Maximum retry attempts (default: 3)
-  backoffRate?: number; // Retry interval multiplier (default: 2)
+  retriesAllowed?: boolean; // Retry the step if it throws (default: false)
+  intervalSeconds?: number; // Seconds before the first retry (default: 1)
+  maxAttempts?: number; // Total attempts, including the first (default: 3)
+  backoffRate?: number; // Multiplier of the wait after each retry (default: 2)
   name?: string; // Step name for identification
 }
 ```
+
+Retry settings apply to `SolidActions.runStep()` and `ctx.step()`. On hosted runs they need `@solidactions/sdk` 0.12.0 or newer: upgrade the dependency and redeploy. Earlier versions ran a failing step once.
 
 Example with retries:
 
@@ -610,6 +612,16 @@ const result = await SolidActions.runStep(() => callUnreliableApi(), {
   backoffRate: 3,
 });
 ```
+
+How a retried step behaves:
+
+- Every error is retried. Each failed attempt logs a warning.
+- Each wait is at most 3600 seconds.
+- One result is recorded, after the last attempt. When every attempt fails the step throws `SolidActionsMaxStepRetriesError`; after a replay it is a plain `Error` with the same message.
+- A cancelled run stops before the next attempt.
+- The wait happens inside the running process: it counts toward run time and the run's time limit. If the run is restarted during a retried step, the step starts again at attempt 1, so make the work safe to repeat.
+- Inside a retried step, a nested step, `now()`, `randomUUID()` and `sleep()` are ordinary calls: nothing is recorded for them, a nested step does not retry on its own, and `sleep()` waits in the process.
+- `send` and `recv` (on `ctx` or `SolidActions`), `SolidActions.setEvent` and starting a child workflow are not allowed inside a retried step. They throw "not allowed inside a step". Each such throw is a failed attempt, so the step ends with `SolidActionsMaxStepRetriesError`. Call them outside the step.
 
 ### Determinism Rules
 
@@ -1012,6 +1024,8 @@ interface StepStatus {
   maxAttempts?: number; // Total allowed attempts
 }
 ```
+
+`stepStatus` is not set inside a step on hosted runs.
 
 ```typescript
 export const wf = defineWorkflow<void, void>({

@@ -266,7 +266,7 @@ See [`docs/sdk-reference.md`](docs/sdk-reference.md) for comprehensive SDK docum
 - The workflow contract: `defineWorkflow({ name, run })` and the `ctx` object (`ctx.input`, `ctx.vars`, `ctx.run`, `ctx.app`, modes)
 - Context variables: typed `ctx.vars`, plain vars vs. `ConnectionVar` (OAuth proxy)
 - Workflows: determinism rules, IDs and idempotency, timeouts, child workflows
-- Steps: `runStep()`, configurable retries, parallel execution with `Promise.allSettled()`
+- Steps: `runStep()`, configurable retries (hosted runs need 0.12.0 or newer), parallel execution with `Promise.allSettled()`
 - Durable primitives: `sleep()`, `now()`, `randomUUID()`
 - Communication: `send()`/`recv()` messaging, `setEvent()`/`getEvent()` events, streaming, `respond()`
 - Workflow handles and management: `listWorkflows()`, `cancelWorkflow()`, `forkWorkflow()`

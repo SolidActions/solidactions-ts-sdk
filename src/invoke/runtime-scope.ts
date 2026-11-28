@@ -15,6 +15,7 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
+import { SolidActionsInvalidWorkflowTransitionError } from '../error';
 // Type-only: importing the value would create a runtime import cycle
 // (runtime-scope -> invoke-system-database -> http_system_database -> workflow
 // -> solidactions -> runtime-scope). InvokeSystemDatabase is used only in type
@@ -73,6 +74,8 @@ export interface RuntimeScope {
    * primitives (none today) simply won't have the bridge available.
    */
   readonly primitives?: DurablePrimitives;
+  /** True while the body of a step with retries runs. Nested durable calls then use no function id. */
+  readonly inRetriedStep?: boolean;
 }
 
 const invokeScope = new AsyncLocalStorage<RuntimeScope>();
@@ -129,4 +132,24 @@ export function getCurrentPrimitives(): DurablePrimitives | undefined {
 export function nextFunctionID(): number {
   const params = requireScope('nextFunctionID').runtimeParams;
   return params.functionIDCounter++;
+}
+
+/** True inside the body of a step that has retries enabled. */
+export function isInRetriedStep(): boolean {
+  return invokeScope.getStore()?.inRetriedStep === true;
+}
+
+/** Run a retried step's body: same run, same function-id counter, marked as inside a step. */
+export function runInRetriedStep<R>(fn: () => Promise<R>): Promise<R> {
+  return invokeScope.run({ ...requireScope('runInRetriedStep'), inRetriedStep: true }, fn);
+}
+
+/**
+ * Refuse a durable operation that would use a function id inside a retried step: the number of ids used would
+ * depend on how many attempts failed, and every later step would replay another step's result.
+ */
+export function assertNotInRetriedStep(operation: string): void {
+  if (isInRetriedStep()) {
+    throw new SolidActionsInvalidWorkflowTransitionError(`Invalid call to \`${operation}\`: not allowed inside a step`);
+  }
 }
